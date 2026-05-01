@@ -1,0 +1,16 @@
+[Unit]
+Description=EVE Mining Tools (ore scanner + ship fitter)
+After=network.target
+
+[Service]
+Type=simple
+User=eve
+WorkingDirectory=/opt/eve-tools
+ExecStart=/usr/bin/python3 ore_scanner.py --host 0.0.0.0 --port 8747 --no-browser
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
