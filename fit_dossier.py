@@ -128,6 +128,9 @@ A = {
     # Ship special bays
     "fleetHangarCapacity": 912,
     "specialFuelBayCapacity": 1549,
+
+    # Propulsion module attributes
+    "massAddition": 796,
 }
 
 # Reverse lookup: attribute_id → name
@@ -360,6 +363,7 @@ CATEGORY_COLUMNS = {
     "Propulsion Modules": [
         ("Speed boost", 1076, "pctval"),      # implantBonusVelocity / speedFactor
         ("Sig penalty", 554, "pctval"),       # signatureRadiusBonus (MWDs)
+        ("Mass add", 796, "flat"),            # massAddition (MWDs only)
     ],
     "Expanded Cargoholds": [
         ("Cargo bonus", 149, "mul"),          # cargoCapacityMultiplier
@@ -391,6 +395,35 @@ HAULER_SHIP_CLASSES = {
     "Hauler", "Industrial", "Deep Space Transport", "Blockade Runner",
     "Freighter", "Jump Freighter",
 }
+
+# Gank threshold constant: gank_threshold_ISK ≈ EHP_kin_therm × GANK_COST_PER_EHP
+# Calibrated to current Catalyst ganker economics (antimatter, ~4500 ISK damage per EHP
+# of gank cost including ship + fittings / CONCORD loss).  Tune as meta shifts.
+GANK_COST_PER_EHP = 4500
+
+# Role-based category filtering (applied at render time, data is preserved)
+ROLE_HIDDEN_CATEGORIES = {
+    "hauler": {
+        "high": {"Strip Miners", "Modulated Strip Miners", "Mining Lasers",
+                 "Industrial Cores", "Compressors", "Mining Foreman Bursts",
+                 "Remote Shield Boosters"},
+        "mid": {"Shield Boosters"},
+        "low": {"Mining Laser Upgrades", "Drone Damage Amplifiers"},
+        "rig": {"Mining Drone Rigs"},
+    },
+}
+
+VALID_ROLES = {"unset", "hauler", "mining", "auto"}
+
+
+def _detect_ship_role(ship):
+    """Auto-detect ship role from ship class."""
+    if ship["ship_class"] in HAULER_SHIP_CLASSES:
+        return "hauler"
+    if ship["ship_class"] in MINING_SHIP_CLASSES:
+        return "mining"
+    return "unset"
+
 
 MAX_WORKERS = 8
 
@@ -695,6 +728,15 @@ def parse_ship_hull(type_id, skills, skill_ids):
     hull_ehp = _layer_ehp(structure_hp, hull_res)
     total_ehp = shield_ehp + armor_ehp + hull_ehp
 
+    # EHP vs Kin/Therm (50/50 split — Catalyst antimatter gank profile)
+    def _layer_ehp_kt(hp, res):
+        weighted = 0.5 * res.get("Kin", 1) + 0.5 * res.get("Therm", 1)
+        return hp / weighted if weighted > 0 else hp
+    shield_ehp_kt = _layer_ehp_kt(shield_hp, shield_res)
+    armor_ehp_kt = _layer_ehp_kt(armor_hp, armor_res)
+    hull_ehp_kt = _layer_ehp_kt(structure_hp, hull_res)
+    total_ehp_kt = shield_ehp_kt + armor_ehp_kt + hull_ehp_kt
+
     # Navigation
     mass = da.get(A["mass"], 0)
     agility_base = da.get(A["agility"], 0)
@@ -792,7 +834,7 @@ def parse_ship_hull(type_id, skills, skill_ids):
         "shield_hp": shield_hp, "armor_hp": armor_hp, "structure_hp": structure_hp,
         "shield_res": shield_res, "armor_res": armor_res, "hull_res": hull_res,
         "shield_ehp": shield_ehp, "armor_ehp": armor_ehp, "hull_ehp": hull_ehp,
-        "total_ehp": total_ehp,
+        "total_ehp": total_ehp, "total_ehp_kt": total_ehp_kt,
 
         "mass": mass, "agility": agility_base, "agility_adj": agility_adj,
         "max_vel": max_vel, "warp_speed": warp_speed, "sig_radius": sig_radius,
@@ -1191,8 +1233,12 @@ def fetch_hull_prices(type_id, regions, use_cache):
 
 def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
                    char_info, skills, skill_warnings, regions, include_jita,
-                   ore_context=None):
-    """Format the complete dossier as markdown."""
+                   ore_context=None, role="unset"):
+    """Format the complete dossier as markdown.
+
+    role: "unset" shows all categories, "hauler"/"mining" hide irrelevant ones.
+    Filtering is render-time only — the candidates data is preserved.
+    """
     now = datetime.datetime.now().isoformat(timespec="seconds")
     region_name = esi.REGIONS.get(region_key, {}).get("name", region_key)
     n_skills = len(skills)
@@ -1289,10 +1335,10 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
       f"EM {fmt_pct(ar['EM'])}, Therm {fmt_pct(ar['Therm'])}, "
       f"Kin {fmt_pct(ar['Kin'])}, Exp {fmt_pct(ar['Exp'])})")
     w(f"- Structure: {ship['structure_hp']:,.0f} HP")
-    w(f"- **EHP (uniform damage, base resists)**: {ship['shield_ehp']:,.0f} + "
-      f"{ship['armor_ehp']:,.0f} + {ship['hull_ehp']:,.0f} = "
-      f"**{ship['total_ehp']:,.0f}**"
-      f"  *(higher with compensation skills trained)*")
+    w(f"- **EHP (omni)**: **{ship['total_ehp']:,.0f}**  "
+      f"*(uniform damage, base resists — higher with compensation skills)*")
+    w(f"- **EHP (vs Kin/Therm)**: **{ship['total_ehp_kt']:,.0f}**  "
+      f"*(Catalyst antimatter gank profile, 50/50 kin+therm)*")
     w("")
 
     # Hull bonuses
@@ -1312,10 +1358,12 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
     # Navigation
     w("### Navigation")
     w("")
-    w(f"- Mass: {ship['mass']:,.0f} kg")
+    w(f"- Mass: {ship['mass']:,.0f} kg  "
+      "*(modified by: Reinforced Bulkheads, Nanofibers)*")
     w(f"- Inertia modifier: {ship['agility']:.4f} (base)"
       + (f" / {ship['agility_adj']:.4f} (skill-adjusted)"
-         if ship.get('agility_skill_details') else ""))
+         if ship.get('agility_skill_details') else "")
+      + "  *(modified by: Istabs, Nanofibers, LF Nozzle Joints)*")
     w(f"- Max velocity: {ship['max_vel']:.0f} m/s")
     w(f"- Align time: {ship['align_time']:.1f}s (base)"
       + (f" / {ship['align_time_adj']:.1f}s (skill-adjusted)"
@@ -1328,26 +1376,56 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
     w(f"- Signature radius: {ship['sig_radius']:.0f} m")
     w("")
 
-    # Hauler analysis section — EHP, cargo:EHP, gank thresholds
+    # Hauler analysis section — EHP, cargo:EHP, gank thresholds, MWD align
     if ship["ship_class"] in HAULER_SHIP_CLASSES:
         w("### Hauler analysis")
         w("")
         cargo_eff = ship.get("cargo_adj", ship["cargo"])
-        ehp = ship["total_ehp"]
+        ehp_omni = ship["total_ehp"]
+        ehp_kt = ship["total_ehp_kt"]
+        gank_threshold = ehp_kt * GANK_COST_PER_EHP
         w(f"| Metric | Base hull (no modules) |")
         w(f"|--------|----------------------:|")
         w(f"| Cargo capacity | {cargo_eff:,.0f} m\u00b3 |")
-        w(f"| EHP (uniform) | {ehp:,.0f} |")
+        w(f"| EHP (omni) | {ehp_omni:,.0f} |")
+        w(f"| EHP (vs Kin/Therm) | {ehp_kt:,.0f} |")
         w(f"| Align time | {ship['align_time_adj']:.1f}s |")
         w(f"| Warp speed | {ship['warp_speed']:.1f} AU/s |")
         w(f"| Signature radius | {ship['sig_radius']:.0f} m |")
         w(f"| Mass | {ship['mass']:,.0f} kg |")
         w(f"| Inertia modifier | {ship['agility_adj']:.4f} |")
+        w(f"| **Gank threshold (approx)** | **{fmt_isk(gank_threshold)} cargo value** |")
+
+        # MWD-pulse align time — find reference MWD from propulsion candidates
+        # MWDs are distinguished from ABs by having signatureRadiusBonus (sig bloom)
+        mwd_ref = None
+        for cat in candidates.get("mid", []):
+            if cat["name"] == "Propulsion Modules":
+                mwds = []
+                for c in cat["candidates"]:
+                    dogma = c.get("dogma", {})
+                    mass_add = dogma.get(A["massAddition"], 0)
+                    sig_bonus = dogma.get(A["signatureRadiusBonus"], 0)
+                    if mass_add > 0 and sig_bonus != 0:
+                        mwds.append((c["name"], mass_add, c["variant"]))
+                if mwds:
+                    mwds.sort(key=lambda x: (0 if x[2] == "T1" else 1, x[1]))
+                    mwd_ref = (mwds[0][0], mwds[0][1])
+                break
+        if mwd_ref:
+            mwd_name, mwd_mass = mwd_ref
+            align_mwd = (-math.log(0.25) * (ship["mass"] + mwd_mass)
+                         * ship["agility_adj"] / 1e6)
+            mass_str = (f"{mwd_mass/1e6:.0f}M" if mwd_mass >= 1e6
+                       else f"{mwd_mass/1e3:.0f}k")
+            w(f"| Align time (MWD pulse) | {align_mwd:.1f}s "
+              f"*(ref: {mwd_name}, +{mass_str} kg)* |")
+
         w("")
-        gank_threshold = ehp * 1000
         w("**Gank math (base hull, no tank modules):**")
-        w(f"- Rule of thumb: you're a target when cargo value > EHP \u00d7 ~1,000 ISK")
-        w(f"- At {ehp:,.0f} EHP: gank-worthy above ~{fmt_isk(gank_threshold)} cargo value")
+        w(f"- Gank threshold \u2248 EHP(Kin/Therm) \u00d7 {GANK_COST_PER_EHP:,} ISK "
+          f"(Catalyst economics, tunable constant)")
+        w(f"- At {ehp_kt:,.0f} EHP: gank-profitable above ~{fmt_isk(gank_threshold)} cargo")
         w(f"- Bulkheads/tank raise EHP \u2192 raise the threshold")
         w(f"- Cargo expanders lower structure HP \u2192 lower EHP \u2192 lower the threshold")
         w("")
@@ -1368,10 +1446,19 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
 
     region_labels = [label for _, label in regions]
 
+    hidden_cats = ROLE_HIDDEN_CATEGORIES.get(role, {})
+
     for slot_type in ("high", "mid", "low", "rig"):
         cats = candidates.get(slot_type, [])
         if not cats:
             continue
+
+        # Role-based category filtering (render-time only, data preserved)
+        slot_hidden = hidden_cats.get(slot_type, set())
+        if slot_hidden:
+            cats = [c for c in cats if c["name"] not in slot_hidden]
+            if not cats:
+                continue
 
         # For Industrial Command Ships, reorder high-slot categories:
         # utility modules (cores, bursts, compressors) first, lasers last
@@ -1463,77 +1550,81 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
     w("---")
     w("")
 
-    # ── Drones ──
-    w("## Drones")
-    w("")
-    w(f"Drone bay: {ship['drone_bay']:.0f} m\u00b3, bandwidth: {ship['drone_bw']:.0f} Mbit/s")
-    if ship["ship_class"] == "Industrial Command Ship":
-        ics_bonus = ship["raw_attrs"].get(3221, 0)
-        ics_level = skills.get("Industrial Command Ships", 0)
-        if ics_bonus:
-            w(f"Hull bonus: +{ics_bonus:.0f}% drone ore mining yield per ICS level "
-              f"(at ICS {ics_level}: +{ics_bonus * ics_level:.0f}%)")
-    w("")
+    # ── Drones (skip entirely if ship has no drone bay) ──
+    if ship["drone_bay"] == 0 and ship["drone_bw"] == 0:
+        drones = []  # suppress rendering below
 
-    for cat in drones:
-        w(f"### {cat['name']}")
+    if drones:
+        w("## Drones")
         w("")
-
-        if not cat["candidates"]:
-            w("*No candidates found.*")
-            w("")
-            continue
-
-        has_yield = any(c.get("yield_per_cycle") for c in cat["candidates"])
-
-        headers = ["Drone", "Variant"]
-        aligns = ["l", "l"]
-        if has_yield:
-            headers += ["Yield/cycle", "Cycle"]
-            aligns += ["r", "r"]
-        headers += ["Volume", "BW", "Reqs met?"]
-        aligns += ["r", "r", "c"]
-        for label in region_labels:
-            headers.append(f"Sell ({label.split()[0]})")
-            aligns.append("r")
-
-        sep_parts = ["---:" if a == "r" else ":---:" if a == "c" else "---" for a in aligns]
-        w("| " + " | ".join(headers) + " |")
-        w("| " + " | ".join(sep_parts) + " |")
-
-        # Drone yield hull bonus — ICS hulls get +X% drone mining yield per level
-        drone_yield_bonus = 0
-        drone_yield_skill = ""
+        w(f"Drone bay: {ship['drone_bay']:.0f} m\u00b3, bandwidth: {ship['drone_bw']:.0f} Mbit/s")
         if ship["ship_class"] == "Industrial Command Ship":
-            ics_bonus = ship["raw_attrs"].get(3221, 0)  # drone ore mining yield per level
+            ics_bonus = ship["raw_attrs"].get(3221, 0)
             ics_level = skills.get("Industrial Command Ships", 0)
-            if ics_bonus and ics_level:
-                drone_yield_bonus = ics_bonus * ics_level / 100
-                drone_yield_skill = f"ICS {ics_level}"
-
-        for c in cat["candidates"]:
-            row = [c["name"], c["variant"]]
-            if has_yield:
-                yld = c.get("yield_per_cycle")
-                cyc = c.get("cycle_time")
-                if yld and drone_yield_bonus:
-                    yld_adj = yld * (1 + drone_yield_bonus)
-                    row.append(f"{yld:.0f} ({yld_adj:.0f}) m\u00b3")
-                else:
-                    row.append(f"{yld:.0f} m\u00b3" if yld else "--")
-                row.append(f"{cyc:.0f}s" if cyc else "--")
-            row.append(f"{c['volume']:.0f} m\u00b3")
-            row.append(f"{c['bandwidth']:.0f}")
-            if c["reqs_met"]:
-                row.append("\u2713")
-            else:
-                row.append("\u2717 (" + ", ".join(c["missing_skills"]) + ")")
-            for label in region_labels:
-                sell = c["prices"].get(f"sell_{label}", 0)
-                row.append(fmt_isk(sell))
-            w("| " + " | ".join(row) + " |")
-
+            if ics_bonus:
+                w(f"Hull bonus: +{ics_bonus:.0f}% drone ore mining yield per ICS level "
+                  f"(at ICS {ics_level}: +{ics_bonus * ics_level:.0f}%)")
         w("")
+
+        for cat in drones:
+            w(f"### {cat['name']}")
+            w("")
+
+            if not cat["candidates"]:
+                w("*No candidates found.*")
+                w("")
+                continue
+
+            has_yield = any(c.get("yield_per_cycle") for c in cat["candidates"])
+
+            headers = ["Drone", "Variant"]
+            aligns = ["l", "l"]
+            if has_yield:
+                headers += ["Yield/cycle", "Cycle"]
+                aligns += ["r", "r"]
+            headers += ["Volume", "BW", "Reqs met?"]
+            aligns += ["r", "r", "c"]
+            for label in region_labels:
+                headers.append(f"Sell ({label.split()[0]})")
+                aligns.append("r")
+
+            sep_parts = ["---:" if a == "r" else ":---:" if a == "c" else "---" for a in aligns]
+            w("| " + " | ".join(headers) + " |")
+            w("| " + " | ".join(sep_parts) + " |")
+
+            # Drone yield hull bonus — ICS hulls get +X% drone mining yield per level
+            drone_yield_bonus = 0
+            drone_yield_skill = ""
+            if ship["ship_class"] == "Industrial Command Ship":
+                ics_bonus = ship["raw_attrs"].get(3221, 0)
+                ics_level = skills.get("Industrial Command Ships", 0)
+                if ics_bonus and ics_level:
+                    drone_yield_bonus = ics_bonus * ics_level / 100
+                    drone_yield_skill = f"ICS {ics_level}"
+
+            for c in cat["candidates"]:
+                row = [c["name"], c["variant"]]
+                if has_yield:
+                    yld = c.get("yield_per_cycle")
+                    cyc = c.get("cycle_time")
+                    if yld and drone_yield_bonus:
+                        yld_adj = yld * (1 + drone_yield_bonus)
+                        row.append(f"{yld:.0f} ({yld_adj:.0f}) m\u00b3")
+                    else:
+                        row.append(f"{yld:.0f} m\u00b3" if yld else "--")
+                    row.append(f"{cyc:.0f}s" if cyc else "--")
+                row.append(f"{c['volume']:.0f} m\u00b3")
+                row.append(f"{c['bandwidth']:.0f}")
+                if c["reqs_met"]:
+                    row.append("\u2713")
+                else:
+                    row.append("\u2717 (" + ", ".join(c["missing_skills"]) + ")")
+                for label in region_labels:
+                    sell = c["prices"].get(f"sell_{label}", 0)
+                    row.append(fmt_isk(sell))
+                w("| " + " | ".join(row) + " |")
+
+            w("")
 
     w("---")
     w("")
@@ -1675,10 +1766,12 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
 # ── Web API data generator ────────────────────────────────────
 
 def generate_dossier_data(ship_name, goal="", region_key="verge",
-                          skills_path=None, include_jita=True, use_cache=True):
+                          skills_path=None, include_jita=True, use_cache=True,
+                          role="auto"):
     """Run the full dossier pipeline and return JSON-serializable data.
 
     Used by the web UI (ore_scanner.py) to serve the fitter tab.
+    role: "auto" detects from ship class, or explicit "hauler"/"mining"/"unset".
     """
     if skills_path is None:
         skills_path = os.path.join(os.path.dirname(__file__), "skills.ini")
@@ -1725,11 +1818,15 @@ def generate_dossier_data(ship_name, goal="", region_key="verge",
     drones = enumerate_drones(drone_groups, ship, skills, skill_ids,
                               regions, use_cache, progress=False)
 
+    # Resolve role
+    effective_role = _detect_ship_role(ship) if role == "auto" else role
+
     # Format markdown dossier (before modifying dicts for JSON)
     region_labels = [label for _, label in regions]
     markdown = format_dossier(
         ship, candidates, drones, hull_prices, goal,
         region_key, char_info, skills, skill_warnings, regions, include_jita,
+        role=effective_role,
     )
 
     # Ensure dogma dicts have string keys for JSON serialisation
@@ -1947,6 +2044,9 @@ def main():
                         help="Write dossier to file (default: stdout)")
     parser.add_argument("--refresh", action="store_true",
                         help="Bypass cache, force fresh ESI fetches")
+    parser.add_argument("--role", default="auto",
+                        choices=sorted(VALID_ROLES),
+                        help="Ship role for category filtering (default: auto-detect)")
     parser.add_argument("--self-test", action="store_true",
                         help="Run verification checks and exit")
 
@@ -2053,12 +2153,13 @@ def main():
             print(f"  WARNING: Could not fetch ore context: {e}")
             print()
 
-    # 10. Format dossier
-    print("Formatting dossier...")
+    # 10. Resolve role and format dossier
+    effective_role = _detect_ship_role(ship) if args.role == "auto" else args.role
+    print(f"Formatting dossier (role: {effective_role})...")
     dossier = format_dossier(
         ship, candidates, drones, hull_prices, args.goal,
         args.region, char_info, skills, skill_warnings, regions, include_jita,
-        ore_context=ore_context,
+        ore_context=ore_context, role=effective_role,
     )
 
     if args.output:
