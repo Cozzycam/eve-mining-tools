@@ -267,6 +267,7 @@ MODULE_SEEDS = [
     ("high", "Mining Foreman Bursts", "Mining Foreman Burst I"),
     ("high", "Remote Shield Boosters", "Small Remote Shield Booster I"),
     ("high", "Compressors", "Medium Asteroid Ore Compressor I"),
+    ("high", "Cloaking Devices", "Prototype Cloaking Device I"),
 
     # Mid slots
     ("mid", "Shield Extenders", "Medium Shield Extender I"),
@@ -277,7 +278,7 @@ MODULE_SEEDS = [
     ("mid", "Shield Hardeners (Exp)", "Explosive Shield Hardener I"),
     ("mid", "Shield Boosters", "Medium Shield Booster I"),
     ("mid", "Cap Batteries", "Medium Cap Battery I"),
-    ("mid", "Afterburners", "10MN Afterburner I"),
+    ("mid", "Propulsion Modules", "10MN Afterburner I"),
 
     # Low slots
     ("low", "Mining Laser Upgrades", "Mining Laser Upgrade I"),
@@ -288,6 +289,8 @@ MODULE_SEEDS = [
     ("low", "Cap Power Relays", "Capacitor Power Relay I"),
     ("low", "Cap Flux Coils", "Capacitor Flux Coil I"),
     ("low", "Reinforced Bulkheads", "Reinforced Bulkheads I"),
+    ("low", "Expanded Cargoholds", "Expanded Cargohold I"),
+    ("low", "Warp Core Stabilizers", "Warp Core Stabilizer I"),
 
     # Rigs
     ("rig", "Shield Rigs", "Medium Core Defense Field Extender I"),
@@ -297,6 +300,7 @@ MODULE_SEEDS = [
     ("rig", "Engineering Rigs (CPU)", "Medium Processor Overclocking Unit I"),
     ("rig", "Navigation Rigs", "Medium Hyperspatial Velocity Optimizer I"),
     ("rig", "Navigation Rigs (agility)", "Medium Polycarbon Engine Housing I"),
+    ("rig", "Cargo Rigs", "Medium Cargohold Optimization I"),
 ]
 
 # Per-category effect columns: (display_name, attribute_id, format_type)
@@ -353,8 +357,13 @@ CATEGORY_COLUMNS = {
     "Shield Boosters": [
         ("Shield HP/cycle", 72, "flat"),      # capacityBonus (shield amount per cycle)
     ],
-    "Afterburners": [
+    "Propulsion Modules": [
         ("Speed boost", 1076, "pctval"),      # implantBonusVelocity / speedFactor
+        ("Sig penalty", 554, "pctval"),       # signatureRadiusBonus (MWDs)
+    ],
+    "Expanded Cargoholds": [
+        ("Cargo bonus", 149, "mul"),          # cargoCapacityMultiplier
+        ("Structure HP", 150, "mul"),         # structureHPMultiplier
     ],
 }
 
@@ -370,6 +379,18 @@ DRONE_SEEDS = [
     ("Medium Combat Drones (Amarr)", "Infiltrator I"),
     ("Salvage Drones", "Salvage Drone I"),
 ]
+
+# Ship classes where mining-specific content (ore context, MLU notes) applies
+MINING_SHIP_CLASSES = {
+    "Mining Barge", "Exhumer", "Mining Frigate",
+    "Industrial Command Ship", "Expedition Frigate",
+}
+
+# Ship classes where hauler-specific content (EHP/gank math, cargo tradeoffs) applies
+HAULER_SHIP_CLASSES = {
+    "Hauler", "Industrial", "Deep Space Transport", "Blockade Runner",
+    "Freighter", "Jump Freighter",
+}
 
 MAX_WORKERS = 8
 
@@ -658,6 +679,21 @@ def parse_ship_hull(type_id, skills, skill_ids):
         "Kin": da.get(A["armorKineticDamageResonance"], 1),
         "Exp": da.get(A["armorExplosiveDamageResonance"], 1),
     }
+    hull_res = {
+        "EM": da.get(A["hullEmDamageResonance"], 1),
+        "Therm": da.get(A["hullThermalDamageResonance"], 1),
+        "Kin": da.get(A["hullKineticDamageResonance"], 1),
+        "Exp": da.get(A["hullExplosiveDamageResonance"], 1),
+    }
+
+    # EHP (uniform damage profile — 25% each type)
+    def _layer_ehp(hp, res):
+        avg_res = sum(res.values()) / len(res) if res else 1
+        return hp / avg_res if avg_res > 0 else hp
+    shield_ehp = _layer_ehp(shield_hp, shield_res)
+    armor_ehp = _layer_ehp(armor_hp, armor_res)
+    hull_ehp = _layer_ehp(structure_hp, hull_res)
+    total_ehp = shield_ehp + armor_ehp + hull_ehp
 
     # Navigation
     mass = da.get(A["mass"], 0)
@@ -714,6 +750,25 @@ def parse_ship_hull(type_id, skills, skill_ids):
         ore_hold_bonus_pct = 5
     ore_hold_adj = ore_hold_base * (1 + ore_hold_bonus_pct * ore_hold_skill_level / 100) if ore_hold_base > 0 else 0
 
+    # Cargo capacity skill bonus — T1 industrials get +5% per racial hauler skill level
+    cargo_skill_name = None
+    cargo_skill_level = 0
+    cargo_bonus_pct = 0
+    if ship_class in ("Hauler", "Industrial"):
+        # Discover the racial hauler skill from hull's required skills
+        for i in range(1, 4):
+            req_skill_tid = int(da.get(A.get(f"requiredSkill{i}"), 0) or 0)
+            if req_skill_tid:
+                req_skill_info = esi.get_type_info(req_skill_tid)
+                if req_skill_info:
+                    sname = req_skill_info.get("name", "")
+                    if "Hauler" in sname or "Industrial" in sname:
+                        cargo_skill_name = sname
+                        cargo_skill_level = skills.get(sname, 0)
+                        cargo_bonus_pct = 5
+                        break
+    cargo_adj = cargo * (1 + cargo_bonus_pct * cargo_skill_level / 100)
+
     # Description (contains trait/bonus text)
     description = strip_html(info.get("description", ""))
 
@@ -735,7 +790,9 @@ def parse_ship_hull(type_id, skills, skill_ids):
         "drone_bay": drone_bay, "drone_bw": drone_bw,
 
         "shield_hp": shield_hp, "armor_hp": armor_hp, "structure_hp": structure_hp,
-        "shield_res": shield_res, "armor_res": armor_res,
+        "shield_res": shield_res, "armor_res": armor_res, "hull_res": hull_res,
+        "shield_ehp": shield_ehp, "armor_ehp": armor_ehp, "hull_ehp": hull_ehp,
+        "total_ehp": total_ehp,
 
         "mass": mass, "agility": agility_base, "agility_adj": agility_adj,
         "max_vel": max_vel, "warp_speed": warp_speed, "sig_radius": sig_radius,
@@ -745,7 +802,11 @@ def parse_ship_hull(type_id, skills, skill_ids):
         "pg_bonus_per_level": pg_bonus_per_level,
         "max_targets": max_targets, "scan_res": scan_res,
 
-        "cargo": cargo, "ore_hold_base": ore_hold_base, "ore_hold_adj": ore_hold_adj,
+        "cargo": cargo, "cargo_adj": cargo_adj,
+        "cargo_skill_name": cargo_skill_name,
+        "cargo_skill_level": cargo_skill_level,
+        "cargo_bonus_pct": cargo_bonus_pct,
+        "ore_hold_base": ore_hold_base, "ore_hold_adj": ore_hold_adj,
         "ore_hold_attr": ore_hold_attr,
         "ore_hold_skill_name": ore_hold_skill_name,
         "ore_hold_skill_level": ore_hold_skill_level,
@@ -1196,7 +1257,14 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
     # Cargo / mining holds
     w("### Cargo / mining holds")
     w("")
-    w(f"- Cargo: {ship['cargo']:.0f} m\u00b3")
+    if ship.get("cargo_skill_name"):
+        csk = ship["cargo_skill_name"]
+        csl = ship["cargo_skill_level"]
+        cbp = ship["cargo_bonus_pct"]
+        w(f"- Cargo: {ship['cargo']:,.0f} / {ship['cargo_adj']:,.0f} m\u00b3"
+          f"  ({csk} {csl}: +{csl * cbp}%)")
+    else:
+        w(f"- Cargo: {ship['cargo']:,.0f} m\u00b3")
     if ship["ore_hold_base"] > 0:
         sk = ship.get("ore_hold_skill_name", "")
         sl = ship.get("ore_hold_skill_level", 0)
@@ -1221,6 +1289,10 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
       f"EM {fmt_pct(ar['EM'])}, Therm {fmt_pct(ar['Therm'])}, "
       f"Kin {fmt_pct(ar['Kin'])}, Exp {fmt_pct(ar['Exp'])})")
     w(f"- Structure: {ship['structure_hp']:,.0f} HP")
+    w(f"- **EHP (uniform damage, base resists)**: {ship['shield_ehp']:,.0f} + "
+      f"{ship['armor_ehp']:,.0f} + {ship['hull_ehp']:,.0f} = "
+      f"**{ship['total_ehp']:,.0f}**"
+      f"  *(higher with compensation skills trained)*")
     w("")
 
     # Hull bonuses
@@ -1255,6 +1327,31 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
     w(f"- Warp speed: {ship['warp_speed']:.1f} AU/s")
     w(f"- Signature radius: {ship['sig_radius']:.0f} m")
     w("")
+
+    # Hauler analysis section — EHP, cargo:EHP, gank thresholds
+    if ship["ship_class"] in HAULER_SHIP_CLASSES:
+        w("### Hauler analysis")
+        w("")
+        cargo_eff = ship.get("cargo_adj", ship["cargo"])
+        ehp = ship["total_ehp"]
+        w(f"| Metric | Base hull (no modules) |")
+        w(f"|--------|----------------------:|")
+        w(f"| Cargo capacity | {cargo_eff:,.0f} m\u00b3 |")
+        w(f"| EHP (uniform) | {ehp:,.0f} |")
+        w(f"| Align time | {ship['align_time_adj']:.1f}s |")
+        w(f"| Warp speed | {ship['warp_speed']:.1f} AU/s |")
+        w(f"| Signature radius | {ship['sig_radius']:.0f} m |")
+        w(f"| Mass | {ship['mass']:,.0f} kg |")
+        w(f"| Inertia modifier | {ship['agility_adj']:.4f} |")
+        w("")
+        gank_threshold = ehp * 1000
+        w("**Gank math (base hull, no tank modules):**")
+        w(f"- Rule of thumb: you're a target when cargo value > EHP \u00d7 ~1,000 ISK")
+        w(f"- At {ehp:,.0f} EHP: gank-worthy above ~{fmt_isk(gank_threshold)} cargo value")
+        w(f"- Bulkheads/tank raise EHP \u2192 raise the threshold")
+        w(f"- Cargo expanders lower structure HP \u2192 lower EHP \u2192 lower the threshold")
+        w("")
+
     w("---")
     w("")
 
@@ -1479,14 +1576,22 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
     w("")
     w("**Groups that stack with each other:**")
     w("")
-    w("- Mining Laser Upgrades: stack with each other (mining yield bonus)")
-    w("- Drone Damage Amplifiers: stack with each other (drone damage/yield bonus)")
+    is_mining = ship["ship_class"] in MINING_SHIP_CLASSES
+    if is_mining:
+        w("- Mining Laser Upgrades: stack with each other (mining yield bonus)")
+        w("- Drone Damage Amplifiers: stack with each other (drone damage/yield bonus)")
     w("- Shield Hardeners: same damage type stacks (EM+EM stack, EM+Therm don't)")
     w("- Shield Extenders: **do NOT stack-pen** (flat HP)")
-    w("- Inertia Stabilizers: stack with each other (agility bonus)")
+    w("- Inertial Stabilizers: stack with each other (agility bonus)")
+    w("- Expanded Cargoholds: stack with each other (cargo multiplier)")
+    w("- Nanofiber Internal Structures: stack with each other (agility bonus)")
     w("")
-    w("**Cross-effect note:** Two MLUs and one DDA do NOT stack-pen each other "
-      "(different effects). Three MLUs do.")
+    if is_mining:
+        w("**Cross-effect note:** Two MLUs and one DDA do NOT stack-pen each other "
+          "(different effects). Three MLUs do.")
+    else:
+        w("**Cross-effect note:** Modules with different effects (e.g. Istab + Nanofiber) "
+          "do NOT stack-pen each other, even though both affect agility.")
     w("")
     w("---")
     w("")
@@ -1514,11 +1619,12 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
       "pastes them into PyFA for ground-truth.")
     w("- **Module/rig drawbacks affect fit budgets.** The Drawback column in each "
       "table shows penalties that are not included in the module's own CPU/PG cost:")
-    w("  - Mining Laser Upgrades increase the CPU usage of the mining lasers they "
-      "upgrade (stack-penned). When fitting MLUs, recompute strip miner CPU as "
-      "base \u00d7 (1 + first_penalty) \u00d7 (1 + second_penalty \u00d7 0.869).")
-    w("  - Drone Mining Augmentor rigs reduce ship CPU output. Subtract the "
-      "drawback from total CPU before computing fit budget.")
+    if is_mining:
+        w("  - Mining Laser Upgrades increase the CPU usage of the mining lasers they "
+          "upgrade (stack-penned). When fitting MLUs, recompute strip miner CPU as "
+          "base \u00d7 (1 + first_penalty) \u00d7 (1 + second_penalty \u00d7 0.869).")
+        w("  - Drone Mining Augmentor rigs reduce ship CPU output. Subtract the "
+          "drawback from total CPU before computing fit budget.")
     w("  - Rigs may have other drawbacks (reduced armor HP, increased sig radius, "
       "etc.). These are shown in the Drawback column for each rig.")
     w("- Output proposed fits as EFT blocks so they can be pasted directly into PyFA.")
@@ -1531,6 +1637,35 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
           "choice for solo use.")
         w("- Industrial Core must be active to use compression modules. It consumes "
           "fuel from the fuel bay and prevents warping while active.")
+
+    if ship["ship_class"] in HAULER_SHIP_CLASSES:
+        w("- **This is a hauler.** Primary goals are cargo capacity, survivability, "
+          "and align time. Key trade-off: cargo vs tank vs agility.")
+        w("- **MWD-Cloak trick**: Fit an MWD + Improved Cloaking Device II. "
+          "Align \u2192 cloak \u2192 activate MWD \u2192 decloak before MWD cycle ends "
+          "\u2192 enter warp. Greatly reduces gank window on gates.")
+        w("- **Expanded Cargoholds** increase cargo but reduce structure HP. "
+          "Stacking penalty applies to multiple cargoholds. Three Expanded Cargoholds "
+          "is the classic newbie mistake: paper-thin hull, trivially gankable.")
+        w("- **Inertial Stabilizers vs Nanofibers**: Both reduce align time. "
+          "Istabs increase signature radius (easier to scan/lock). "
+          "Nanofibers reduce structure HP but add velocity.")
+        w("- **Reinforced Bulkheads** increase structure HP but reduce cargo capacity. "
+          "Consider for bulk hull tanking (opposite trade-off to cargoholds).")
+        w("- **Cargo rigs** (Cargohold Optimization) increase cargo like cargoholds "
+          "but use rig slots. They stack-pen with Expanded Cargohold modules.")
+        w("- For **max cargo**: stack Expanded Cargoholds + Cargo Rigs, accept the "
+          "EHP loss. For **max survivability**: Damage Control + Bulkheads or shield "
+          "tank, accept smaller cargo. For **balanced**: mix cargo and tank modules.")
+        w("- **Cargo:EHP ratio is the gank metric.** Suicide gankers calculate whether "
+          "cargo value exceeds the cost of ships needed to kill you. Lower EHP = fewer "
+          "ganker ships = lower cargo threshold. Surface the EHP impact of every fit.")
+        w("- **Align time is king for same-system hauling.** Under ~4s, you enter warp "
+          "before most gankers can lock. Over ~10s, you're a sitting duck. "
+          "Align = \u2212ln(0.25) \u00d7 mass \u00d7 inertia / 1,000,000.")
+        w("- **Show the tradeoff explicitly**: for each proposed fit, show effective "
+          "cargo, EHP, align time, and cargo:EHP ratio side by side so the pilot can "
+          "pick the right point on the curve.")
 
     w("")
 
@@ -1901,21 +2036,22 @@ def main():
     drones = enumerate_drones(drone_groups, ship, skills, skill_ids, regions, use_cache)
     print()
 
-    # 9. Ore market context (top 10 ores in region)
+    # 9. Ore market context (top 10 ores in region) — mining ships only
     ore_context = None
-    try:
-        from ore_scanner import scan as ore_scan, enrich_results as ore_enrich
-        print("Fetching ore market context...")
-        region_id = esi.REGIONS[args.region]["id"]
-        ore_results = ore_scan(region_id, 22000, show_all=False, ore_class="1")
-        ore_results = ore_enrich(ore_results)
-        ore_context = ore_results[:10]
-        print(f"  Top ore: {ore_context[0]['name']} at {ore_context[0]['isk_m3']:.2f} ISK/m\u00b3"
-              if ore_context else "  No ore data")
-        print()
-    except Exception as e:
-        print(f"  WARNING: Could not fetch ore context: {e}")
-        print()
+    if ship["ship_class"] in MINING_SHIP_CLASSES:
+        try:
+            from ore_scanner import scan as ore_scan, enrich_results as ore_enrich
+            print("Fetching ore market context...")
+            region_id = esi.REGIONS[args.region]["id"]
+            ore_results = ore_scan(region_id, 22000, show_all=False, ore_class="1")
+            ore_results = ore_enrich(ore_results)
+            ore_context = ore_results[:10]
+            print(f"  Top ore: {ore_context[0]['name']} at {ore_context[0]['isk_m3']:.2f} ISK/m\u00b3"
+                  if ore_context else "  No ore data")
+            print()
+        except Exception as e:
+            print(f"  WARNING: Could not fetch ore context: {e}")
+            print()
 
     # 10. Format dossier
     print("Formatting dossier...")
