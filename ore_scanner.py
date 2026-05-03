@@ -1353,6 +1353,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <label>Region</label>
     <select id="fitter-region"></select>
   </div>
+  <div class="field">
+    <label>Role</label>
+    <select id="fitter-role">
+      <option value="auto">Auto-detect</option>
+      <option value="hauler">Hauler</option>
+      <option value="mining">Mining</option>
+      <option value="unset">Show all</option>
+    </select>
+  </div>
   <button id="fitter-btn" onclick="doFitter()">Generate Dossier</button>
 </div>
 <div id="fitter-status"></div>
@@ -1961,6 +1970,7 @@ try {
   if (fs.ship) document.getElementById('fitter-ship').value = fs.ship;
   if (fs.goal) document.getElementById('fitter-goal').value = fs.goal;
   if (fs.region) fitterRegionSel.value = fs.region;
+  if (fs.role) document.getElementById('fitter-role').value = fs.role;
   const savedTab = localStorage.getItem('activeTab');
   if (savedTab === 'fitter') switchTab('fitter');
 } catch(e) {}
@@ -1978,6 +1988,7 @@ async function doFitter() {
   const ship = document.getElementById('fitter-ship').value.trim();
   const goal = document.getElementById('fitter-goal').value.trim();
   const region = fitterRegionSel.value;
+  const role = document.getElementById('fitter-role').value;
 
   if (!ship) { fitterStatus('Enter a ship name.', true); return; }
 
@@ -1987,11 +1998,11 @@ async function doFitter() {
   document.getElementById('fitter-results').classList.add('hidden');
 
   try {
-    localStorage.setItem('fitterSettings', JSON.stringify({ship, goal, region}));
+    localStorage.setItem('fitterSettings', JSON.stringify({ship, goal, region, role}));
   } catch(e) {}
 
   try {
-    const params = new URLSearchParams({ship, goal, region});
+    const params = new URLSearchParams({ship, goal, region, role});
     const resp = await fetch('/api/fitter/generate?' + params.toString());
     const data = await resp.json();
     if (data.error) {
@@ -2058,16 +2069,28 @@ function renderFitter(data) {
 
   // Capacity card
   h += '<div class="stat-card"><h3>Capacity</h3>';
-  h += '<div class="stat-line">Cargo: <span class="val">' + s.cargo.toFixed(0) + '</span> m\u00b3</div>';
+  if (s.cargo_skill_name) {
+    h += '<div class="stat-line">Cargo: <span class="val">' + s.cargo.toLocaleString() + '</span> / <span class="val">' + s.cargo_adj.toLocaleString() + '</span> m\u00b3 <span class="dim">(' + s.cargo_skill_name + ' ' + s.cargo_skill_level + ')</span></div>';
+  } else {
+    h += '<div class="stat-line">Cargo: <span class="val">' + s.cargo.toLocaleString() + '</span> m\u00b3</div>';
+  }
   if (s.ore_hold_base > 0) {
     h += '<div class="stat-line">Mining hold: <span class="val">' + s.ore_hold_base.toLocaleString() + '</span> / <span class="val">' + s.ore_hold_adj.toLocaleString() + '</span> m\u00b3</div>';
   }
   if (s.fleet_hangar > 0) h += '<div class="stat-line">Fleet hangar: <span class="val">' + s.fleet_hangar.toLocaleString() + '</span> m\u00b3</div>';
   if (s.fuel_bay > 0) h += '<div class="stat-line">Fuel bay: <span class="val">' + s.fuel_bay.toLocaleString() + '</span> m\u00b3</div>';
+  if (data.gank_cost_per_ehp && s.total_ehp_kt) {
+    const gankThreshold = s.total_ehp_kt * data.gank_cost_per_ehp;
+    h += '<div class="stat-line">Gank threshold: <span class="val">' + fmtIsk(gankThreshold) + '</span> <span class="dim">(EHP_kt \u00d7 ' + data.gank_cost_per_ehp.toLocaleString() + ')</span></div>';
+  }
   h += '</div>';
 
   // Navigation card
   h += '<div class="stat-card"><h3>Navigation</h3>';
+  h += '<div class="stat-line">Mass: <span class="val">' + s.mass.toLocaleString() + '</span> kg</div>';
+  h += '<div class="stat-line">Inertia: <span class="val">' + s.agility.toFixed(4) + '</span>';
+  if (s.agility_adj) h += ' / <span class="val">' + s.agility_adj.toFixed(4) + '</span> skilled';
+  h += '</div>';
   h += '<div class="stat-line">Align: <span class="val">' + s.align_time.toFixed(1) + 's</span>';
   if (s.align_time_adj) h += ' / <span class="val">' + s.align_time_adj.toFixed(1) + 's</span> skilled';
   h += '</div>';
@@ -2084,6 +2107,8 @@ function renderFitter(data) {
   h += '<div class="stat-line">Shield: <span class="val">' + s.shield_hp.toLocaleString() + ' HP</span> <span class="dim">(EM ' + fmtPct(sr.EM) + ' / Th ' + fmtPct(sr.Therm) + ' / Kin ' + fmtPct(sr.Kin) + ' / Ex ' + fmtPct(sr.Exp) + ')</span></div>';
   h += '<div class="stat-line">Armor: <span class="val">' + s.armor_hp.toLocaleString() + ' HP</span> <span class="dim">(EM ' + fmtPct(ar.EM) + ' / Th ' + fmtPct(ar.Therm) + ' / Kin ' + fmtPct(ar.Kin) + ' / Ex ' + fmtPct(ar.Exp) + ')</span></div>';
   h += '<div class="stat-line">Structure: <span class="val">' + s.structure_hp.toLocaleString() + ' HP</span></div>';
+  if (s.total_ehp) h += '<div class="stat-line"><strong>EHP (omni):</strong> <span class="val">' + Math.round(s.total_ehp).toLocaleString() + '</span></div>';
+  if (s.total_ehp_kt) h += '<div class="stat-line"><strong>EHP (Kin/Therm):</strong> <span class="val">' + Math.round(s.total_ehp_kt).toLocaleString() + '</span></div>';
 
   // Hull bonuses
   if (s.structured_bonuses && s.structured_bonuses.length) {
@@ -2116,9 +2141,14 @@ function renderFitter(data) {
     rig: 'Rig Slots (' + s.rig_slots + ' slots, ' + s.calibration.toFixed(0) + ' cal)',
   };
 
+  const roleHidden = data.role_hidden || {};
   h += '<div class="fitter-section"><h2>Module Candidates</h2>';
   ['high','mid','low','rig'].forEach(slotType => {
-    const cats = data.candidates[slotType] || [];
+    let cats = data.candidates[slotType] || [];
+    if (!cats.length) return;
+    // Role-based filtering (render-time only, data preserved)
+    const hidden = roleHidden[slotType] || [];
+    if (hidden.length) cats = cats.filter(c => !hidden.includes(c.name));
     if (!cats.length) return;
     h += '<h3>' + slotLabels[slotType] + '</h3>';
     cats.forEach(cat => {
@@ -2129,7 +2159,8 @@ function renderFitter(data) {
   });
   h += '</div>';
 
-  // ── Drones ──
+  // ── Drones (skip when no drone bay) ──
+  if (s.drone_bay > 0 || s.drone_bw > 0) {
   h += '<div class="fitter-section"><h2>Drones</h2>';
   h += '<div class="stat-line">Bay: <span class="val">' + s.drone_bay.toFixed(0) + '</span> m\u00b3 &bull; BW: <span class="val">' + s.drone_bw.toFixed(0) + '</span> Mbit/s</div>';
   (data.drones || []).forEach(cat => {
@@ -2138,6 +2169,7 @@ function renderFitter(data) {
     h += renderDroneTable(cat, regionLabels);
   });
   h += '</div>';
+  } // end drone bay check
 
   // Copy markdown button
   h += '<button id="copy-md-btn" onclick="copyDossier()">Copy Markdown to Clipboard</button>';
@@ -2290,14 +2322,15 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             return
         goal = qs.get("goal", [""])[0]
         region_key = qs.get("region", ["verge"])[0]
+        role = qs.get("role", ["auto"])[0]
         if region_key not in REGIONS:
             self._send_json({"error": f"Unknown region: {region_key}"}, 400)
             return
 
-        print(f"  Fitter: generating dossier for {ship_name.strip()}...")
+        print(f"  Fitter: generating dossier for {ship_name.strip()} (role={role})...")
         try:
             data = fit_dossier.generate_dossier_data(
-                ship_name.strip(), goal=goal, region_key=region_key,
+                ship_name.strip(), goal=goal, region_key=region_key, role=role,
             )
         except Exception as e:
             self._send_json({"error": f"Dossier generation failed: {e}"}, 500)

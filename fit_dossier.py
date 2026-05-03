@@ -1841,6 +1841,12 @@ def generate_dossier_data(ship_name, goal="", region_key="verge",
             for c in cat.get("candidates", []):
                 c["dogma"] = _strkeys(c.get("dogma", {}))
 
+    # Build role hidden set for frontend filtering
+    role_hidden = {}
+    rh = ROLE_HIDDEN_CATEGORIES.get(effective_role, {})
+    for st, cats_set in rh.items():
+        role_hidden[st] = list(cats_set)
+
     return {
         "ship": ship_out,
         "candidates": candidates,
@@ -1852,6 +1858,9 @@ def generate_dossier_data(ship_name, goal="", region_key="verge",
         "region": region_key,
         "region_name": local_label,
         "region_labels": region_labels,
+        "role": effective_role,
+        "role_hidden": role_hidden,
+        "gank_cost_per_ehp": GANK_COST_PER_EHP,
         "category_columns": {k: [list(t) for t in v]
                              for k, v in CATEGORY_COLUMNS.items()},
         "markdown": markdown,
