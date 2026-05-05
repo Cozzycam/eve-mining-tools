@@ -217,6 +217,12 @@ MOON_ORES = [
     {"id": 46319, "name": "Shining Ytterbite",     "vol": 10.0, "group": "Ytterbite",  "cls": 8, "tier": "r64"},
 ]
 
+# ── Erratic ore definitions (phased asteroid fields) ────────
+# Reprocessing is random (yields 1 of 8 minerals per batch) — no fixed formula.
+ERRATIC_ORES = [
+    {"id": 90041, "name": "Prismaticite", "vol": 40.0, "group": "Prismaticite", "cls": 9},
+]
+
 # ── Compressed type IDs (raw_id → compressed_id, all 100:1 ratio) ─
 COMP_IDS = {
     # Belt: Highsec
@@ -275,6 +281,8 @@ COMP_IDS = {
     45511: 62507, 46314: 62508, 46315: 62509,                    # Monazite
     45512: 62504, 46316: 62505, 46317: 62506,                    # Loparite
     45513: 62513, 46318: 62514, 46319: 62515,                    # Ytterbite
+    # Erratic
+    90041: 90307,                                                # Prismaticite
 }
 
 COMPRESSION_RATIO = 100  # universal: 100 raw units → 1 compressed unit
@@ -390,7 +398,9 @@ for _o in BELT_ORES:
     _o["cat"] = "belt"
 for _o in MOON_ORES:
     _o["cat"] = "moon"
-ORES = BELT_ORES + MOON_ORES
+for _o in ERRATIC_ORES:
+    _o["cat"] = "erratic"
+ORES = BELT_ORES + MOON_ORES + ERRATIC_ORES
 
 SHIPS = {
     "venture":   5000,
@@ -625,6 +635,8 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
         ores = [o for o in ORES if o["cat"] == "belt"]
     elif ore_class == "moon":
         ores = [o for o in ORES if o["cat"] == "moon"]
+    elif ore_class == "erratic":
+        ores = [o for o in ORES if o["cat"] == "erratic"]
     else:
         try:
             cls_int = int(ore_class)
@@ -1266,6 +1278,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <option value="7">R32 &mdash; Rare</option>
         <option value="8">R64 &mdash; Exceptional</option>
       </optgroup>
+      <optgroup label="Erratic Ores">
+        <option value="erratic">Erratic (Phased Fields)</option>
+      </optgroup>
     </select>
   </div>
   <div class="field">
@@ -1514,8 +1529,8 @@ async function doScan() {
   scanBtn.disabled = true;
   statusEl.className = '';
   const clsVal = document.getElementById('ore-class').value;
-  const clsLabels = {'0':'all ores','belt':'all belt','1':'Highsec','2':'Lowsec','3':'Nullsec','moon':'all moon','4':'R4','5':'R8','6':'R16','7':'R32','8':'R64'};
-  const oreCounts = {'0':168,'belt':108,'1':32,'2':42,'3':34,'moon':60,'4':12,'5':12,'6':12,'7':12,'8':12};
+  const clsLabels = {'0':'all ores','belt':'all belt','1':'Highsec','2':'Lowsec','3':'Nullsec','moon':'all moon','4':'R4','5':'R8','6':'R16','7':'R32','8':'R64','erratic':'Erratic'};
+  const oreCounts = {'0':169,'belt':108,'1':32,'2':42,'3':34,'moon':60,'4':12,'5':12,'6':12,'7':12,'8':12,'erratic':1};
   const clsLabel = clsLabels[clsVal] || 'ores';
   const oreCount = oreCounts[clsVal] || 168;
   const reproPct = document.getElementById('repro-pct').value;
