@@ -393,6 +393,25 @@ for _formula in REPRO_FORMULAS.values():
     for _mat_id, _ in _formula:
         REPRO_MATERIAL_IDS.add(_mat_id)
 
+# Random reprocessing for erratic ores (per 100 units, 100% yield)
+# Each batch randomly produces ONE mineral from the list with variable quantity
+RANDOM_REPRO_RANGES = {
+    90041: [  # Prismaticite
+        (34, 368000, 496800),   # Tritanium
+        (35, 89464, 111830),    # Pyerite
+        (36, 35420, 45540),     # Mexallon
+        (37, 23920, 31280),     # Isogen
+        (38, 2875, 4025),       # Nocxium
+        (39, 1299, 1528),       # Zydrine
+        (40, 634, 830),         # Megacyte
+        (11399, 312, 624),      # Morphite
+    ],
+}
+# Ensure all random repro minerals are in the price-fetch set
+for _outcomes in RANDOM_REPRO_RANGES.values():
+    for _mat_id, _, _ in _outcomes:
+        REPRO_MATERIAL_IDS.add(_mat_id)
+
 # Assign categories and combine into single ORES list
 for _o in BELT_ORES:
     _o["cat"] = "belt"
@@ -474,6 +493,30 @@ def calc_repro_value(ore_id, material_prices, repro_efficiency):
     return total
 
 
+def calc_random_repro_range(ore_id, material_prices, repro_efficiency):
+    """Calculate min/max/avg ISK from reprocessing 100 units of a random-output ore.
+
+    Each batch randomly produces ONE mineral from the possible outcomes.
+    Returns (min_isk, max_isk, avg_isk) or None.
+    """
+    if ore_id not in RANDOM_REPRO_RANGES:
+        return None
+    outcomes = []
+    for mat_id, min_qty, max_qty in RANDOM_REPRO_RANGES[ore_id]:
+        price = material_prices.get(mat_id, 0)
+        if price <= 0:
+            continue
+        lo = int(min_qty * repro_efficiency) * price
+        hi = int(max_qty * repro_efficiency) * price
+        outcomes.append((lo, hi))
+    if not outcomes:
+        return None
+    worst = min(o[0] for o in outcomes)
+    best = max(o[1] for o in outcomes)
+    avg = sum((o[0] + o[1]) / 2 for o in outcomes) / len(outcomes)
+    return (worst, best, avg)
+
+
 def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
                            from_system_id, hold_size, ore_vol, yield_m3_min,
                            local_region_key=None):
@@ -483,18 +526,29 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
     in station and sell to local buy orders.  Other regions require hauling
     minerals to their trade hub, so full jump count applies.
 
+    Handles both deterministic ores (REPRO_VARIANTS) and random-output
+    erratic ores (RANDOM_REPRO_RANGES).
+
     Returns dict with repro_isk_m3/hold/hr/jumps/region/hub, or None.
     """
-    if ore_id not in REPRO_VARIANTS:
+    is_random = ore_id in RANDOM_REPRO_RANGES
+    if not is_random and ore_id not in REPRO_VARIANTS:
         return None
 
     best = None
     best_score = -1
 
     for rkey, mat_prices in all_region_mat_prices.items():
-        repro_val = calc_repro_value(ore_id, mat_prices, repro_efficiency)
-        if repro_val is None or repro_val <= 0:
-            continue
+        if is_random:
+            rng = calc_random_repro_range(ore_id, mat_prices, repro_efficiency)
+            if rng is None:
+                continue
+            min_isk, max_isk, avg_isk = rng
+            repro_val = avg_isk  # use average for scoring
+        else:
+            repro_val = calc_repro_value(ore_id, mat_prices, repro_efficiency)
+            if repro_val is None or repro_val <= 0:
+                continue
 
         repro_isk_m3 = repro_val / (100 * ore_vol)
         repro_isk_hold = repro_isk_m3 * hold_size
@@ -520,7 +574,7 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
 
         if score > best_score:
             best_score = score
-            best = {
+            result = {
                 "repro_isk_m3": repro_isk_m3,
                 "repro_isk_hold": repro_isk_hold,
                 "repro_isk_hr": repro_isk_hr,
@@ -528,6 +582,10 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
                 "repro_region": REGIONS[rkey]["name"],
                 "repro_hub": REGION_HUBS[rkey],
             }
+            if is_random:
+                result["repro_isk_m3_min"] = min_isk / (100 * ore_vol)
+                result["repro_isk_m3_max"] = max_isk / (100 * ore_vol)
+            best = result
 
     return best
 
@@ -587,6 +645,7 @@ def _empty_result(ore, order_count=0, demand=0):
             "comp_isk_hr": None, "comp_jumps": None, "comp_system_id": None,
             "repro_isk_m3": 0, "repro_isk_hold": 0, "repro_isk_hr": None,
             "repro_jumps": None, "repro_region": None, "repro_hub": None,
+            "repro_isk_m3_min": None, "repro_isk_m3_max": None,
             "buyback_isk_m3": 0, "buyback_isk_hold": 0, "buyback_isk_hr": None,
             "buyback_type": None,
             "best_path": "raw", "best_isk_m3": 0, "best_isk_hr": None,
@@ -724,6 +783,8 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
                 entry["repro_jumps"] = repro["repro_jumps"]
                 entry["repro_region"] = repro["repro_region"]
                 entry["repro_hub"] = repro["repro_hub"]
+                entry["repro_isk_m3_min"] = repro.get("repro_isk_m3_min")
+                entry["repro_isk_m3_max"] = repro.get("repro_isk_m3_max")
 
         # ── Path 4: Buyback (zero travel) ──
         if buyback_rate > 0:
@@ -1896,7 +1957,13 @@ function renderResults(data, isResort) {
     if (showPaths) {
       html += '<td class="num">' + (r.isk_m3 > 0 ? fmtNum(r.isk_m3) : '<span class="no-orders">--</span>') + '</td>';
       if (hasComp) html += '<td class="num">' + (r.comp_isk_m3 > 0 ? '<span class="comp-better">' + fmtNum(r.comp_isk_m3) + '</span>' : '<span class="no-orders">--</span>') + '</td>';
-      if (hasRepro) html += '<td class="num">' + (r.repro_isk_m3 > 0 ? '<span class="repro-better">' + fmtNum(r.repro_isk_m3) + '</span>' : '<span class="no-orders">--</span>') + '</td>';
+      if (hasRepro) {
+        if (r.repro_isk_m3_min != null && r.repro_isk_m3_max != null) {
+          html += '<td class="num"><span class="repro-better" title="Random output (avg ' + fmtNum(r.repro_isk_m3) + ')">' + fmtNum(r.repro_isk_m3_min) + ' - ' + fmtNum(r.repro_isk_m3_max) + '</span></td>';
+        } else {
+          html += '<td class="num">' + (r.repro_isk_m3 > 0 ? '<span class="repro-better">' + fmtNum(r.repro_isk_m3) + '</span>' : '<span class="no-orders">--</span>') + '</td>';
+        }
+      }
       if (hasBuyback) html += '<td class="num">' + (r.buyback_isk_m3 > 0 ? fmtNum(r.buyback_isk_m3) : '<span class="no-orders">--</span>') + '</td>';
     }
 
@@ -2464,6 +2531,8 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
                 "repro_jumps": r.get("repro_jumps"),
                 "repro_hub": r.get("repro_hub"),
                 "repro_region": r.get("repro_region"),
+                "repro_isk_m3_min": _r(r.get("repro_isk_m3_min")),
+                "repro_isk_m3_max": _r(r.get("repro_isk_m3_max")),
                 # Buyback
                 "buyback_isk_m3": _r(r.get("buyback_isk_m3", 0)),
                 "buyback_isk_hold": _r(r.get("buyback_isk_hold", 0)),
