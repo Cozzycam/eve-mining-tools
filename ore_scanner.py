@@ -475,8 +475,13 @@ def calc_repro_value(ore_id, material_prices, repro_efficiency):
 
 
 def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
-                           from_system_id, hold_size, ore_vol, yield_m3_min):
+                           from_system_id, hold_size, ore_vol, yield_m3_min,
+                           local_region_key=None):
     """Find best region to sell reprocessed materials for an ore.
+
+    For the local region (where the player mines), travel is 0 — reprocess
+    in station and sell to local buy orders.  Other regions require hauling
+    minerals to their trade hub, so full jump count applies.
 
     Returns dict with repro_isk_m3/hold/hr/jumps/region/hub, or None.
     """
@@ -496,11 +501,15 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
 
         repro_jumps = None
         if from_system_id is not None:
-            hub_sid = _get_hub_system_id(rkey)
-            if hub_sid:
-                repro_jumps = get_jump_count(from_system_id, hub_sid)
-                if repro_jumps < 0:
-                    continue  # unreachable
+            if rkey == local_region_key:
+                # Local region: reprocess in station, sell locally — no travel
+                repro_jumps = 0
+            else:
+                hub_sid = _get_hub_system_id(rkey)
+                if hub_sid:
+                    repro_jumps = get_jump_count(from_system_id, hub_sid)
+                    if repro_jumps < 0:
+                        continue  # unreachable
 
         repro_isk_hr = None
         if yield_m3_min > 0:
@@ -627,7 +636,7 @@ def _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min):
 
 def scan(region_id, hold_size, show_all=False, ore_class="0",
          from_system_id=None, yield_m3_min=0,
-         repro_efficiency=0, buyback_rate=0):
+         repro_efficiency=0, buyback_rate=0, region_key=None):
     # Filter ores by class/category
     if ore_class == "0" or ore_class == 0:
         ores = ORES
@@ -706,7 +715,8 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
         if repro_efficiency > 0:
             repro = calc_best_repro_region(
                 ore["id"], all_region_mat_prices, repro_efficiency,
-                from_system_id, hold_size, ore["vol"], yield_m3_min)
+                from_system_id, hold_size, ore["vol"], yield_m3_min,
+                local_region_key=region_key)
             if repro:
                 entry["repro_isk_m3"] = repro["repro_isk_m3"]
                 entry["repro_isk_hold"] = repro["repro_isk_hold"]
@@ -2416,7 +2426,7 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
         results = scan(region["id"], hold_size, show_all=show_all, ore_class=ore_class,
                        from_system_id=from_system_id, yield_m3_min=yield_m3_min,
                        repro_efficiency=repro_efficiency,
-                       buyback_rate=buyback_rate)
+                       buyback_rate=buyback_rate, region_key=region_key)
         results = enrich_results(results, from_system_id=from_system_id)
 
         def _r(v):
