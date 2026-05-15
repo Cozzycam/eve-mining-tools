@@ -538,13 +538,16 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
     if not is_random and ore_id not in REPRO_VARIANTS:
         return None
 
-    # When compressing, score with base hold so travel matters for region pick
+    # When compressing, only consider local region — you reprocess where you
+    # mine, not haul compressed ore cross-region.
     score_hold = hold_size / COMPRESSION_RATIO if compress_in_hold else hold_size
 
     best = None
     best_score = -1
 
     for rkey, mat_prices in all_region_mat_prices.items():
+        if compress_in_hold and rkey != local_region_key:
+            continue
         if is_random:
             rng = calc_random_repro_range(ore_id, mat_prices, repro_efficiency)
             if rng is None:
