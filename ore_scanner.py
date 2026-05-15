@@ -854,6 +854,25 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
                 entry["buyback_isk_hr"] = bb_isk_hr
                 entry["buyback_type"] = bb_type
 
+        # ── Recalculate ISK/hr with base hold when compressing ──
+        # With 100× hold, mining time dwarfs travel (25,000 min vs 15 min),
+        # making all destinations look equal.  Use base hold for mine_min
+        # so travel distance matters proportionally to a real mining session.
+        if compress_in_hold and yield_m3_min > 0:
+            base_hold = hold_size / COMPRESSION_RATIO
+            if entry["comp_isk_m3"] > 0:
+                entry["comp_isk_hr"] = calc_isk_hr(
+                    entry["comp_isk_m3"] * base_hold, base_hold,
+                    yield_m3_min, entry.get("comp_jumps"))
+            if entry["repro_isk_m3"] > 0:
+                entry["repro_isk_hr"] = calc_isk_hr(
+                    entry["repro_isk_m3"] * base_hold, base_hold,
+                    yield_m3_min, entry.get("repro_jumps"))
+            if entry["buyback_isk_m3"] > 0:
+                entry["buyback_isk_hr"] = calc_isk_hr(
+                    entry["buyback_isk_m3"] * base_hold, base_hold,
+                    yield_m3_min, 0)
+
         # ── Determine best path ──
         paths = []
         if entry["isk_m3"] > 0:
