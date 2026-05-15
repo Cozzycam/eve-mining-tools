@@ -519,12 +519,15 @@ def calc_random_repro_range(ore_id, material_prices, repro_efficiency):
 
 def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
                            from_system_id, hold_size, ore_vol, yield_m3_min,
-                           local_region_key=None):
+                           local_region_key=None, compress_in_hold=False):
     """Find best region to sell reprocessed materials for an ore.
 
     For the local region (where the player mines), travel is 0 — reprocess
     in station and sell to local buy orders.  Other regions require hauling
     minerals to their trade hub, so full jump count applies.
+
+    When compress_in_hold is True, ISK/hr scoring uses the base (uncompressed)
+    hold so that travel distance matters when choosing regions.
 
     Handles both deterministic ores (REPRO_VARIANTS) and random-output
     erratic ores (RANDOM_REPRO_RANGES).
@@ -534,6 +537,9 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
     is_random = ore_id in RANDOM_REPRO_RANGES
     if not is_random and ore_id not in REPRO_VARIANTS:
         return None
+
+    # When compressing, score with base hold so travel matters for region pick
+    score_hold = hold_size / COMPRESSION_RATIO if compress_in_hold else hold_size
 
     best = None
     best_score = -1
@@ -567,7 +573,8 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
 
         repro_isk_hr = None
         if yield_m3_min > 0:
-            repro_isk_hr = calc_isk_hr(repro_isk_hold, hold_size, yield_m3_min, repro_jumps)
+            score_isk_hold = repro_isk_m3 * score_hold
+            repro_isk_hr = calc_isk_hr(score_isk_hold, score_hold, yield_m3_min, repro_jumps)
             score = repro_isk_hr or 0
         else:
             score = repro_isk_m3
@@ -820,7 +827,8 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
             repro = calc_best_repro_region(
                 ore["id"], all_region_mat_prices, repro_efficiency,
                 from_system_id, hold_size, ore["vol"], yield_m3_min,
-                local_region_key=region_key)
+                local_region_key=region_key,
+                compress_in_hold=compress_in_hold)
             if repro:
                 entry["repro_isk_m3"] = repro["repro_isk_m3"]
                 entry["repro_isk_hold"] = repro["repro_isk_hold"]
