@@ -695,7 +695,8 @@ def _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min):
 
 def scan(region_id, hold_size, show_all=False, ore_class="0",
          from_system_id=None, yield_m3_min=0,
-         repro_efficiency=0, buyback_rate=0, region_key=None):
+         repro_efficiency=0, buyback_rate=0, region_key=None,
+         compress_in_hold=False):
     # Filter ores by class/category
     if ore_class == "0" or ore_class == 0:
         ores = ORES
@@ -741,27 +742,71 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
 
         entry = _empty_result(ore, order_count, demand)
 
-        # ── Path 1: Raw ore ──
-        raw = _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min)
-        if raw:
-            entry["best_buy"] = raw["price"]
-            entry["isk_m3"] = raw["isk_m3"]
-            entry["isk_hold"] = raw["isk_hold"]
-            entry["isk_hr"] = raw["isk_hr"]
-            entry["system_id"] = raw["system_id"]
-            entry["location_id"] = raw["location_id"]
-            entry["jumps"] = raw["jumps"]
-            entry["sell_local"] = raw["sell_local"]
-            entry["sell_local_label"] = raw["sell_local_label"]
+        # ── Path 1: Raw ore (skip when compressing — you sell compressed) ──
+        if not compress_in_hold:
+            raw = _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min)
+            if raw:
+                entry["best_buy"] = raw["price"]
+                entry["isk_m3"] = raw["isk_m3"]
+                entry["isk_hold"] = raw["isk_hold"]
+                entry["isk_hr"] = raw["isk_hr"]
+                entry["system_id"] = raw["system_id"]
+                entry["location_id"] = raw["location_id"]
+                entry["jumps"] = raw["jumps"]
+                entry["sell_local"] = raw["sell_local"]
+                entry["sell_local_label"] = raw["sell_local_label"]
 
-        # ── Path 2: Compressed ore (travel-aware) ──
+        # ── Path 2: Compressed ore (cross-region when compressing) ──
         if ore["id"] in COMP_IDS:
             time.sleep(0.15)
-            comp_orders = fetch_buy_orders(region_id, COMP_IDS[ore["id"]])
-            comp_buys = [o for o in comp_orders if o.get("is_buy_order", True)] if comp_orders else []
-            # Build a pseudo-ore with compressed vol for evaluation
             comp_ore = {**ore, "vol": COMPRESSION_RATIO * ore["vol"]}
-            comp_eval = _eval_best_order(comp_buys, comp_ore, hold_size, from_system_id, yield_m3_min)
+            if compress_in_hold:
+                # Cross-region: search all hubs for best compressed buy orders
+                best_comp = None
+                units_per_hold = int(hold_size / comp_ore["vol"]) if comp_ore["vol"] > 0 else 0
+                for rkey, rinfo in REGIONS.items():
+                    comp_orders = fetch_buy_orders(rinfo["id"], COMP_IDS[ore["id"]])
+                    comp_buys = [o for o in comp_orders if o.get("is_buy_order", True)] if comp_orders else []
+                    if not comp_buys or units_per_hold <= 0:
+                        time.sleep(0.08)
+                        continue
+                    if rkey == region_key:
+                        # Same region: normal travel-aware eval
+                        comp_eval = _eval_best_order(comp_buys, comp_ore, hold_size, from_system_id, yield_m3_min)
+                    else:
+                        # Other region: best price + travel to hub
+                        viable = [o for o in comp_buys if units_per_hold >= o.get("min_volume", 1)]
+                        best_order = max(viable, key=lambda o: o["price"], default=None) if viable else None
+                        if best_order is None:
+                            time.sleep(0.08)
+                            continue
+                        isk_m3 = best_order["price"] / comp_ore["vol"]
+                        isk_hold = best_order["price"] * units_per_hold
+                        jumps = None
+                        if from_system_id is not None:
+                            hub_sid = _get_hub_system_id(rkey)
+                            if hub_sid:
+                                jumps = get_jump_count(from_system_id, hub_sid)
+                                if jumps < 0:
+                                    time.sleep(0.08)
+                                    continue
+                        isk_hr = calc_isk_hr(isk_hold, hold_size, yield_m3_min, jumps) if yield_m3_min > 0 else None
+                        comp_eval = {"price": best_order["price"], "isk_m3": isk_m3,
+                                     "isk_hold": isk_hold, "isk_hr": isk_hr, "jumps": jumps,
+                                     "system_id": best_order.get("system_id"),
+                                     "location_id": best_order.get("location_id")}
+                    if comp_eval is None:
+                        time.sleep(0.08)
+                        continue
+                    score = comp_eval["isk_hr"] if comp_eval["isk_hr"] else comp_eval["isk_m3"]
+                    if best_comp is None or score > best_comp[1]:
+                        best_comp = (comp_eval, score)
+                    time.sleep(0.08)
+                comp_eval = best_comp[0] if best_comp else None
+            else:
+                comp_orders = fetch_buy_orders(region_id, COMP_IDS[ore["id"]])
+                comp_buys = [o for o in comp_orders if o.get("is_buy_order", True)] if comp_orders else []
+                comp_eval = _eval_best_order(comp_buys, comp_ore, hold_size, from_system_id, yield_m3_min)
             if comp_eval:
                 entry["comp_buy"] = comp_eval["price"]
                 entry["comp_isk_m3"] = comp_eval["isk_m3"]
@@ -1608,7 +1653,8 @@ async function doScan() {
   const buybackPct = document.getElementById('buyback-pct').value;
   const reproExtra = reproPct ? 20 : 0;  // 6 regions x materials
   const bbExtra = buybackPct ? 10 : 0;
-  const estSecs = Math.ceil(oreCount * 0.4) + reproExtra + bbExtra;  // ~0.4s/ore (raw+comp)
+  const compressExtra = document.getElementById('compress-hold').checked ? Math.ceil(oreCount * 0.5) : 0;  // cross-region comp search
+  const estSecs = Math.ceil(oreCount * 0.4) + reproExtra + bbExtra + compressExtra;
   statusEl.innerHTML = '<span class="spinner"></span>Scanning ' + clsLabel + ' (~' + estSecs + 's, first scan slower)';
   resultsEl.classList.add('hidden');
   resultsEl.innerHTML = '';
@@ -2493,7 +2539,8 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
         results = scan(region["id"], hold_size, show_all=show_all, ore_class=ore_class,
                        from_system_id=from_system_id, yield_m3_min=yield_m3_min,
                        repro_efficiency=repro_efficiency,
-                       buyback_rate=buyback_rate, region_key=region_key)
+                       buyback_rate=buyback_rate, region_key=region_key,
+                       compress_in_hold=compress_in_hold)
         results = enrich_results(results, from_system_id=from_system_id)
 
         def _r(v):
