@@ -442,43 +442,101 @@ def _compute_history_stats(history, days=30):
     }
 
 
-def fetch_pi_market(pi_types, local_region_id, progress=False):
-    """Fetch market data for all PI products: 30-day VWAP from history + live buy.
+def _fetch_buy_orders_in_range(region_id, type_id, home_system_id, max_jumps):
+    """Fetch buy orders filtered to stations within max_jumps of home system.
 
-    Uses volume-weighted average price (VWAP) from ESI market history as the
-    primary pricing signal — more stable than live snapshots for PI infrastructure
-    decisions. Live best-buy is kept as a secondary signal.
+    Returns: (best_price, best_order, total_depth) for orders in range,
+             plus (best_any_price, best_any_order) region-wide for reference.
+    """
+    url = (f"{esi.ESI_BASE}/markets/{region_id}/orders/"
+           f"?datasource=tranquility&order_type=buy&type_id={type_id}")
+    orders = esi.esi_get_cached(url, esi.CACHE_TTL_MARKET) or []
+    buy_orders = [o for o in orders if o.get("is_buy_order", True)]
 
-    Returns: {type_id: {local_vwap, local_buy, local_avg_daily_vol,
-                        local_active_days, jita_vwap, jita_buy, ...}}
+    if not buy_orders:
+        return 0, None, 0, 0, None
+
+    # Best region-wide (for reference)
+    best_any = max(buy_orders, key=lambda o: o["price"])
+    best_any_price = best_any["price"]
+
+    # Filter to orders within jump range
+    in_range = []
+    for o in buy_orders:
+        sys_id = o.get("system_id", 0)
+        if sys_id == home_system_id:
+            in_range.append(o)
+            continue
+        jumps = esi.get_jump_count(home_system_id, sys_id)
+        if 0 <= jumps <= max_jumps:
+            in_range.append(o)
+
+    if not in_range:
+        return 0, None, 0, best_any_price, best_any
+
+    best = max(in_range, key=lambda o: o["price"])
+    depth = sum(o.get("volume_remain", 0) for o in in_range)
+    return best["price"], best, depth, best_any_price, best_any
+
+
+def fetch_pi_market(pi_types, local_region_id, home_system_id, max_jumps,
+                    progress=False):
+    """Fetch market data for all PI products.
+
+    Uses two pricing signals:
+    - **Best in-range buy order** (within max_jumps of home) — the actual
+      price you'd sell at. Primary signal for ISK/hr calculations.
+    - **30-day regional VWAP** (from ESI market history) — what the item
+      typically trades at across the region. Reference / sanity check.
+
+    Returns: {type_id: {local_buy, local_depth, local_vwap, ...}}
     """
     jita_region_id = esi.REGIONS["jita"]["id"]
     type_ids = [tid for tid, t in pi_types.items() if t["tier"] != "P0"]
 
     if progress:
-        print(f"  Fetching market history for {len(type_ids)} PI products...")
+        print(f"  Fetching market data for {len(type_ids)} PI products "
+              f"(buy orders within {max_jumps}j of home)...")
 
     prices = {}
 
     def _fetch_one(tid):
-        # Local region: history + live buy
+        # Local region: in-range buy orders + history
+        (local_buy, local_order, local_depth,
+         local_any_buy, _) = _fetch_buy_orders_in_range(
+            local_region_id, tid, home_system_id, max_jumps)
+
         local_hist = _fetch_market_history(local_region_id, tid)
         local_stats = _compute_history_stats(local_hist, days=30)
-        local_live, _ = esi.fetch_best_buy(local_region_id, tid, use_cache=True)
 
-        # Jita: history + live buy
+        # Buyer location for display
+        local_buyer_system = ""
+        local_buyer_jumps = 0
+        if local_order:
+            sys_id = local_order.get("system_id", 0)
+            local_buyer_system = esi.resolve_system_name(sys_id)
+            local_buyer_jumps = esi.get_jump_count(home_system_id, sys_id)
+            if local_buyer_jumps < 0:
+                local_buyer_jumps = 0
+
+        # Jita: history + live buy (no jump filtering — it's a destination)
         jita_hist = _fetch_market_history(jita_region_id, tid)
         jita_stats = _compute_history_stats(jita_hist, days=30)
         jita_live, _ = esi.fetch_best_buy(jita_region_id, tid, use_cache=True)
 
         return tid, {
-            # 30-day VWAP — primary pricing signal
+            # Primary: best buy order within max_jumps of home
+            "local_buy": local_buy,
+            "local_depth": local_depth,
+            "local_buyer_system": local_buyer_system,
+            "local_buyer_jumps": local_buyer_jumps,
+            # Region-wide best buy (may be out of range)
+            "local_any_buy": local_any_buy,
+            # 30-day VWAP — reference / sanity check
             "local_vwap": local_stats["vwap"],
             "local_avg_daily_vol": local_stats["avg_daily_volume"],
             "local_total_vol": local_stats["total_volume"],
             "local_active_days": local_stats["active_days"],
-            # Live best buy — secondary / snapshot
-            "local_buy": local_live,
             # Jita
             "jita_vwap": jita_stats["vwap"],
             "jita_avg_daily_vol": jita_stats["avg_daily_volume"],
@@ -954,9 +1012,9 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
 def compute_economics(viable_chains, market_prices, cfg, pi_types):
     """Compute ISK/hr, tax, haul time for each viable chain.
 
-    Uses 30-day VWAP (volume-weighted average price) from ESI market history
-    as the primary pricing signal. PI is long-term infrastructure — live
-    snapshots are too volatile. Live best-buy kept as secondary reference.
+    Primary price: best live buy order within max_market_jumps of home system.
+    This is the actual price you'd sell at — the realised ISK/hr.
+    Reference: 30-day regional VWAP for sanity checking.
     """
     home_system_id = esi.search_system_id(cfg["home_system"])
     jita_system_id = esi.search_system_id("Jita")
@@ -971,12 +1029,16 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         tid = chain["output_type_id"]
         prices = market_prices.get(tid, {})
 
-        # Primary: 30-day VWAP from market history
+        # Primary: best buy order within jump range
+        local_buy = prices.get("local_buy", 0)
+        local_depth = prices.get("local_depth", 0)
+        local_buyer_system = prices.get("local_buyer_system", "")
+        local_buyer_jumps = prices.get("local_buyer_jumps", 0)
+        local_any_buy = prices.get("local_any_buy", 0)
+        # Reference: 30-day regional VWAP
         local_vwap = prices.get("local_vwap", 0)
         local_avg_daily_vol = prices.get("local_avg_daily_vol", 0)
         local_active_days = prices.get("local_active_days", 0)
-        # Secondary: live snapshot
-        local_buy = prices.get("local_buy", 0)
         # Jita
         jita_vwap = prices.get("jita_vwap", 0)
         jita_avg_daily_vol = prices.get("jita_avg_daily_vol", 0)
@@ -986,8 +1048,11 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         units_hr = vc.get("units_hr", 0)
 
         # Store all price signals
-        vc["local_vwap"] = local_vwap
         vc["local_buy_price"] = local_buy
+        vc["local_depth"] = local_depth
+        vc["local_buyer_system"] = local_buyer_system
+        vc["local_buyer_jumps"] = local_buyer_jumps
+        vc["local_vwap"] = local_vwap
         vc["local_avg_daily_vol"] = local_avg_daily_vol
         vc["local_active_days"] = local_active_days
         vc["jita_vwap"] = jita_vwap
@@ -995,8 +1060,8 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         vc["jita_avg_daily_vol"] = jita_avg_daily_vol
         vc["jita_active_days"] = jita_active_days
 
-        # Gross ISK/hr uses VWAP (what you'd realistically sell for over time)
-        vc["gross_isk_hr"] = units_hr * local_vwap
+        # Gross ISK/hr uses best in-range buy (what you'd actually sell for)
+        vc["gross_isk_hr"] = units_hr * local_buy
 
         # Tax
         tax_per_unit = _compute_chain_tax(vc, pi_types, cfg)
@@ -1005,7 +1070,7 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         # Net ISK/hr = gross - tax
         vc["net_isk_hr"] = vc["gross_isk_hr"] - vc["tax_per_hr"]
 
-        # Jita ISK/hr (using Jita VWAP)
+        # Jita ISK/hr (using Jita VWAP — you'd sell over time there)
         haul_model = cfg["haul"]
         jita_round_trip_sec = (jita_jumps * 2 * haul_model["sec_per_jump"]
                                + 2 * haul_model["sec_per_station"])
@@ -1016,8 +1081,21 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         # Haul time for daily production
         vc["haul_minutes_per_day"] = _compute_haul_time(vc, cfg)
 
-        # Flags
-        # Liquidity: can the market absorb your daily production?
+        # ── Flags ──
+
+        # NO LOCAL BUYER: no buy orders within jump range
+        if local_buy == 0:
+            if local_vwap > 100:
+                vc["flags"].append("NO LOCAL BUYER")
+            elif jita_vwap > 100:
+                vc["flags"].append("NO LOCAL MARKET")
+        else:
+            # LOWBALL LOCAL: in-range buy is significantly below regional VWAP
+            if local_vwap > 0 and local_buy < local_vwap * 0.85:
+                pct = (1 - local_buy / local_vwap) * 100
+                vc["flags"].append(f"LOWBALL LOCAL (-{pct:.0f}% vs VWAP)")
+
+        # Liquidity
         daily_output = units_hr * 24
         if local_active_days < 10:
             vc["flags"].append(f"LOW ACTIVITY ({local_active_days}d/30d)")
@@ -1036,13 +1114,11 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
             if fill_hours < 24:
                 vc["flags"].append(f"MUST HAUL EVERY {fill_hours:.0f}H")
 
-        # Jita spread: compare VWAPs (more stable than live snapshots)
-        if local_vwap > 10 and jita_vwap > local_vwap:
-            spread_pct = (jita_vwap - local_vwap) / local_vwap * 100
+        # Jita spread: compare in-range buy vs Jita VWAP
+        if local_buy > 10 and jita_vwap > local_buy:
+            spread_pct = (jita_vwap - local_buy) / local_buy * 100
             if spread_pct > 30:
-                vc["flags"].append(f"JITA SPREAD +{spread_pct:.0f}%")
-        elif local_vwap <= 10 and jita_vwap > 100:
-            vc["flags"].append("NO LOCAL MARKET")
+                vc["flags"].append(f"JITA +{spread_pct:.0f}%")
 
 
 def _compute_chain_tax(vc, pi_types, cfg):
@@ -1361,8 +1437,8 @@ def render_markdown(allocated, ranked_by_tier, cfg, char_info, pi_skills,
                       "P3": "P3 (Specialized Commodities)"}
         lines.append(f"### {tier_label.get(tier, tier)}")
         lines.append("")
-        lines.append("| Rank | Product | Setup | Units/hr | 30d VWAP | Live Buy | Net ISK/hr | Vol/day | Haul/day | Flags |")
-        lines.append("|------|---------|-------|----------|----------|----------|------------|---------|----------|-------|")
+        lines.append("| Rank | Product | Setup | Units/hr | Buy (in range) | Buyer | VWAP | Net ISK/hr | Haul/day | Flags |")
+        lines.append("|------|---------|-------|----------|----------------|-------|------|------------|----------|-------|")
 
         for rank, vc in enumerate(tier_chains, 1):
             chain = vc["chain"]
@@ -1383,15 +1459,15 @@ def render_markdown(allocated, ranked_by_tier, cfg, char_info, pi_skills,
             if not vc.get("viable"):
                 flags_str = ", ".join(vc.get("flags", ["NOT VIABLE"]))
 
-            avg_daily_vol = vc.get("local_avg_daily_vol", 0)
-            vol_str = _fmt_num(avg_daily_vol, 0) if avg_daily_vol > 0 else "--"
+            buyer = vc.get("local_buyer_system", "")
+            buyer_jumps = vc.get("local_buyer_jumps", 0)
+            buyer_str = f"{buyer} ({buyer_jumps}j)" if buyer else "--"
 
             lines.append(
                 f"| {rank} | {chain['output_name']} | {setup_str} | "
-                f"{vc.get('units_hr',0):.0f} | {_fmt_isk(vc.get('local_vwap',0))} | "
-                f"{_fmt_isk(vc.get('local_buy_price',0))} | "
+                f"{vc.get('units_hr',0):.0f} | {_fmt_isk(vc.get('local_buy_price',0))} | "
+                f"{buyer_str} | {_fmt_isk(vc.get('local_vwap',0))} | "
                 f"{_fmt_isk(vc.get('net_isk_hr',0))}/hr | "
-                f"{vol_str} | "
                 f"{vc.get('haul_minutes_per_day',0):.0f} min | {flags_str} |"
             )
 
@@ -1444,14 +1520,19 @@ def render_markdown(allocated, ranked_by_tier, cfg, char_info, pi_skills,
     # Flag definitions
     lines.append("## Flag Definitions")
     lines.append("")
-    lines.append("- **THIN MARKET**: local buy depth < 24h production")
+    lines.append(f"- **Buy (in range)**: best buy order within {cfg['max_market_jumps']} jumps of {cfg['home_system']}")
+    lines.append("- **VWAP**: 30-day volume-weighted average transaction price (region-wide)")
+    lines.append("- **NO LOCAL BUYER**: no buy orders within jump range")
+    lines.append("- **NO LOCAL MARKET**: no meaningful trade activity in region")
+    lines.append("- **LOWBALL LOCAL**: best in-range buyer is >15% below regional VWAP")
+    lines.append("- **THIN MARKET**: daily production exceeds avg daily trade volume")
+    lines.append("- **LOW ACTIVITY**: traded fewer than 10 of last 30 days")
     lines.append("- **HAUL OVER BUDGET**: daily haul exceeds max_haul_minutes_per_day")
     lines.append("- **POWER LIMIT**: layout pushes against PG or CPU ceiling")
     lines.append("- **NO [PLANET TYPE]**: chain needs a planet type not in your inventory")
     lines.append("- **MUST HAUL EVERY XH**: launchpad fills before 24h")
     lines.append("- **EXCEEDS 5 PLANETS**: chain needs more planet slots than available")
-    lines.append("- **JITA SPREAD**: Jita price significantly higher than local")
-    lines.append("- **NO LOCAL MARKET**: no meaningful buy orders locally; Jita may work")
+    lines.append("- **JITA +X%**: Jita VWAP significantly higher than local buy")
     lines.append("")
 
     return "\n".join(lines)
@@ -1507,7 +1588,8 @@ def generate_pi_dossier_data(overrides=None):
     chains = build_chain_graph(pi_types, schematics)
 
     print("  PI Dossier: fetching market data...")
-    market_prices = fetch_pi_market(pi_types, local_region_id, progress=True)
+    market_prices = fetch_pi_market(pi_types, local_region_id, home_system_id,
+                                    cfg["max_market_jumps"], progress=True)
 
     print("  PI Dossier: computing layouts and economics...")
     viable = find_viable_chains(chains, pi_types, schematics,
@@ -1535,8 +1617,11 @@ def generate_pi_dossier_data(overrides=None):
             "planet_count": vc.get("planet_count", len(vc.get("planets_used", []))),
             "units_hr": vc.get("units_hr", 0),
             "volume_hr": vc.get("volume_hr", 0),
-            "local_vwap": vc.get("local_vwap", 0),
             "local_buy_price": vc.get("local_buy_price", 0),
+            "local_depth": vc.get("local_depth", 0),
+            "local_buyer_system": vc.get("local_buyer_system", ""),
+            "local_buyer_jumps": vc.get("local_buyer_jumps", 0),
+            "local_vwap": vc.get("local_vwap", 0),
             "local_avg_daily_vol": vc.get("local_avg_daily_vol", 0),
             "local_active_days": vc.get("local_active_days", 0),
             "jita_vwap": vc.get("jita_vwap", 0),
