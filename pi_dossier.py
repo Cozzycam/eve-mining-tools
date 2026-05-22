@@ -608,41 +608,103 @@ def _compute_history_stats(history, days=30):
     }
 
 
+SUSTAINED_PRICE_WINDOW_DAYS = 30  # blend price over this many days of production
+SHALLOW_BUY_THRESHOLD_DAYS = 7   # flag if real buy depth < this many days
+MIN_REAL_ORDER_PRICE = 2         # orders at <= this price are treated as stubs
+
+
 def _fetch_buy_orders_in_range(region_id, type_id, home_system_id, max_jumps):
     """Fetch buy orders filtered to stations within max_jumps of home system.
 
-    Returns: (best_price, best_order, total_depth) for orders in range,
-             plus (best_any_price, best_any_order) region-wide for reference.
+    Returns: {
+        "best_price": float, "best_order": dict, "real_depth": int,
+        "book": [(price, volume, system_name, jumps), ...] sorted desc by price,
+        "best_any_price": float
+    }
     """
     url = (f"{esi.ESI_BASE}/markets/{region_id}/orders/"
            f"?datasource=tranquility&order_type=buy&type_id={type_id}")
     orders = esi.esi_get_cached(url, esi.CACHE_TTL_MARKET) or []
     buy_orders = [o for o in orders if o.get("is_buy_order", True)]
 
-    if not buy_orders:
-        return 0, None, 0, 0, None
+    empty = {"best_price": 0, "best_order": None, "real_depth": 0,
+             "book": [], "best_any_price": 0}
 
-    # Best region-wide (for reference)
-    best_any = max(buy_orders, key=lambda o: o["price"])
-    best_any_price = best_any["price"]
+    if not buy_orders:
+        return empty
+
+    best_any_price = max(o["price"] for o in buy_orders)
 
     # Filter to orders within jump range
     in_range = []
     for o in buy_orders:
         sys_id = o.get("system_id", 0)
         if sys_id == home_system_id:
-            in_range.append(o)
-            continue
-        jumps = esi.get_jump_count(home_system_id, sys_id)
-        if 0 <= jumps <= max_jumps:
-            in_range.append(o)
+            jumps = 0
+        else:
+            jumps = esi.get_jump_count(home_system_id, sys_id)
+            if jumps < 0 or jumps > max_jumps:
+                continue
+        in_range.append((o["price"], o.get("volume_remain", 0),
+                         esi.resolve_system_name(sys_id), jumps, o))
 
     if not in_range:
-        return 0, None, 0, best_any_price, best_any
+        return {**empty, "best_any_price": best_any_price}
 
-    best = max(in_range, key=lambda o: o["price"])
-    depth = sum(o.get("volume_remain", 0) for o in in_range)
-    return best["price"], best, depth, best_any_price, best_any
+    in_range.sort(key=lambda x: -x[0])
+    best_order = in_range[0][4]
+    best_price = in_range[0][0]
+    real_depth = sum(vol for price, vol, _, _, _ in in_range
+                     if price > MIN_REAL_ORDER_PRICE)
+    book = [(price, vol, sys_name, jumps)
+            for price, vol, sys_name, jumps, _ in in_range]
+
+    return {
+        "best_price": best_price,
+        "best_order": best_order,
+        "real_depth": real_depth,
+        "book": book,
+        "best_any_price": best_any_price,
+    }
+
+
+def _compute_sustained_price(book, units_per_day, vwap, days=SUSTAINED_PRICE_WINDOW_DAYS):
+    """Walk the buy order book and blend with VWAP over N days of production.
+
+    For each order above the stub threshold, sell into it until exhausted.
+    Remaining production (no buy orders left) assumes user posts sell orders
+    at VWAP — the typical regional trade price.
+
+    Returns: (sustained_price_per_unit, real_buy_days)
+    """
+    total_to_sell = units_per_day * days
+    if total_to_sell <= 0:
+        return vwap, 0
+
+    sold = 0
+    revenue = 0.0
+    real_buy_units = 0
+
+    for price, volume, _, _ in book:
+        if price <= MIN_REAL_ORDER_PRICE:
+            continue  # skip 1-ISK stubs
+        can_sell = min(volume, total_to_sell - sold)
+        revenue += can_sell * price
+        sold += can_sell
+        real_buy_units += can_sell
+        if sold >= total_to_sell:
+            break
+
+    # Remaining production sold at VWAP (user posts sell orders)
+    remaining = total_to_sell - sold
+    if remaining > 0:
+        fill_price = vwap if vwap > 0 else 0
+        revenue += remaining * fill_price
+        sold += remaining
+
+    sustained = revenue / sold if sold > 0 else 0
+    real_buy_days = real_buy_units / units_per_day if units_per_day > 0 else 0
+    return sustained, real_buy_days
 
 
 def fetch_pi_market(pi_types, local_region_id, home_system_id, max_jumps,
@@ -668,18 +730,17 @@ def fetch_pi_market(pi_types, local_region_id, home_system_id, max_jumps,
 
     def _fetch_one(tid):
         # Local region: in-range buy orders + history
-        (local_buy, local_order, local_depth,
-         local_any_buy, _) = _fetch_buy_orders_in_range(
+        local_data = _fetch_buy_orders_in_range(
             local_region_id, tid, home_system_id, max_jumps)
 
         local_hist = _fetch_market_history(local_region_id, tid)
         local_stats = _compute_history_stats(local_hist, days=30)
 
-        # Buyer location for display
+        # Buyer location for display (from top order)
         local_buyer_system = ""
         local_buyer_jumps = 0
-        if local_order:
-            sys_id = local_order.get("system_id", 0)
+        if local_data["best_order"]:
+            sys_id = local_data["best_order"].get("system_id", 0)
             local_buyer_system = esi.resolve_system_name(sys_id)
             local_buyer_jumps = esi.get_jump_count(home_system_id, sys_id)
             if local_buyer_jumps < 0:
@@ -691,14 +752,14 @@ def fetch_pi_market(pi_types, local_region_id, home_system_id, max_jumps,
         jita_live, _ = esi.fetch_best_buy(jita_region_id, tid, use_cache=True)
 
         return tid, {
-            # Primary: best buy order within max_jumps of home
-            "local_buy": local_buy,
-            "local_depth": local_depth,
+            # Buy order book within range (sorted desc by price)
+            "local_buy": local_data["best_price"],
+            "local_real_depth": local_data["real_depth"],
+            "local_book": local_data["book"],
             "local_buyer_system": local_buyer_system,
             "local_buyer_jumps": local_buyer_jumps,
-            # Region-wide best buy (may be out of range)
-            "local_any_buy": local_any_buy,
-            # 30-day VWAP — reference / sanity check
+            "local_any_buy": local_data["best_any_price"],
+            # 30-day VWAP — reference / sustained-sale fallback
             "local_vwap": local_stats["vwap"],
             "local_avg_daily_vol": local_stats["avg_daily_volume"],
             "local_total_vol": local_stats["total_volume"],
@@ -1193,9 +1254,10 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
 def compute_economics(viable_chains, market_prices, cfg, pi_types):
     """Compute ISK/hr, tax, haul time for each viable chain.
 
-    Primary price: best live buy order within max_market_jumps of home system.
-    This is the actual price you'd sell at — the realised ISK/hr.
-    Reference: 30-day regional VWAP for sanity checking.
+    Primary price: sustained realised price — walks the buy order book within
+    max_market_jumps and blends with VWAP for production beyond order depth.
+    This models what you'd actually earn over 30 days, not just the instant
+    top-of-book price.
     """
     home_system_id = esi.search_system_id(cfg["home_system"])
     jita_system_id = esi.search_system_id("Jita")
@@ -1210,27 +1272,31 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         tid = chain["output_type_id"]
         prices = market_prices.get(tid, {})
 
-        # Primary: best buy order within jump range
         local_buy = prices.get("local_buy", 0)
-        local_depth = prices.get("local_depth", 0)
+        local_book = prices.get("local_book", [])
+        local_real_depth = prices.get("local_real_depth", 0)
         local_buyer_system = prices.get("local_buyer_system", "")
         local_buyer_jumps = prices.get("local_buyer_jumps", 0)
-        local_any_buy = prices.get("local_any_buy", 0)
-        # Reference: 30-day regional VWAP
         local_vwap = prices.get("local_vwap", 0)
         local_avg_daily_vol = prices.get("local_avg_daily_vol", 0)
         local_active_days = prices.get("local_active_days", 0)
-        # Jita
         jita_vwap = prices.get("jita_vwap", 0)
         jita_avg_daily_vol = prices.get("jita_avg_daily_vol", 0)
         jita_active_days = prices.get("jita_active_days", 0)
         jita_buy = prices.get("jita_buy", 0)
 
         units_hr = vc.get("units_hr", 0)
+        units_per_day = units_hr * 24
+
+        # Compute sustained realised price: walk the order book, blend with VWAP
+        sustained_price, real_buy_days = _compute_sustained_price(
+            local_book, units_per_day, local_vwap)
 
         # Store all price signals
-        vc["local_buy_price"] = local_buy
-        vc["local_depth"] = local_depth
+        vc["local_buy_price"] = local_buy  # top of book (snapshot)
+        vc["local_sustained"] = sustained_price  # blended over 30d
+        vc["local_real_depth"] = local_real_depth
+        vc["local_real_buy_days"] = real_buy_days
         vc["local_buyer_system"] = local_buyer_system
         vc["local_buyer_jumps"] = local_buyer_jumps
         vc["local_vwap"] = local_vwap
@@ -1241,8 +1307,8 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         vc["jita_avg_daily_vol"] = jita_avg_daily_vol
         vc["jita_active_days"] = jita_active_days
 
-        # Gross ISK/hr uses best in-range buy (what you'd actually sell for)
-        vc["gross_isk_hr"] = units_hr * local_buy
+        # Gross ISK/hr uses sustained price (realistic over 30 days)
+        vc["gross_isk_hr"] = units_hr * sustained_price
 
         # Tax
         tax_per_unit = _compute_chain_tax(vc, pi_types, cfg)
@@ -1270,20 +1336,17 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
                 vc["flags"].append("NO LOCAL BUYER")
             elif jita_vwap > 100:
                 vc["flags"].append("NO LOCAL MARKET")
-        else:
-            # LOWBALL LOCAL: in-range buy is significantly below regional VWAP
-            if local_vwap > 0 and local_buy < local_vwap * 0.85:
-                pct = (1 - local_buy / local_vwap) * 100
-                vc["flags"].append(f"LOWBALL LOCAL (-{pct:.0f}% vs VWAP)")
 
-        # Liquidity
-        daily_output = units_hr * 24
+        # SHALLOW BUY: real buy order depth covers less than 7 days of production
+        if real_buy_days < SHALLOW_BUY_THRESHOLD_DAYS and units_per_day > 0:
+            if real_buy_days > 0:
+                vc["flags"].append(f"SHALLOW BUY ({real_buy_days:.0f}d depth)")
+            elif local_buy > MIN_REAL_ORDER_PRICE:
+                vc["flags"].append("SHALLOW BUY (<1d depth)")
+
+        # Liquidity from history
         if local_active_days < 10:
             vc["flags"].append(f"LOW ACTIVITY ({local_active_days}d/30d)")
-        elif local_avg_daily_vol > 0 and daily_output > 0:
-            days_to_absorb = daily_output / local_avg_daily_vol
-            if days_to_absorb > 1:
-                vc["flags"].append("THIN MARKET")
 
         if vc["haul_minutes_per_day"] > cfg["max_haul_minutes"]:
             vc["flags"].append("HAUL OVER BUDGET")
@@ -1619,8 +1682,8 @@ def render_markdown(allocated, ranked_by_tier, cfg, char_info, pi_skills,
                       "P3": "P3 (Specialized Commodities)"}
         lines.append(f"### {tier_label.get(tier, tier)}")
         lines.append("")
-        lines.append("| Rank | Product | Setup | Units/hr | Buy (in range) | Buyer | VWAP | Net ISK/hr | Haul/day | Flags |")
-        lines.append("|------|---------|-------|----------|----------------|-------|------|------------|----------|-------|")
+        lines.append("| Rank | Product | Setup | Units/hr | Sustained | Top Buy | VWAP | Net ISK/hr | Haul/day | Flags |")
+        lines.append("|------|---------|-------|----------|-----------|---------|------|------------|----------|-------|")
 
         for rank, vc in enumerate(tier_chains, 1):
             chain = vc["chain"]
@@ -1647,8 +1710,9 @@ def render_markdown(allocated, ranked_by_tier, cfg, char_info, pi_skills,
 
             lines.append(
                 f"| {rank} | {chain['output_name']} | {setup_str} | "
-                f"{vc.get('units_hr',0):.0f} | {_fmt_isk(vc.get('local_buy_price',0))} | "
-                f"{buyer_str} | {_fmt_isk(vc.get('local_vwap',0))} | "
+                f"{vc.get('units_hr',0):.0f} | {_fmt_isk(vc.get('local_sustained',0))} | "
+                f"{_fmt_isk(vc.get('local_buy_price',0))} | "
+                f"{_fmt_isk(vc.get('local_vwap',0))} | "
                 f"{_fmt_isk(vc.get('net_isk_hr',0))}/hr | "
                 f"{vc.get('haul_minutes_per_day',0):.0f} min | {flags_str} |"
             )
@@ -1702,12 +1766,12 @@ def render_markdown(allocated, ranked_by_tier, cfg, char_info, pi_skills,
     # Flag definitions
     lines.append("## Flag Definitions")
     lines.append("")
-    lines.append(f"- **Buy (in range)**: best buy order within {cfg['max_market_jumps']} jumps of {cfg['home_system']}")
+    lines.append(f"- **Sustained**: blended price over 30d — walks buy book within {cfg['max_market_jumps']}j, VWAP for remainder")
+    lines.append("- **Top Buy**: highest buy order within range (snapshot)")
     lines.append("- **VWAP**: 30-day volume-weighted average transaction price (region-wide)")
+    lines.append("- **SHALLOW BUY**: real buy orders (>2 ISK) cover <7 days of production")
     lines.append("- **NO LOCAL BUYER**: no buy orders within jump range")
     lines.append("- **NO LOCAL MARKET**: no meaningful trade activity in region")
-    lines.append("- **LOWBALL LOCAL**: best in-range buyer is >15% below regional VWAP")
-    lines.append("- **THIN MARKET**: daily production exceeds avg daily trade volume")
     lines.append("- **LOW ACTIVITY**: traded fewer than 10 of last 30 days")
     lines.append("- **HAUL OVER BUDGET**: daily haul exceeds max_haul_minutes_per_day")
     lines.append("- **POWER LIMIT**: layout pushes against PG or CPU ceiling")
@@ -1800,8 +1864,10 @@ def generate_pi_dossier_data(overrides=None):
             "planet_count": vc.get("planet_count", len(vc.get("planets_used", []))),
             "units_hr": vc.get("units_hr", 0),
             "volume_hr": vc.get("volume_hr", 0),
+            "local_sustained": vc.get("local_sustained", 0),
             "local_buy_price": vc.get("local_buy_price", 0),
-            "local_depth": vc.get("local_depth", 0),
+            "local_real_depth": vc.get("local_real_depth", 0),
+            "local_real_buy_days": vc.get("local_real_buy_days", 0),
             "local_buyer_system": vc.get("local_buyer_system", ""),
             "local_buyer_jumps": vc.get("local_buyer_jumps", 0),
             "local_vwap": vc.get("local_vwap", 0),
