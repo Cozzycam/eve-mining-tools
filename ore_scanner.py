@@ -2735,17 +2735,18 @@ function renderPi(data) {
     let totalNet = 0;
     data.allocated.forEach(a => { totalNet += a.net_isk_hr || 0; });
     h += '<p><strong>Total:</strong> ' + fmtIsk(totalNet) + '/hr net</p>';
-    h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>System</th><th>Type</th><th>Role</th><th>Product</th><th class="num">Net ISK/hr</th></tr></thead><tbody>';
+    h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>System</th><th>Type</th><th>Role</th><th>Product</th><th class="num">ISK/hr (chain)</th></tr></thead><tbody>';
     let slot = 0;
     data.allocated.forEach(a => {
       if (a.planets_used && a.planets_used.length) {
-        a.planets_used.forEach(p => {
+        a.planets_used.forEach((p, i) => {
           slot++;
-          h += '<tr><td>' + slot + '</td><td>' + p.system + '</td><td>' + p.type + '</td><td>' + p.role + '</td><td>' + a.output_name + '</td><td class="num">' + fmtIsk(a.net_isk_hr) + '</td></tr>';
+          const iskCol = i === 0 ? fmtIsk(a.net_isk_hr) + '/hr' : '';
+          h += '<tr><td>' + slot + '</td><td>' + p.system + '</td><td>' + p.type + '</td><td>' + p.role + '</td><td>' + a.output_name + '</td><td class="num">' + iskCol + '</td></tr>';
         });
       } else {
         slot++;
-        h += '<tr><td>' + slot + '</td><td>--</td><td>--</td><td>' + a.layout_type + '</td><td>' + a.output_name + '</td><td class="num">' + fmtIsk(a.net_isk_hr) + '</td></tr>';
+        h += '<tr><td>' + slot + '</td><td>--</td><td>--</td><td>' + a.layout_type + '</td><td>' + a.output_name + '</td><td class="num">' + fmtIsk(a.net_isk_hr) + '/hr</td></tr>';
       }
     });
     h += '</tbody></table></div></div>';

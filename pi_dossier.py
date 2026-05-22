@@ -1494,29 +1494,43 @@ def rank_chains(viable_chains):
 
 
 def allocate_5_planets(ranked_chains, planet_inv, max_planets=5, max_haul_minutes=None):
-    """Greedy allocator: pick top chain, consume its planets, repeat."""
+    """Allocate planet slots to maximize total ISK/hr.
+
+    Ranks chains by ISK/hr per planet slot consumed, then fills greedily.
+    Self-contained 1-planet chains naturally win over factory chains unless
+    the factory's per-slot contribution exceeds the next-best alternative.
+    """
+    # Pre-compute per-slot value for each chain
+    candidates = []
+    for vc in ranked_chains:
+        if not vc.get("viable"):
+            continue
+        pc = vc.get("planet_count", len(vc.get("planets_used", [])))
+        if pc == 0:
+            pc = 1
+        net = vc.get("net_isk_hr", 0)
+        per_slot = net / pc
+        candidates.append((per_slot, pc, vc))
+
+    # Sort by ISK/hr per slot, descending
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
     allocated = []
     remaining = copy.deepcopy(planet_inv)
     planets_used = 0
     total_haul = 0
 
-    for vc in ranked_chains:
+    for per_slot, pc, vc in candidates:
         if planets_used >= max_planets:
             break
-        if not vc.get("viable"):
+        if planets_used + pc > max_planets:
             continue
-        # Skip chains that would blow the haul budget
+
         chain_haul = vc.get("haul_minutes_per_day", 0)
         if max_haul_minutes and total_haul + chain_haul > max_haul_minutes * 1.5:
             continue
 
-        planet_count = vc.get("planet_count", len(vc.get("planets_used", [])))
-        if planet_count == 0:
-            planet_count = 1
-        if planets_used + planet_count > max_planets:
-            continue
-
-        # Check if we still have the required planets
+        # Check planet availability
         needed = {}
         for p in vc.get("planets_used", []):
             ptype = p.get("type")
@@ -1535,12 +1549,11 @@ def allocate_5_planets(ranked_chains, planet_inv, max_planets=5, max_haul_minute
         if not can_allocate:
             continue
 
-        # Consume planets
         for (sys, ptype), count in needed.items():
             remaining[sys][ptype] -= count
 
         allocated.append(vc)
-        planets_used += planet_count
+        planets_used += pc
         total_haul += chain_haul
 
     return allocated
@@ -1645,26 +1658,29 @@ def render_markdown(allocated, ranked_by_tier, cfg, char_info, pi_skills,
         lines.append(f"**Total expected:** {_fmt_isk(total_net)}/hr net  |  "
                      f"Daily haul: {total_haul:.0f} min")
         lines.append("")
-        lines.append("| Slot | System | Type | Role | Output | Units/hr | m3/hr |")
-        lines.append("|------|--------|------|------|--------|----------|-------|")
+        lines.append("| Slot | System | Type | Role | Product | ISK/hr (chain) |")
+        lines.append("|------|--------|------|------|---------|----------------|")
 
         slot = 0
         for vc in allocated:
             chain = vc["chain"]
-            for p in vc.get("planets_used", []):
+            pc = vc.get("planet_count", len(vc.get("planets_used", []))) or 1
+            net = vc.get("net_isk_hr", 0)
+            planets = vc.get("planets_used", [])
+            for i, p in enumerate(planets):
                 slot += 1
+                # Show chain total on first row, blank on subsequent
+                isk_col = _fmt_isk(net) + "/hr" if i == 0 else ""
                 lines.append(
                     f"| {slot} | {p.get('system','?')} | {p.get('type','?')} | "
-                    f"{p.get('role','?')} | {chain['output_name']} | "
-                    f"{vc.get('units_hr',0):.0f} | {vc.get('volume_hr',0):.1f} |"
+                    f"{p.get('role','?')} | {chain['output_name']} | {isk_col} |"
                 )
-            if not vc.get("planets_used"):
-                slot += vc.get("planet_count", 1)
+            if not planets:
+                slot += pc
                 lines.append(
                     f"| {slot} | {cfg['home_system']} | -- | "
-                    f"{chain['output_name']} ({vc.get('layout_type','')}) | "
-                    f"{chain['output_name']} | "
-                    f"{vc.get('units_hr',0):.0f} | {vc.get('volume_hr',0):.1f} |"
+                    f"{vc.get('layout_type','')} | {chain['output_name']} | "
+                    f"{_fmt_isk(net)}/hr |"
                 )
 
         lines.append("")
