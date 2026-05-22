@@ -577,21 +577,34 @@ def _fetch_market_history(region_id, type_id):
 
 
 def _compute_history_stats(history, days=30):
-    """Compute VWAP and volume stats over the last N days of history.
+    """Compute VWAP, volume, and trade activity over the last N calendar days.
 
-    Returns: {vwap, avg_daily_volume, total_volume, active_days, days_sampled}
+    Filters by actual date strings so the window is always a fixed calendar
+    period. Previous version used history[-N:] which for rarely-traded products
+    could span months (inflating active_days to 30/30).
+
+    Returns: {vwap, avg_daily_volume, total_volume, active_days, days_sampled,
+              total_order_count}
     """
-    recent = history[-days:] if len(history) >= days else history
+    cutoff = (datetime.datetime.utcnow()
+              - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+    recent = [d for d in history if d.get("date", "") >= cutoff]
+
+    empty = {"vwap": 0, "avg_daily_volume": 0, "total_volume": 0,
+             "active_days": 0, "days_sampled": days,
+             "total_order_count": 0}
     if not recent:
-        return {"vwap": 0, "avg_daily_volume": 0, "total_volume": 0,
-                "active_days": 0, "days_sampled": 0}
+        return empty
 
     total_value = 0
     total_volume = 0
     active_days = 0
+    total_orders = 0
     for d in recent:
         vol = d.get("volume", 0)
         avg = d.get("average", 0)
+        oc = d.get("order_count", 0)
+        total_orders += oc
         if vol > 0:
             total_value += avg * vol
             total_volume += vol
@@ -601,16 +614,19 @@ def _compute_history_stats(history, days=30):
 
     return {
         "vwap": vwap,
-        "avg_daily_volume": total_volume / len(recent),
+        "avg_daily_volume": total_volume / days,  # per calendar day, not per entry
         "total_volume": total_volume,
         "active_days": active_days,
-        "days_sampled": len(recent),
+        "days_sampled": days,
+        "total_order_count": total_orders,
     }
 
 
 SUSTAINED_PRICE_WINDOW_DAYS = 30  # blend price over this many days of production
 SHALLOW_BUY_THRESHOLD_DAYS = 7   # flag if real buy depth < this many days
 MIN_REAL_ORDER_PRICE = 2         # orders at <= this price are treated as stubs
+LOW_ACTIVITY_ORDER_THRESHOLD = 10  # flag if fewer trades than this in 30d
+ORDERS_FOR_FULL_ACTIVITY = 20     # this many orders/30d = activity_factor 1.0
 
 
 def _fetch_buy_orders_in_range(region_id, type_id, home_system_id, max_jumps):
@@ -764,11 +780,13 @@ def fetch_pi_market(pi_types, local_region_id, home_system_id, max_jumps,
             "local_avg_daily_vol": local_stats["avg_daily_volume"],
             "local_total_vol": local_stats["total_volume"],
             "local_active_days": local_stats["active_days"],
+            "local_order_count": local_stats["total_order_count"],
             # Jita
             "jita_vwap": jita_stats["vwap"],
             "jita_avg_daily_vol": jita_stats["avg_daily_volume"],
             "jita_total_vol": jita_stats["total_volume"],
             "jita_active_days": jita_stats["active_days"],
+            "jita_order_count": jita_stats["total_order_count"],
             "jita_buy": jita_live,
         }
 
@@ -1451,6 +1469,7 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         local_vwap = prices.get("local_vwap", 0)
         local_avg_daily_vol = prices.get("local_avg_daily_vol", 0)
         local_active_days = prices.get("local_active_days", 0)
+        local_order_count = prices.get("local_order_count", 0)
         jita_vwap = prices.get("jita_vwap", 0)
         jita_avg_daily_vol = prices.get("jita_avg_daily_vol", 0)
         jita_active_days = prices.get("jita_active_days", 0)
@@ -1473,6 +1492,7 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         vc["local_vwap"] = local_vwap
         vc["local_avg_daily_vol"] = local_avg_daily_vol
         vc["local_active_days"] = local_active_days
+        vc["local_order_count"] = local_order_count
         vc["jita_vwap"] = jita_vwap
         vc["jita_buy_price"] = jita_buy
         vc["jita_avg_daily_vol"] = jita_avg_daily_vol
@@ -1489,10 +1509,11 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         vc["net_isk_hr"] = vc["gross_isk_hr"] - vc["tax_per_hr"]
 
         # Activity-adjusted ISK/hr — penalises products that rarely trade.
-        # If a product only trades 6 of 30 days, production sits unsold 80%
-        # of the time. Used for ranking and allocator, not displayed as "real"
-        # ISK/hr — the raw net_isk_hr is what you earn when you DO sell.
-        activity_factor = min(local_active_days / 30.0, 1.0) if local_active_days < 30 else 1.0
+        # Uses sum(order_count) over the last 30 calendar days as the signal.
+        # Products need ~20 trades/month for full activity score.
+        # Below that, production may sit unsold waiting for a buyer.
+        activity_factor = min(local_order_count / ORDERS_FOR_FULL_ACTIVITY,
+                              1.0)
         vc["activity_factor"] = activity_factor
         vc["adjusted_net_isk_hr"] = vc["net_isk_hr"] * activity_factor
 
@@ -1523,9 +1544,9 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
             elif local_buy > MIN_REAL_ORDER_PRICE:
                 vc["flags"].append("SHALLOW BUY (<1d depth)")
 
-        # Liquidity from history
-        if local_active_days < 10:
-            vc["flags"].append(f"LOW ACTIVITY ({local_active_days}d/30d)")
+        # Liquidity from trade frequency
+        if local_order_count < LOW_ACTIVITY_ORDER_THRESHOLD:
+            vc["flags"].append(f"LOW ACTIVITY ({local_order_count} trades/30d)")
 
         if vc["haul_minutes_per_day"] > cfg["max_haul_minutes"]:
             vc["flags"].append("HAUL OVER BUDGET")
@@ -2022,8 +2043,8 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
                       "P3": "P3 (Specialized Commodities)"}
         lines.append(f"### {tier_label.get(tier, tier)}")
         lines.append("")
-        lines.append("| Rank | Product | Setup | Units/hr | Sustained | Net ISK/hr | Adj ISK/hr | Haul/day | Flags |")
-        lines.append("|------|---------|-------|----------|-----------|------------|------------|----------|-------|")
+        lines.append("| Rank | Product | Setup | Units/hr | Sustained | Net ISK/hr | Adj ISK/hr | Trades | Haul/day | Flags |")
+        lines.append("|------|---------|-------|----------|-----------|------------|------------|--------|----------|-------|")
 
         for rank, vc in enumerate(tier_chains, 1):
             chain = vc["chain"]
@@ -2049,10 +2070,12 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
             # Only show adjusted if different from net (activity < 1.0)
             adj_str = f"{_fmt_isk(adj)}/hr" if abs(adj - net) > 1 else "="
 
+            oc = vc.get("local_order_count", 0)
             lines.append(
                 f"| {rank} | {chain['output_name']} | {setup_str} | "
                 f"{vc.get('units_hr',0):.0f} | {_fmt_isk(vc.get('local_sustained',0))} | "
                 f"{_fmt_isk(net)}/hr | {adj_str} | "
+                f"{oc}/30d | "
                 f"{vc.get('haul_minutes_per_day',0):.0f} min | {flags_str} |"
             )
 
@@ -2107,11 +2130,11 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
     lines.append("")
     lines.append(f"- **Sustained**: blended price over 30d — walks buy book within {cfg['max_market_jumps']}j, VWAP for remainder")
     lines.append("- **Net ISK/hr**: revenue when selling (sustained price x units/hr - tax)")
-    lines.append("- **Adj ISK/hr**: net x activity factor (days_traded/30). Penalises thin markets where production sits unsold. '=' means no penalty. Rankings use this.")
+    lines.append("- **Adj ISK/hr**: net x activity factor (trades/20, capped at 1.0). Penalises thin markets where production sits unsold. '=' means no penalty. Rankings use this.")
     lines.append("- **SHALLOW BUY**: real buy orders (>2 ISK) cover <7 days of production")
     lines.append("- **NO LOCAL BUYER**: no buy orders within jump range")
     lines.append("- **NO LOCAL MARKET**: no meaningful trade activity in region")
-    lines.append("- **LOW ACTIVITY**: traded fewer than 10 of last 30 days")
+    lines.append(f"- **LOW ACTIVITY**: fewer than {LOW_ACTIVITY_ORDER_THRESHOLD} trades in last 30 calendar days (region-wide)")
     lines.append("- **HAUL OVER BUDGET**: daily haul exceeds max_haul_minutes_per_day")
     lines.append("- **POWER LIMIT**: layout pushes against PG or CPU ceiling")
     lines.append("- **NO [PLANET TYPE]**: chain needs a planet type not in your inventory")
@@ -2212,6 +2235,7 @@ def generate_pi_dossier_data(overrides=None):
             "local_vwap": vc.get("local_vwap", 0),
             "local_avg_daily_vol": vc.get("local_avg_daily_vol", 0),
             "local_active_days": vc.get("local_active_days", 0),
+            "local_order_count": vc.get("local_order_count", 0),
             "jita_vwap": vc.get("jita_vwap", 0),
             "jita_buy_price": vc.get("jita_buy_price", 0),
             "jita_avg_daily_vol": vc.get("jita_avg_daily_vol", 0),
@@ -2289,6 +2313,7 @@ def generate_pi_dossier_data(overrides=None):
                     "depth_units": vc.get("local_real_depth", 0),
                     "avg_daily_vol": vc.get("local_avg_daily_vol", 0),
                     "active_days": vc.get("local_active_days", 0),
+                    "order_count": vc.get("local_order_count", 0),
                     "jita_buy": vc.get("jita_buy_price", 0),
                     "jita_vwap": vc.get("jita_vwap", 0),
                     "jita_daily_vol": vc.get("jita_avg_daily_vol", 0),

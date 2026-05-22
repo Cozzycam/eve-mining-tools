@@ -2875,7 +2875,7 @@ function renderPi(data) {
             h += '<div>Local buy: <span class="val">' + fmtIsk(m.local_buy) + '</span> @ ' + (m.buyer_system||'?') + ' (' + (m.buyer_jumps||0) + 'j)</div>';
             h += '<div>Sustained: <span class="val">' + fmtIsk(m.local_sustained||0) + '</span> (30d blend)</div>';
             h += '<div>Order depth: <span class="val">' + (m.depth_days||0).toFixed(0) + 'd</span> (' + (m.depth_units||0).toLocaleString() + ' units)</div>';
-            h += '<div>History: <span class="val">' + (m.active_days||0) + '/30d</span> active, ' + (m.avg_daily_vol||0).toFixed(0) + ' units/day</div>';
+            h += '<div>History: <span class="val">' + (m.order_count||0) + ' trades/30d</span>, ' + (m.active_days||0) + 'd active, ' + (m.avg_daily_vol||0).toFixed(0) + ' units/day</div>';
           } else {
             h += '<div style="color:var(--yellow)">No local buy orders in range</div><div></div>';
           }
@@ -2908,13 +2908,14 @@ function renderPi(data) {
     if (!chains.length) return;
     const tierLabel = {P1:'P1 (Self-contained)',P2:'P2 (Refined)',P3:'P3 (Specialized)'}[tier]||tier;
     h += '<div class="fitter-section"><h2>' + tierLabel + '</h2>';
-    h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>Product</th><th>Setup</th><th class="num">Units/hr</th><th class="num">Sustained</th><th class="num">Net ISK/hr</th><th class="num">Adj ISK/hr</th><th class="num">Haul</th><th>Flags</th></tr></thead><tbody>';
+    h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>Product</th><th>Setup</th><th class="num">Units/hr</th><th class="num">Sustained</th><th class="num">Net ISK/hr</th><th class="num">Adj ISK/hr</th><th class="num">Trades</th><th class="num">Haul</th><th>Flags</th></tr></thead><tbody>';
     chains.forEach((c, i) => {
       const setup = c.layout_type === 'p1_extractor' ? '1 planet' : c.layout_type === 'p2_selfcontained' ? '1 planet (self)' : c.layout_type === 'p2_factory' ? c.planet_count + 'p (factory)' : c.planet_count + ' planets';
       const flags = (c.flags && c.flags.length) ? c.flags.join(', ') : '--';
       const rowCls = c.viable ? '' : ' style="opacity:0.5"';
       const adj = Math.abs(c.adjusted_net_isk_hr - c.net_isk_hr) > 1 ? fmtIsk(c.adjusted_net_isk_hr) : '=';
-      h += '<tr' + rowCls + '><td>' + (i+1) + '</td><td>' + c.output_name + '</td><td>' + setup + '</td><td class="num">' + c.units_hr + '</td><td class="num">' + fmtIsk(c.local_sustained||0) + '</td><td class="num">' + fmtIsk(c.net_isk_hr) + '</td><td class="num">' + adj + '</td><td class="num">' + c.haul_minutes_per_day.toFixed(0) + 'm</td><td>' + flags + '</td></tr>';
+      const oc = c.local_order_count || 0;
+      h += '<tr' + rowCls + '><td>' + (i+1) + '</td><td>' + c.output_name + '</td><td>' + setup + '</td><td class="num">' + c.units_hr + '</td><td class="num">' + fmtIsk(c.local_sustained||0) + '</td><td class="num">' + fmtIsk(c.net_isk_hr) + '</td><td class="num">' + adj + '</td><td class="num">' + oc + '/30d</td><td class="num">' + c.haul_minutes_per_day.toFixed(0) + 'm</td><td>' + flags + '</td></tr>';
     });
     h += '</tbody></table></div></div>';
   });
