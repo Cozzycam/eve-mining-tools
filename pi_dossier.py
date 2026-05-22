@@ -1339,12 +1339,13 @@ def compute_projections(top_chains, pi_skills, cfg):
             "detail": "Allows one more production planet",
         })
 
-    # Planetology projection
+    # Planetology projection — no direct yield bonus, improves scan resolution
     if pi_skills["planetology"] < 4:
         projections.append({
-            "skill": "Planetology IV",
-            "effect": "Improved scan accuracy, est. +15-25% extraction rate",
-            "detail": "Better hotspot identification in PI scanning",
+            "skill": f"Planetology {pi_skills['planetology'] + 1}",
+            "effect": "Higher resolution resource scanning overlay",
+            "detail": "No direct yield bonus. Helps place extractors on better hotspots, "
+                      "which indirectly improves yield through better positioning.",
         })
 
     return projections
