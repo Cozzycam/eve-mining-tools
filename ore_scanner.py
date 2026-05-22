@@ -1555,15 +1555,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <details style="margin:12px 0;">
-  <summary style="cursor:pointer;color:var(--dim);font-size:0.85em;">Planet Inventory &amp; Extraction Rates (click to edit)</summary>
-  <div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:8px;">
+  <summary style="cursor:pointer;color:var(--dim);font-size:0.85em;">Planet Inventory &amp; Resource Data (click to edit)</summary>
+  <div style="margin-top:8px;">
     <div>
       <h4 style="color:var(--dim);margin:0 0 6px;">Planet Inventory</h4>
       <div id="pi-inventory-editor" style="font-size:0.82em;"></div>
       <button onclick="savePiInventory()" style="margin-top:6px;font-size:0.8em;">Save Inventory</button>
     </div>
-    <div>
-      <h4 style="color:var(--dim);margin:0 0 6px;">Extraction Rates (P0/hr per 10-head ECU)</h4>
+    <div style="margin-top:16px;">
+      <h4 style="color:var(--dim);margin:0 0 6px;">Resource Data (per System.PlanetType)</h4>
+      <p style="font-size:0.7em;color:var(--dim);margin:0 0 6px;">Density % from in-game scan. Observed P0/hr from actual extraction (overrides density estimate). Leave blank for defaults.</p>
       <div id="pi-extraction-editor" style="font-size:0.82em;"></div>
       <button onclick="savePiExtraction()" style="margin-top:6px;font-size:0.8em;">Save Rates</button>
     </div>
@@ -2495,12 +2496,15 @@ function piStatus(msg, isError) {
   el.innerHTML = msg;
 }
 
+let piServerData = {};
+
 async function loadPiConfig() {
   try {
     const resp = await fetch('/api/pi/config');
     const data = await resp.json();
+    piServerData = data;
     if (data.planet_inventory) renderPiInventoryEditor(data.planet_inventory);
-    if (data.extraction_rates) renderPiExtractionEditor(data.extraction_rates);
+    renderPiResourceEditor(data.extraction_rates || {}, data.density_data || {}, data.planet_inventory || {});
     if (data.config) {
       if (data.config.tax_rate) document.getElementById('pi-tax').value = (data.config.tax_rate * 100).toFixed(0);
       if (data.config.hauler_m3) document.getElementById('pi-hauler').value = data.config.hauler_m3;
@@ -2512,6 +2516,21 @@ async function loadPiConfig() {
 }
 
 const PI_PLANET_TYPES = ['Barren','Gas','Ice','Lava','Oceanic','Plasma','Storm','Temperate'];
+
+// Planet type -> valid P0 resources (must match PLANET_P0_MAP in pi_dossier.py)
+const PI_P0_MAP = {
+  Barren:    ['Aqueous Liquids','Base Metals','Carbon Compounds','Microorganisms','Noble Metals'],
+  Gas:       ['Aqueous Liquids','Base Metals','Ionic Solutions','Noble Gas','Reactive Gas'],
+  Ice:       ['Aqueous Liquids','Heavy Metals','Microorganisms','Noble Gas','Planktic Colonies'],
+  Lava:      ['Base Metals','Felsic Magma','Heavy Metals','Non-CS Crystals','Suspended Plasma'],
+  Oceanic:   ['Aqueous Liquids','Carbon Compounds','Complex Organisms','Microorganisms','Planktic Colonies'],
+  Plasma:    ['Base Metals','Heavy Metals','Noble Metals','Non-CS Crystals','Suspended Plasma'],
+  Storm:     ['Aqueous Liquids','Base Metals','Ionic Solutions','Noble Gas','Suspended Plasma'],
+  Temperate: ['Aqueous Liquids','Autotrophs','Carbon Compounds','Complex Organisms','Microorganisms'],
+};
+
+function p0Key(name) { return name.replace(/ /g,'_').replace(/-/g,'_'); }
+function p0Label(key) { return key === 'Non_CS_Crystals' ? 'Non-CS Crystals' : key.replace(/_/g,' '); }
 
 function renderPiInventoryEditor(inv) {
   const el = document.getElementById('pi-inventory-editor');
@@ -2541,27 +2560,46 @@ function addPiInvRow() {
   tbody.insertAdjacentHTML('beforeend', h);
 }
 
-function renderPiExtractionEditor(rates) {
+function renderPiResourceEditor(rates, density, inventory) {
   const el = document.getElementById('pi-extraction-editor');
-  let h = '<table style="border-collapse:collapse;"><thead><tr><th style="padding:2px 6px;">System</th>';
-  PI_PLANET_TYPES.forEach(t => { h += '<th style="padding:2px 4px;font-size:0.8em;">' + t + '</th>'; });
-  h += '</tr></thead><tbody>';
-  // Show all systems from inventory
-  const invRows = document.querySelectorAll('#pi-inventory-editor .pi-inv-sys');
-  const systems = new Set();
-  invRows.forEach(inp => { if(inp.value.trim()) systems.add(inp.value.trim()); });
-  for (const [sys] of Object.entries(rates)) systems.add(sys);
-  for (const sys of systems) {
-    const sysRates = rates[sys] || {};
-    h += '<tr><td style="padding:2px 6px;font-size:0.8em;">' + sys + '</td>';
-    PI_PLANET_TYPES.forEach(t => {
-      const v = sysRates[t] || '';
-      h += '<td style="padding:2px 2px;"><input type="number" class="pi-ext-val" data-sys="' + sys + '" data-type="' + t + '" value="' + v + '" placeholder="8000" min="0" step="1000" style="width:50px;font-size:0.8em;text-align:center;"></td>';
-    });
-    h += '</tr>';
+  // Build list of System.PlanetType combos from inventory + existing data
+  const combos = new Set();
+  for (const [sys, planets] of Object.entries(inventory)) {
+    for (const [ptype, count] of Object.entries(planets)) {
+      if (count > 0 && PI_P0_MAP[ptype]) combos.add(sys + '.' + ptype);
+    }
   }
-  h += '</tbody></table>';
-  h += '<p style="font-size:0.7em;color:var(--dim);margin:4px 0;">Leave blank for default (8000). Enter observed values from in-game.</p>';
+  for (const k of Object.keys(rates)) combos.add(k);
+  for (const k of Object.keys(density)) combos.add(k);
+
+  const sorted = [...combos].sort();
+  let h = '';
+  for (const combo of sorted) {
+    const [sys, ptype] = combo.split('.', 2);
+    const resources = PI_P0_MAP[ptype] || [];
+    if (!resources.length) continue;
+    const rateData = rates[combo] || {};
+    const densData = density[combo] || {};
+
+    h += '<div style="margin-bottom:10px;border:1px solid var(--border);border-radius:6px;padding:8px;">';
+    h += '<strong style="color:var(--accent);font-size:0.85em;">' + combo + '</strong>';
+    h += '<table style="border-collapse:collapse;margin-top:4px;width:100%;"><thead><tr>';
+    h += '<th style="text-align:left;padding:1px 6px;">Resource</th>';
+    h += '<th style="padding:1px 4px;">Density %</th>';
+    h += '<th style="padding:1px 4px;">Observed P0/hr</th>';
+    h += '</tr></thead><tbody>';
+    for (const res of resources) {
+      const key = p0Key(res);
+      const dVal = densData[res] || '';
+      const rVal = rateData[res] || '';
+      h += '<tr><td style="padding:1px 6px;color:var(--dim);">' + res + '</td>';
+      h += '<td style="padding:1px 2px;text-align:center;"><input type="number" class="pi-dens-val" data-combo="' + combo + '" data-res="' + res + '" value="' + dVal + '" placeholder="" min="0" max="100" step="1" style="width:45px;font-size:0.8em;text-align:center;"></td>';
+      h += '<td style="padding:1px 2px;text-align:center;"><input type="number" class="pi-obs-val" data-combo="' + combo + '" data-res="' + res + '" value="' + rVal + '" placeholder="" min="0" step="100" style="width:60px;font-size:0.8em;text-align:center;"></td>';
+      h += '</tr>';
+    }
+    h += '</tbody></table></div>';
+  }
+  if (!sorted.length) h = '<p style="color:var(--dim);">Add planets to inventory first.</p>';
   el.innerHTML = h;
 }
 
@@ -2580,40 +2618,54 @@ function collectPiInventory() {
   return inv;
 }
 
-function collectPiExtraction() {
+function collectPiResourceData() {
   const rates = {};
-  document.querySelectorAll('.pi-ext-val').forEach(inp => {
-    const sys = inp.dataset.sys;
+  const density = {};
+  document.querySelectorAll('.pi-obs-val').forEach(inp => {
+    const combo = inp.dataset.combo;
+    const res = inp.dataset.res;
     const v = parseInt(inp.value) || 0;
     if (v > 0) {
-      if (!rates[sys]) rates[sys] = {};
-      rates[sys][inp.dataset.type] = v;
+      if (!rates[combo]) rates[combo] = {};
+      rates[combo][res] = v;
     }
   });
-  return rates;
+  document.querySelectorAll('.pi-dens-val').forEach(inp => {
+    const combo = inp.dataset.combo;
+    const res = inp.dataset.res;
+    const v = parseFloat(inp.value) || 0;
+    if (v > 0) {
+      if (!density[combo]) density[combo] = {};
+      density[combo][res] = v;
+    }
+  });
+  return {rates, density};
 }
 
 async function savePiInventory() {
   const inv = collectPiInventory();
-  // Capture current extraction rates before re-render
-  const currentRates = collectPiExtraction();
+  const {rates, density} = collectPiResourceData();
   try {
     const resp = await fetch('/api/pi/save-inventory', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(inv)});
     const r = await resp.json();
     if (r.ok) {
       piStatus('Inventory saved.');
-      // Re-render extraction editor so new systems appear
-      renderPiExtractionEditor(currentRates);
+      renderPiResourceEditor(rates, density, inv);
     } else piStatus(r.error||'Save failed',true);
   } catch(e) { piStatus('Save failed: '+e.message,true); }
 }
 
 async function savePiExtraction() {
-  const rates = collectPiExtraction();
+  const {rates, density} = collectPiResourceData();
   try {
-    const resp = await fetch('/api/pi/save-extraction', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(rates)});
-    const r = await resp.json();
-    if (r.ok) piStatus('Extraction rates saved.'); else piStatus(r.error||'Save failed',true);
+    const [r1, r2] = await Promise.all([
+      fetch('/api/pi/save-extraction', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(rates)}),
+      fetch('/api/pi/save-density', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(density)}),
+    ]);
+    const d1 = await r1.json();
+    const d2 = await r2.json();
+    if (d1.ok && d2.ok) piStatus('Resource data saved.');
+    else piStatus((d1.error||'') + ' ' + (d2.error||'Save failed'), true);
   } catch(e) { piStatus('Save failed: '+e.message,true); }
 }
 
@@ -2852,6 +2904,10 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             self._handle_pi_save_extraction(body)
             return
 
+        if parsed.path == "/api/pi/save-density":
+            self._handle_pi_save_density(body)
+            return
+
         self.send_error(404)
 
     def _handle_pi_save_inventory(self, body):
@@ -2868,6 +2924,15 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
         try:
             data = json.loads(body.decode())
             pi_dossier.save_extraction_rates(data)
+            self._send_json({"ok": True})
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def _handle_pi_save_density(self, body):
+        import pi_dossier
+        try:
+            data = json.loads(body.decode())
+            pi_dossier.save_planet_density(data)
             self._send_json({"ok": True})
         except Exception as e:
             self._send_json({"error": str(e)}, 500)

@@ -1817,7 +1817,7 @@ def save_planet_inventory(data):
 def save_extraction_rates(data):
     """Save extraction rates dict to planet_extraction.ini (v1.1 format).
 
-    data: {"System.PlanetType": {"Resource_Name": rate}} (from web UI JSON)
+    data: {"System.PlanetType": {"Resource Name": rate}} (from web UI JSON)
     """
     cp = configparser.ConfigParser()
     cp.optionxform = str
@@ -1825,11 +1825,30 @@ def save_extraction_rates(data):
         cp.add_section(section_key)
         for resource, rate in sorted(resources.items()):
             if isinstance(rate, (int, float)) and rate > 0:
-                cp.set(section_key, resource, str(int(rate)))
+                cp.set(section_key, _name_to_underscore(resource), str(int(rate)))
     path = _ini_path("planet_extraction.ini")
     with open(path, "w", encoding="utf-8") as f:
         f.write("; Observed P0/hr per resource per planet-type per system.\n")
         f.write("; Format: [System.PlanetType] Resource_Name = p0_per_hour\n\n")
+        cp.write(f)
+
+
+def save_planet_density(data):
+    """Save planet density dict to planet_density.ini.
+
+    data: {"System.PlanetType": {"Resource Name": density_pct}} (from web UI JSON)
+    """
+    cp = configparser.ConfigParser()
+    cp.optionxform = str
+    for section_key, resources in sorted(data.items()):
+        cp.add_section(section_key)
+        for resource, pct in sorted(resources.items()):
+            if isinstance(pct, (int, float)) and pct > 0:
+                cp.set(section_key, _name_to_underscore(resource), str(int(pct)))
+    path = _ini_path("planet_density.ini")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# planet_density.ini\n")
+        f.write("# Per-resource density % from in-game scan\n\n")
         cp.write(f)
 
 
