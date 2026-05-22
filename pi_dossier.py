@@ -1317,6 +1317,14 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         # Net ISK/hr = gross - tax
         vc["net_isk_hr"] = vc["gross_isk_hr"] - vc["tax_per_hr"]
 
+        # Activity-adjusted ISK/hr — penalises products that rarely trade.
+        # If a product only trades 6 of 30 days, production sits unsold 80%
+        # of the time. Used for ranking and allocator, not displayed as "real"
+        # ISK/hr — the raw net_isk_hr is what you earn when you DO sell.
+        activity_factor = min(local_active_days / 30.0, 1.0) if local_active_days < 30 else 1.0
+        vc["activity_factor"] = activity_factor
+        vc["adjusted_net_isk_hr"] = vc["net_isk_hr"] * activity_factor
+
         # Jita ISK/hr (using Jita VWAP — you'd sell over time there)
         haul_model = cfg["haul"]
         jita_round_trip_sec = (jita_jumps * 2 * haul_model["sec_per_jump"]
@@ -1489,8 +1497,9 @@ def _compute_haul_time(vc, cfg):
 # ── Ranking & allocation ──────────────────────────────────────
 
 def rank_chains(viable_chains):
-    """Sort chains by net ISK/hr descending."""
-    return sorted(viable_chains, key=lambda c: c.get("net_isk_hr", 0), reverse=True)
+    """Sort chains by activity-adjusted net ISK/hr descending."""
+    return sorted(viable_chains,
+                  key=lambda c: c.get("adjusted_net_isk_hr", 0), reverse=True)
 
 
 def _run_greedy_allocation(candidates, planet_inv, max_planets, max_haul_minutes):
@@ -1539,7 +1548,7 @@ def _run_greedy_allocation(candidates, planet_inv, max_planets, max_haul_minutes
         allocated.append(vc)
         planets_used += pc
         total_haul += chain_haul
-        total_net += vc.get("net_isk_hr", 0)
+        total_net += vc.get("adjusted_net_isk_hr", 0)
 
     return allocated, total_net
 
@@ -1563,12 +1572,12 @@ def allocate_5_planets(ranked_chains, planet_inv, max_planets=5, max_haul_minute
         return cands
 
     strategies = [
-        ("Per-slot ISK/hr",
-         lambda vc, pc: vc.get("net_isk_hr", 0) / pc),
-        ("Total ISK/hr (favours factories)",
-         lambda vc, pc: vc.get("net_isk_hr", 0)),
+        ("Per-slot adjusted ISK/hr",
+         lambda vc, pc: vc.get("adjusted_net_isk_hr", 0) / pc),
+        ("Total adjusted ISK/hr (favours factories)",
+         lambda vc, pc: vc.get("adjusted_net_isk_hr", 0)),
         ("Self-contained only",
-         lambda vc, pc: vc.get("net_isk_hr", 0) / pc if pc == 1 else -1),
+         lambda vc, pc: vc.get("adjusted_net_isk_hr", 0) / pc if pc == 1 else -1),
     ]
 
     layouts = []
@@ -1744,8 +1753,8 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
                       "P3": "P3 (Specialized Commodities)"}
         lines.append(f"### {tier_label.get(tier, tier)}")
         lines.append("")
-        lines.append("| Rank | Product | Setup | Units/hr | Sustained | Top Buy | VWAP | Net ISK/hr | Haul/day | Flags |")
-        lines.append("|------|---------|-------|----------|-----------|---------|------|------------|----------|-------|")
+        lines.append("| Rank | Product | Setup | Units/hr | Sustained | Net ISK/hr | Adj ISK/hr | Haul/day | Flags |")
+        lines.append("|------|---------|-------|----------|-----------|------------|------------|----------|-------|")
 
         for rank, vc in enumerate(tier_chains, 1):
             chain = vc["chain"]
@@ -1766,16 +1775,15 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
             if not vc.get("viable"):
                 flags_str = ", ".join(vc.get("flags", ["NOT VIABLE"]))
 
-            buyer = vc.get("local_buyer_system", "")
-            buyer_jumps = vc.get("local_buyer_jumps", 0)
-            buyer_str = f"{buyer} ({buyer_jumps}j)" if buyer else "--"
+            net = vc.get("net_isk_hr", 0)
+            adj = vc.get("adjusted_net_isk_hr", 0)
+            # Only show adjusted if different from net (activity < 1.0)
+            adj_str = f"{_fmt_isk(adj)}/hr" if abs(adj - net) > 1 else "="
 
             lines.append(
                 f"| {rank} | {chain['output_name']} | {setup_str} | "
                 f"{vc.get('units_hr',0):.0f} | {_fmt_isk(vc.get('local_sustained',0))} | "
-                f"{_fmt_isk(vc.get('local_buy_price',0))} | "
-                f"{_fmt_isk(vc.get('local_vwap',0))} | "
-                f"{_fmt_isk(vc.get('net_isk_hr',0))}/hr | "
+                f"{_fmt_isk(net)}/hr | {adj_str} | "
                 f"{vc.get('haul_minutes_per_day',0):.0f} min | {flags_str} |"
             )
 
@@ -1829,8 +1837,8 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
     lines.append("## Flag Definitions")
     lines.append("")
     lines.append(f"- **Sustained**: blended price over 30d — walks buy book within {cfg['max_market_jumps']}j, VWAP for remainder")
-    lines.append("- **Top Buy**: highest buy order within range (snapshot)")
-    lines.append("- **VWAP**: 30-day volume-weighted average transaction price (region-wide)")
+    lines.append("- **Net ISK/hr**: revenue when selling (sustained price x units/hr - tax)")
+    lines.append("- **Adj ISK/hr**: net x activity factor (days_traded/30). Penalises thin markets where production sits unsold. '=' means no penalty. Rankings use this.")
     lines.append("- **SHALLOW BUY**: real buy orders (>2 ISK) cover <7 days of production")
     lines.append("- **NO LOCAL BUYER**: no buy orders within jump range")
     lines.append("- **NO LOCAL MARKET**: no meaningful trade activity in region")
@@ -1941,6 +1949,8 @@ def generate_pi_dossier_data(overrides=None):
             "gross_isk_hr": vc.get("gross_isk_hr", 0),
             "tax_per_hr": vc.get("tax_per_hr", 0),
             "net_isk_hr": vc.get("net_isk_hr", 0),
+            "activity_factor": vc.get("activity_factor", 1.0),
+            "adjusted_net_isk_hr": vc.get("adjusted_net_isk_hr", 0),
             "haul_minutes_per_day": vc.get("haul_minutes_per_day", 0),
             "viable": vc.get("viable", False),
             "rate_sources": vc.get("rate_sources", []),
