@@ -2800,10 +2800,15 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             cfg = pi_dossier.load_pi_config()
             inv = pi_dossier.load_planet_inventory()
             rates = pi_dossier.load_extraction_rates()
+            density = pi_dossier.load_planet_density()
+            # Serialize tuple keys to "System.PlanetType" strings
+            rates_json = {f"{s}.{p}": r for (s, p), r in rates.items()}
+            density_json = {f"{s}.{p}": d for (s, p), d in density.items()}
             self._send_json({
                 "config": cfg,
                 "planet_inventory": inv,
-                "extraction_rates": rates,
+                "extraction_rates": rates_json,
+                "density_data": density_json,
             })
         except Exception as e:
             self._send_json({"error": str(e)}, 500)

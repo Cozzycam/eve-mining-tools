@@ -76,6 +76,26 @@ FACILITY_COSTS = {
 DEFAULT_ECU_HEADS = 10
 DEFAULT_EXTRACTION_RATE = 8000  # P0/hr per 10-head ECU (conservative)
 
+# Density-to-yield estimation table (Phase 3).
+# Per-head P0/hr estimates indexed by density band and head-count band.
+# Calibrated against Cozzynk's 4 observed data points at Planetology II.
+# Calibration data:
+#   23% density, 3 heads → 2036/head/hr
+#   13% density, 4 heads → 1798/head/hr
+#   16% density, 4 heads → 1491/head/hr
+#    5% density, 7 heads → 770/head/hr
+DENSITY_YIELD_PER_HEAD = {
+    # (min_pct, max_pct): per_head_hr at 10 heads (default estimation target)
+    (0, 3):    300,    # very low — barely extractable, hard to find viable hotspot
+    (3, 6):    750,    # low
+    (6, 10):   1000,   # low-medium
+    (10, 15):  1350,   # medium (calibrated: 13% → 1798/4heads, but 10-head yields less/head)
+    (15, 20):  1500,   # medium-high (calibrated: 16% → 1491/4heads)
+    (20, 26):  1700,   # high (calibrated: 23% → 2036/3heads, 10-head estimate ~1700)
+    (26, 35):  1900,   # very high
+    (35, 101): 2200,   # exceptional
+}
+
 # CCU level → (powergrid, cpu) budgets (from EVE SDE)
 CCU_BUDGETS = {
     0: (6000, 1675),
@@ -170,20 +190,104 @@ def load_planet_inventory():
     return inv
 
 
+def _underscore_to_name(s):
+    """Convert config key 'Aqueous_Liquids' to EVE Ref name 'Aqueous Liquids'.
+    Special case: 'Non_CS_Crystals' → 'Non-CS Crystals'."""
+    if s.startswith("Non_CS"):
+        return "Non-CS Crystals"
+    return s.replace("_", " ")
+
+
+def _name_to_underscore(s):
+    """Convert EVE Ref name 'Aqueous Liquids' to config key 'Aqueous_Liquids'."""
+    return s.replace(" ", "_").replace("-", "_")
+
+
 def load_extraction_rates():
-    """Load planet_extraction.ini → {system: {planet_type: p0_per_hr}}."""
+    """Load planet_extraction.ini (v1.1 per-resource format).
+
+    v1.1 sections are [System.PlanetType], keys are Resource_Name = p0_per_hr.
+    Returns: {(system, planet_type): {p0_name: rate}}
+    """
     cp = configparser.ConfigParser()
     cp.optionxform = str
     cp.read(_ini_path("planet_extraction.ini"), encoding="utf-8")
     rates = {}
     for section in cp.sections():
-        rates[section] = {}
-        for ptype, rate in cp.items(section):
+        if "." not in section:
+            continue  # skip non-v1.1 sections
+        system, ptype = section.split(".", 1)
+        key = (system, ptype)
+        rates[key] = {}
+        for resource, rate in cp.items(section):
             try:
-                rates[section][ptype] = float(rate)
+                p0_name = _underscore_to_name(resource)
+                rates[key][p0_name] = float(rate)
             except ValueError:
                 pass
     return rates
+
+
+def load_planet_density():
+    """Load planet_density.ini → per-resource density % from in-game scans.
+
+    Returns: {(system, planet_type): {p0_name: density_pct}}
+    """
+    path = _ini_path("planet_density.ini")
+    if not os.path.exists(path):
+        return {}
+    cp = configparser.ConfigParser()
+    cp.optionxform = str
+    cp.read(path, encoding="utf-8")
+    densities = {}
+    for section in cp.sections():
+        if "." not in section:
+            continue
+        system, ptype = section.split(".", 1)
+        key = (system, ptype)
+        densities[key] = {}
+        for resource, pct in cp.items(section):
+            try:
+                p0_name = _underscore_to_name(resource)
+                densities[key][p0_name] = float(pct)
+            except ValueError:
+                pass
+    return densities
+
+
+def _estimate_from_density(density_pct, heads=DEFAULT_ECU_HEADS):
+    """Estimate P0/hr from density % using the calibrated lookup table.
+
+    Returns estimated total P0/hr for the given head count.
+    """
+    for (lo, hi), per_head in DENSITY_YIELD_PER_HEAD.items():
+        if lo <= density_pct < hi:
+            return per_head * heads
+    # Above all bands — use highest
+    return 2200 * heads
+
+
+def get_p0_rate(system, ptype, p0_name, extraction_rates, density_data,
+                heads=DEFAULT_ECU_HEADS):
+    """Get P0 extraction rate with source tagging.
+
+    Priority: observed (OBS) → density estimate (EST) → default (DFL).
+    Returns: (rate_p0_per_hr, source_tag)
+    """
+    # 1. Observed rate
+    key = (system, ptype)
+    obs = extraction_rates.get(key, {}).get(p0_name)
+    if obs is not None and obs > 0:
+        return obs, "OBS"
+
+    # 2. Density-based estimate
+    density = density_data.get(key, {}).get(p0_name)
+    if density is not None and density > 0:
+        est = _estimate_from_density(density, heads)
+        return est, "EST"
+
+    # 3. Default
+    return DEFAULT_EXTRACTION_RATE, "DFL"
 
 
 # ── EVE Ref data fetching ─────────────────────────────────────
@@ -578,37 +682,48 @@ def _planet_budget_remaining(pg_budget, cpu_budget, facilities):
     return pg_budget - pg_used, cpu_budget - cpu_used
 
 
+def _bif_p1_output(p0_per_hr, num_bifs):
+    """Calculate actual P1 output for N BIFs given a P0 extraction rate.
+
+    A BIF needs 6000 P0/hr for full 40 P1/hr output. If underfed, it
+    produces proportionally less. P0 supply is split evenly across BIFs.
+    """
+    bif_full_input = 6000
+    bif_full_output = 40
+    if num_bifs == 0:
+        return 0
+    p0_per_bif = p0_per_hr / num_bifs
+    utilization = min(1.0, p0_per_bif / bif_full_input)
+    return num_bifs * bif_full_output * utilization
+
+
 def compute_p1_layout(chain, extraction_rate, pg_budget, cpu_budget):
     """Compute layout for a P1 extraction planet.
 
     Returns: {facilities, units_hr, volume_hr, pg_used, cpu_used} or None
     """
-    # P1 chain: 1 ECU extracts P0, BIFs convert to P1
-    # BIF: 3000 P0 → 20 P1 per 30 min cycle = 6000 P0/hr input, 40 P1/hr output
     p0_per_hr = extraction_rate
-    bif_input_rate = 6000  # P0/hr per BIF
-    bif_output_rate = 40   # P1/hr per BIF
+    bif_input_rate = 6000
 
-    # How many BIFs can the extraction rate support?
-    max_bifs_by_extraction = max(1, int(p0_per_hr / bif_input_rate))
+    # How many full BIFs can the extraction rate support?
+    # Always place at least 1 BIF (it runs at partial capacity if underfed)
+    max_bifs = max(1, int(p0_per_hr / bif_input_rate))
 
-    # Start with 1 ECU + BIFs + 1 launchpad, check budget
-    for num_bifs in range(max_bifs_by_extraction, 0, -1):
+    for num_bifs in range(max_bifs, 0, -1):
         facilities = {"ecu": 1, "bif": num_bifs, "launchpad": 1}
         pg_rem, cpu_rem = _planet_budget_remaining(pg_budget, cpu_budget, facilities)
         if pg_rem >= 0 and cpu_rem >= 0:
-            units_hr = num_bifs * bif_output_rate
+            # Actual P1 output accounts for partial BIF feeding
+            units_hr = _bif_p1_output(p0_per_hr, num_bifs)
             volume_hr = units_hr * chain["volume"]
-            pg_used = pg_budget - pg_rem
-            cpu_used = cpu_budget - cpu_rem
             return {
                 "facilities": facilities,
                 "units_hr": units_hr,
                 "volume_hr": volume_hr,
-                "pg_used": pg_used,
-                "cpu_used": cpu_used,
+                "pg_used": pg_budget - pg_rem,
+                "cpu_used": cpu_budget - cpu_rem,
                 "role": "extractor",
-                "p0_consumed_hr": num_bifs * bif_input_rate,
+                "p0_consumed_hr": min(p0_per_hr, num_bifs * bif_input_rate),
             }
 
     return None
@@ -620,31 +735,32 @@ def compute_p2_selfcontained_layout(chain, extraction_rates, pg_budget, cpu_budg
     extraction_rates: list of 2 P0 extraction rates for the planet.
     Returns layout dict or None.
     """
-    # P2 self-contained: 2 ECUs + 2 BIFs + AIF(s) + launchpad
-    # Each BIF: 6000 P0/hr → 40 P1/hr
-    # Each AIF: 40+40 P1/hr → 5 P2/hr (60 min cycle)
     bif_input_rate = 6000
-    bif_output_rate = 40
-    aif_p1_input_rate = 40  # per P1 type, per AIF
+    aif_p1_input_rate = 40  # P1/hr each type per AIF
     aif_output_rate = 5     # P2/hr per AIF
 
-    # Determine BIFs per P0 type based on extraction rates
+    # Each P0 line: 1+ BIFs, actual P1 output depends on extraction rate
     bifs_per_p0 = []
+    p1_outputs = []
     for rate in extraction_rates:
-        bifs_per_p0.append(max(1, int(rate / bif_input_rate)))
+        num_bifs = max(1, int(rate / bif_input_rate))
+        bifs_per_p0.append(num_bifs)
+        p1_outputs.append(_bif_p1_output(rate, num_bifs))
 
-    # Number of AIFs limited by the slower P1 production line
-    min_bifs = min(bifs_per_p0)
-    max_aifs = min_bifs  # Each AIF needs 40 P1/hr from each of 2 BIF lines
+    # AIF throughput limited by the slower P1 line
+    min_p1 = min(p1_outputs)
+    # Each AIF needs 40 P1/hr from each input; fractional throughput allowed
+    max_aifs_by_p1 = min_p1 / aif_p1_input_rate  # may be < 1.0
 
-    for num_aifs in range(max_aifs, 0, -1):
-        bifs_0 = num_aifs  # BIFs for P0 type 0
-        bifs_1 = num_aifs  # BIFs for P0 type 1
-        total_bifs = bifs_0 + bifs_1
+    # Try fitting AIFs (at least 1) within PG/CPU budget
+    total_bifs = sum(bifs_per_p0)
+    for num_aifs in range(max(1, int(max_aifs_by_p1)), 0, -1):
         facilities = {"ecu": 2, "bif": total_bifs, "aif": num_aifs, "launchpad": 1}
         pg_rem, cpu_rem = _planet_budget_remaining(pg_budget, cpu_budget, facilities)
         if pg_rem >= 0 and cpu_rem >= 0:
-            units_hr = num_aifs * aif_output_rate
+            # Actual output: limited by slower P1 line and AIF count
+            effective_aif_throughput = min(num_aifs, max_aifs_by_p1)
+            units_hr = effective_aif_throughput * aif_output_rate
             volume_hr = units_hr * chain["volume"]
             return {
                 "facilities": facilities,
@@ -653,7 +769,7 @@ def compute_p2_selfcontained_layout(chain, extraction_rates, pg_budget, cpu_budg
                 "pg_used": pg_budget - pg_rem,
                 "cpu_used": cpu_budget - cpu_rem,
                 "role": "self-contained",
-                "p0_consumed_hr": [bifs_0 * bif_input_rate, bifs_1 * bif_input_rate],
+                "p0_consumed_hr": [min(r, b * bif_input_rate) for r, b in zip(extraction_rates, bifs_per_p0)],
             }
 
     return None
@@ -703,9 +819,12 @@ def compute_factory_layout(chain, pg_budget, cpu_budget):
 
 # ── Chain analysis ────────────────────────────────────────────
 
-def find_viable_chains(chains, pi_types, schematics, planet_inv, extraction_rates_cfg, cfg):
+def find_viable_chains(chains, pi_types, schematics, planet_inv,
+                       extraction_rates, density_data, cfg):
     """For each producible chain, compute layout options and economics.
 
+    extraction_rates: {(system, ptype): {p0_name: rate}} — observed
+    density_data: {(system, ptype): {p0_name: density_pct}} — scanned
     Returns list of analysed chain dicts, sorted by viability (not yet ranked by ISK).
     """
     pg_budget = cfg["pg_budget"]
@@ -722,6 +841,11 @@ def find_viable_chains(chains, pi_types, schematics, planet_inv, extraction_rate
     for ptype, entries in flat_inv.items():
         total_by_type[ptype] = sum(c for _, c in entries)
 
+    rate_ctx = {
+        "extraction_rates": extraction_rates,
+        "density_data": density_data,
+    }
+
     results = []
 
     for tid, chain in chains.items():
@@ -729,14 +853,14 @@ def find_viable_chains(chains, pi_types, schematics, planet_inv, extraction_rate
 
         if tier == "P1":
             result = _analyse_p1_chain(chain, pi_types, flat_inv, total_by_type,
-                                       extraction_rates_cfg, pg_budget, cpu_budget)
+                                       rate_ctx, pg_budget, cpu_budget)
         elif tier == "P2":
             result = _analyse_p2_chain(chain, pi_types, schematics, flat_inv,
-                                       total_by_type, extraction_rates_cfg,
+                                       total_by_type, rate_ctx,
                                        pg_budget, cpu_budget)
         elif tier == "P3":
             result = _analyse_p3_chain(chain, pi_types, schematics, flat_inv,
-                                       total_by_type, extraction_rates_cfg,
+                                       total_by_type, rate_ctx,
                                        pg_budget, cpu_budget)
         else:
             continue
@@ -747,89 +871,79 @@ def find_viable_chains(chains, pi_types, schematics, planet_inv, extraction_rate
     return results
 
 
-def _get_extraction_rate(system, ptype, extraction_rates_cfg):
-    """Get observed extraction rate for a system/planet_type combo."""
-    sys_rates = extraction_rates_cfg.get(system, {})
-    return sys_rates.get(ptype, DEFAULT_EXTRACTION_RATE)
+def _get_p0_rate_for_planet(system, ptype, p0_name, rate_ctx):
+    """Get P0 rate for a specific resource on a specific planet type in a system."""
+    return get_p0_rate(system, ptype, p0_name,
+                       rate_ctx["extraction_rates"],
+                       rate_ctx["density_data"])
 
 
-def _best_system_for_ptype(ptype, flat_inv, extraction_rates_cfg):
-    """Find best system+planet for a planet type based on extraction rate."""
-    entries = flat_inv.get(ptype, [])
-    if not entries:
-        return None, 0
+def _best_system_for_p0(p0_name, compatible_ptypes, flat_inv, rate_ctx):
+    """Find best system+planet type for extracting a specific P0 resource.
+
+    Returns: (system, ptype, rate, source_tag) or (None, None, 0, "")
+    """
     best_sys = None
+    best_ptype = None
     best_rate = 0
-    for system, count in entries:
-        if count > 0:
-            rate = _get_extraction_rate(system, ptype, extraction_rates_cfg)
+    best_tag = ""
+    for ptype in compatible_ptypes:
+        entries = flat_inv.get(ptype, [])
+        for system, count in entries:
+            if count <= 0:
+                continue
+            rate, tag = _get_p0_rate_for_planet(system, ptype, p0_name, rate_ctx)
             if rate > best_rate:
                 best_rate = rate
                 best_sys = system
-    return best_sys, best_rate
+                best_ptype = ptype
+                best_tag = tag
+    return best_sys, best_ptype, best_rate, best_tag
 
 
 def _analyse_p1_chain(chain, pi_types, flat_inv, total_by_type,
-                      extraction_rates_cfg, pg_budget, cpu_budget):
+                      rate_ctx, pg_budget, cpu_budget):
     """Analyse a P1 chain (single extraction planet)."""
-    # P1 needs exactly one P0 input
     if not chain["p0_inputs"]:
         return None
 
     p0_name = chain["p0_inputs"][0]["name"]
     compatible_ptypes = P0_PLANET_MAP.get(p0_name, set())
 
-    # Find best available planet
-    best_ptype = None
-    best_system = None
-    best_rate = 0
+    best_sys, best_ptype, best_rate, tag = _best_system_for_p0(
+        p0_name, compatible_ptypes, flat_inv, rate_ctx)
 
-    for ptype in compatible_ptypes:
-        system, rate = _best_system_for_ptype(ptype, flat_inv, extraction_rates_cfg)
-        if system and rate > best_rate:
-            best_rate = rate
-            best_system = system
-            best_ptype = ptype
-
-    if not best_system:
+    if not best_sys:
         return {
-            "chain": chain,
-            "viable": False,
+            "chain": chain, "viable": False,
             "flags": [f"NO {', '.join(compatible_ptypes)}"],
-            "planets_used": [],
-            "units_hr": 0,
-            "volume_hr": 0,
+            "planets_used": [], "units_hr": 0, "volume_hr": 0,
         }
 
     layout = compute_p1_layout(chain, best_rate, pg_budget, cpu_budget)
     if not layout:
         return {
-            "chain": chain,
-            "viable": False,
-            "flags": ["POWER LIMIT"],
-            "planets_used": [],
-            "units_hr": 0,
-            "volume_hr": 0,
+            "chain": chain, "viable": False, "flags": ["POWER LIMIT"],
+            "planets_used": [], "units_hr": 0, "volume_hr": 0,
         }
 
+    rate_detail = f"{p0_name}: {best_rate:.0f}/hr [{tag}]"
     return {
-        "chain": chain,
-        "viable": True,
-        "layout_type": "p1_extractor",
-        "planets_used": [{"system": best_system, "type": best_ptype,
+        "chain": chain, "viable": True, "layout_type": "p1_extractor",
+        "planets_used": [{"system": best_sys, "type": best_ptype,
                           "role": f"Extract {p0_name} -> {chain['output_name']}",
-                          "layout": layout}],
+                          "layout": layout, "rate_detail": rate_detail}],
         "planet_count": 1,
         "units_hr": layout["units_hr"],
         "volume_hr": layout["volume_hr"],
+        "rate_sources": [tag],
         "flags": [],
     }
 
 
 def _analyse_p2_chain(chain, pi_types, schematics, flat_inv, total_by_type,
-                      extraction_rates_cfg, pg_budget, cpu_budget):
+                      rate_ctx, pg_budget, cpu_budget):
     """Analyse a P2 chain. Try self-contained first, then factory+extractors."""
-    # P2 needs 2 P1 inputs, each from a different P0
     if len(chain["p0_inputs"]) < 2:
         return None
 
@@ -841,121 +955,123 @@ def _analyse_p2_chain(chain, pi_types, schematics, flat_inv, total_by_type,
     best_selfcontained = None
 
     for ptype in common_ptypes:
-        system, rate = _best_system_for_ptype(ptype, flat_inv, extraction_rates_cfg)
-        if system:
+        entries = flat_inv.get(ptype, [])
+        for system, count in entries:
+            if count <= 0:
+                continue
+            # Get per-resource rates for both P0s on this planet
+            rates = []
+            tags = []
+            for p0_name in p0_names:
+                rate, tag = _get_p0_rate_for_planet(system, ptype, p0_name, rate_ctx)
+                rates.append(rate)
+                tags.append(tag)
+
             layout = compute_p2_selfcontained_layout(
-                chain, [rate, rate], pg_budget, cpu_budget)
+                chain, rates, pg_budget, cpu_budget)
             if layout:
                 if not best_selfcontained or layout["units_hr"] > best_selfcontained["layout"]["units_hr"]:
                     best_selfcontained = {
                         "system": system, "type": ptype, "layout": layout,
+                        "rates": rates, "tags": tags,
                     }
 
     if best_selfcontained:
         layout = best_selfcontained["layout"]
+        rate_details = []
+        bottleneck_idx = best_selfcontained["rates"].index(min(best_selfcontained["rates"]))
+        for i, (p0_name, rate, tag) in enumerate(
+                zip(p0_names, best_selfcontained["rates"], best_selfcontained["tags"])):
+            bif_input = 6000
+            headroom = (rate - bif_input) / bif_input * 100 if rate > 0 else 0
+            marker = " <- BOTTLENECK" if i == bottleneck_idx and len(p0_names) > 1 else ""
+            rate_details.append(f"{p0_name}: {rate:.0f}/hr [{tag}] "
+                                f"({headroom:+.0f}% headroom){marker}")
+
         return {
-            "chain": chain,
-            "viable": True,
-            "layout_type": "p2_selfcontained",
+            "chain": chain, "viable": True, "layout_type": "p2_selfcontained",
             "planets_used": [{
                 "system": best_selfcontained["system"],
                 "type": best_selfcontained["type"],
                 "role": f"Extract+Process -> {chain['output_name']}",
                 "layout": layout,
+                "rate_details": rate_details,
             }],
             "planet_count": 1,
             "units_hr": layout["units_hr"],
             "volume_hr": layout["volume_hr"],
+            "rate_sources": best_selfcontained["tags"],
             "flags": [],
         }
 
     # Try factory setup: separate extraction planets + factory planet
-    # Need: 1 planet per P0 type (extract P0 -> P1) + 1 factory planet
     extraction_planets = []
+    all_tags = []
     for i, p0_name in enumerate(p0_names):
-        best_ptype = None
-        best_system = None
-        best_rate = 0
-        for ptype in p0_ptypes[i]:
-            system, rate = _best_system_for_ptype(ptype, flat_inv, extraction_rates_cfg)
-            if system and rate > best_rate:
-                best_rate = rate
-                best_system = system
-                best_ptype = ptype
-        if not best_system:
+        best_sys, best_ptype, best_rate, tag = _best_system_for_p0(
+            p0_name, p0_ptypes[i], flat_inv, rate_ctx)
+        if not best_sys:
             return {
                 "chain": chain, "viable": False,
                 "flags": [f"NO {', '.join(p0_ptypes[i])}"],
                 "planets_used": [], "units_hr": 0, "volume_hr": 0,
             }
 
-        # Compute P1 extraction layout for this planet
         p1_input = chain["inputs"][i]
         p1_type = pi_types.get(p1_input["type_id"])
         if not p1_type:
             continue
 
-        # Create a temporary P1 chain for layout calculation
         p1_chain = {"volume": p1_type["volume"], "tier": "P1"}
         p1_layout = compute_p1_layout(p1_chain, best_rate, pg_budget, cpu_budget)
         if not p1_layout:
             return {
-                "chain": chain, "viable": False,
-                "flags": ["POWER LIMIT"],
+                "chain": chain, "viable": False, "flags": ["POWER LIMIT"],
                 "planets_used": [], "units_hr": 0, "volume_hr": 0,
             }
 
         extraction_planets.append({
-            "system": best_system, "type": best_ptype,
+            "system": best_sys, "type": best_ptype,
             "role": f"Extract {p0_name} -> {p1_type['name']}",
             "layout": p1_layout,
             "p1_output_hr": p1_layout["units_hr"],
+            "rate_detail": f"{p0_name}: {best_rate:.0f}/hr [{tag}]",
         })
+        all_tags.append(tag)
 
-    # Factory planet
     factory_layout = compute_factory_layout(chain, pg_budget, cpu_budget)
     if not factory_layout:
         return {
-            "chain": chain, "viable": False,
-            "flags": ["POWER LIMIT"],
+            "chain": chain, "viable": False, "flags": ["POWER LIMIT"],
             "planets_used": [], "units_hr": 0, "volume_hr": 0,
         }
 
-    # Factory output is limited by the slower P1 supply
-    # Each AIF needs 40 P1/hr of each input type
-    aif_p1_need = 40  # P1/hr per AIF per input type
+    aif_p1_need = 40
     min_p1_supply = min(ep["p1_output_hr"] for ep in extraction_planets)
     max_aifs_by_supply = max(1, int(min_p1_supply / aif_p1_need))
     actual_aifs = min(factory_layout["facilities"]["aif"], max_aifs_by_supply)
 
-    aif_output_rate = 5  # P2/hr per AIF
-    units_hr = actual_aifs * aif_output_rate
+    units_hr = actual_aifs * 5
     volume_hr = units_hr * chain["volume"]
 
-    planets = []
-    for ep in extraction_planets:
-        planets.append(ep)
+    planets = list(extraction_planets)
     planets.append({
-        "system": extraction_planets[0]["system"],  # Factory near extractors
+        "system": extraction_planets[0]["system"],
         "type": "Any",
         "role": f"Factory -> {chain['output_name']}",
         "layout": factory_layout,
     })
 
     return {
-        "chain": chain,
-        "viable": True,
-        "layout_type": "p2_factory",
-        "planets_used": planets,
-        "planet_count": len(planets),
-        "units_hr": units_hr,
-        "volume_hr": volume_hr,
-        "flags": [],
+        "chain": chain, "viable": True, "layout_type": "p2_factory",
+        "planets_used": planets, "planet_count": len(planets),
+        "units_hr": units_hr, "volume_hr": volume_hr,
+        "rate_sources": all_tags, "flags": [],
     }
 
 
 def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
-                      extraction_rates_cfg, pg_budget, cpu_budget):
+                      rate_ctx, pg_budget, cpu_budget):
     """Analyse a P3 chain. These need multiple planets."""
     # P3 needs 2-3 P2 inputs, each of which needs its own P1+P0 chain
     # Count total planets needed
@@ -1552,6 +1668,7 @@ def generate_pi_dossier_data(overrides=None):
     cfg = load_pi_config()
     planet_inv = load_planet_inventory()
     extraction_rates = load_extraction_rates()
+    density_data = load_planet_density()
 
     # Apply overrides
     if overrides:
@@ -1594,7 +1711,7 @@ def generate_pi_dossier_data(overrides=None):
 
     print("  PI Dossier: computing layouts and economics...")
     viable = find_viable_chains(chains, pi_types, schematics,
-                                planet_inv, extraction_rates, cfg)
+                                planet_inv, extraction_rates, density_data, cfg)
     compute_economics(viable, market_prices, cfg, pi_types)
 
     ranked = rank_chains(viable)
@@ -1633,10 +1750,12 @@ def generate_pi_dossier_data(overrides=None):
             "net_isk_hr": vc.get("net_isk_hr", 0),
             "haul_minutes_per_day": vc.get("haul_minutes_per_day", 0),
             "viable": vc.get("viable", False),
+            "rate_sources": vc.get("rate_sources", []),
             "flags": vc.get("flags", []),
             "planets_used": [
                 {"system": p.get("system", ""), "type": p.get("type", ""),
-                 "role": p.get("role", "")}
+                 "role": p.get("role", ""),
+                 "rate_details": p.get("rate_details", p.get("rate_detail", ""))}
                 for p in vc.get("planets_used", [])
             ],
         })
@@ -1671,7 +1790,8 @@ def generate_pi_dossier_data(overrides=None):
             "max_planets": cfg["max_planets"],
         },
         "planet_inventory": planet_inv,
-        "extraction_rates": extraction_rates,
+        "extraction_rates": {f"{s}.{p}": rates for (s, p), rates in extraction_rates.items()},
+        "density_data": {f"{s}.{p}": dens for (s, p), dens in density_data.items()},
         "chains": chains_json,
         "allocated": allocated_json,
         "projections": projections,
@@ -1695,18 +1815,21 @@ def save_planet_inventory(data):
 
 
 def save_extraction_rates(data):
-    """Save extraction rates dict to planet_extraction.ini."""
+    """Save extraction rates dict to planet_extraction.ini (v1.1 format).
+
+    data: {"System.PlanetType": {"Resource_Name": rate}} (from web UI JSON)
+    """
     cp = configparser.ConfigParser()
     cp.optionxform = str
-    for system, rates in sorted(data.items()):
-        cp.add_section(system)
-        for ptype, rate in sorted(rates.items()):
-            if rate > 0:
-                cp.set(system, ptype, str(int(rate)))
+    for section_key, resources in sorted(data.items()):
+        cp.add_section(section_key)
+        for resource, rate in sorted(resources.items()):
+            if isinstance(rate, (int, float)) and rate > 0:
+                cp.set(section_key, resource, str(int(rate)))
     path = _ini_path("planet_extraction.ini")
     with open(path, "w", encoding="utf-8") as f:
-        f.write("; Observed P0/hr per 10-head ECU, by system and planet type.\n")
-        f.write("; Default for missing entries: 8000 (conservative baseline).\n\n")
+        f.write("; Observed P0/hr per resource per planet-type per system.\n")
+        f.write("; Format: [System.PlanetType] Resource_Name = p0_per_hour\n\n")
         cp.write(f)
 
 
