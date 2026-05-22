@@ -203,11 +203,32 @@ def _name_to_underscore(s):
     return s.replace(" ", "_").replace("-", "_")
 
 
-def load_extraction_rates():
-    """Load planet_extraction.ini (v1.1 per-resource format).
+def _parse_section_key(section):
+    """Parse config section into (system, ptype, instance).
 
-    v1.1 sections are [System.PlanetType], keys are Resource_Name = p0_per_hr.
-    Returns: {(system, planet_type): {p0_name: rate}}
+    Supports:
+      [Jufvitte.Gas.A]  → ('Jufvitte', 'Gas', 'A')
+      [Jufvitte.Gas]    → ('Jufvitte', 'Gas', 'A')  (legacy, treat as instance A)
+    """
+    parts = section.split(".")
+    if len(parts) >= 3:
+        return parts[0], parts[1], parts[2]
+    elif len(parts) == 2:
+        return parts[0], parts[1], "A"
+    return None, None, None
+
+
+def _section_key_str(system, ptype, instance):
+    """Build config section string."""
+    return f"{system}.{ptype}.{instance}"
+
+
+def load_extraction_rates():
+    """Load planet_extraction.ini (per-resource per-instance format).
+
+    Sections: [System.PlanetType.Instance] (e.g. [Jufvitte.Gas.A])
+    Legacy [System.PlanetType] sections treated as instance A.
+    Returns: {section_key_str: {p0_name: rate}}
     """
     cp = configparser.ConfigParser()
     cp.optionxform = str
@@ -215,9 +236,11 @@ def load_extraction_rates():
     rates = {}
     for section in cp.sections():
         if "." not in section:
-            continue  # skip non-v1.1 sections
-        system, ptype = section.split(".", 1)
-        key = (system, ptype)
+            continue
+        system, ptype, instance = _parse_section_key(section)
+        if not system:
+            continue
+        key = _section_key_str(system, ptype, instance)
         rates[key] = {}
         for resource, rate in cp.items(section):
             try:
@@ -229,9 +252,9 @@ def load_extraction_rates():
 
 
 def load_planet_density():
-    """Load planet_density.ini → per-resource density % from in-game scans.
+    """Load planet_density.ini → per-resource density % per planet instance.
 
-    Returns: {(system, planet_type): {p0_name: density_pct}}
+    Returns: {section_key_str: {p0_name: density_pct}}
     """
     path = _ini_path("planet_density.ini")
     if not os.path.exists(path):
@@ -243,8 +266,10 @@ def load_planet_density():
     for section in cp.sections():
         if "." not in section:
             continue
-        system, ptype = section.split(".", 1)
-        key = (system, ptype)
+        system, ptype, instance = _parse_section_key(section)
+        if not system:
+            continue
+        key = _section_key_str(system, ptype, instance)
         densities[key] = {}
         for resource, pct in cp.items(section):
             try:
@@ -256,38 +281,59 @@ def load_planet_density():
 
 
 def _estimate_from_density(density_pct, heads=DEFAULT_ECU_HEADS):
-    """Estimate P0/hr from density % using the calibrated lookup table.
-
-    Returns estimated total P0/hr for the given head count.
-    """
+    """Estimate P0/hr from density % using the calibrated lookup table."""
     for (lo, hi), per_head in DENSITY_YIELD_PER_HEAD.items():
         if lo <= density_pct < hi:
             return per_head * heads
-    # Above all bands — use highest
     return 2200 * heads
 
 
 def get_p0_rate(system, ptype, p0_name, extraction_rates, density_data,
                 heads=DEFAULT_ECU_HEADS):
-    """Get P0 extraction rate with source tagging.
+    """Get best P0 extraction rate across all planet instances, with source tag.
 
-    Priority: observed (OBS) → density estimate (EST) → default (DFL).
-    Returns: (rate_p0_per_hr, source_tag)
+    Searches all instances (A, B, C...) for system+ptype and returns the
+    best rate found. Priority: observed (OBS) > density estimate (EST) > default (DFL).
+    Returns: (rate_p0_per_hr, source_tag, instance)
     """
-    # 1. Observed rate
-    key = (system, ptype)
-    obs = extraction_rates.get(key, {}).get(p0_name)
-    if obs is not None and obs > 0:
-        return obs, "OBS"
+    best_rate = 0
+    best_tag = "DFL"
+    best_instance = "A"
 
-    # 2. Density-based estimate
-    density = density_data.get(key, {}).get(p0_name)
-    if density is not None and density > 0:
-        est = _estimate_from_density(density, heads)
-        return est, "EST"
+    # Find all instances for this system.ptype
+    prefix = f"{system}.{ptype}."
+    instance_keys = [k for k in extraction_rates if k.startswith(prefix)]
+    instance_keys += [k for k in density_data if k.startswith(prefix) and k not in instance_keys]
 
-    # 3. Default
-    return DEFAULT_EXTRACTION_RATE, "DFL"
+    # If no specific instance data, check legacy key without instance
+    if not instance_keys:
+        instance_keys = [f"{system}.{ptype}.A"]
+
+    for key in instance_keys:
+        instance = key.split(".")[-1]
+
+        # Check observed
+        obs = extraction_rates.get(key, {}).get(p0_name)
+        if obs is not None and obs > 0:
+            if obs > best_rate:
+                best_rate = obs
+                best_tag = "OBS"
+                best_instance = instance
+            continue
+
+        # Check density estimate
+        density = density_data.get(key, {}).get(p0_name)
+        if density is not None and density > 0:
+            est = _estimate_from_density(density, heads)
+            if est > best_rate:
+                best_rate = est
+                best_tag = "EST"
+                best_instance = instance
+
+    if best_rate == 0:
+        return DEFAULT_EXTRACTION_RATE, "DFL", "?"
+
+    return best_rate, best_tag, best_instance
 
 
 # ── EVE Ref data fetching ─────────────────────────────────────
@@ -872,10 +918,13 @@ def find_viable_chains(chains, pi_types, schematics, planet_inv,
 
 
 def _get_p0_rate_for_planet(system, ptype, p0_name, rate_ctx):
-    """Get P0 rate for a specific resource on a specific planet type in a system."""
-    return get_p0_rate(system, ptype, p0_name,
-                       rate_ctx["extraction_rates"],
-                       rate_ctx["density_data"])
+    """Get P0 rate for a specific resource on a specific planet type in a system.
+    Returns: (rate, tag) — drops instance for backward compat with callers.
+    """
+    rate, tag, _instance = get_p0_rate(system, ptype, p0_name,
+                                        rate_ctx["extraction_rates"],
+                                        rate_ctx["density_data"])
+    return rate, tag
 
 
 def _best_system_for_p0(p0_name, compatible_ptypes, flat_inv, rate_ctx):
@@ -1790,8 +1839,8 @@ def generate_pi_dossier_data(overrides=None):
             "max_planets": cfg["max_planets"],
         },
         "planet_inventory": planet_inv,
-        "extraction_rates": {f"{s}.{p}": rates for (s, p), rates in extraction_rates.items()},
-        "density_data": {f"{s}.{p}": dens for (s, p), dens in density_data.items()},
+        "extraction_rates": extraction_rates,
+        "density_data": density_data,
         "chains": chains_json,
         "allocated": allocated_json,
         "projections": projections,

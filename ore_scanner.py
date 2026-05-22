@@ -2562,44 +2562,68 @@ function addPiInvRow() {
 
 function renderPiResourceEditor(rates, density, inventory) {
   const el = document.getElementById('pi-extraction-editor');
-  // Build list of System.PlanetType combos from inventory + existing data
-  const combos = new Set();
+  const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+  // Build per-instance list from inventory counts
+  // e.g. Jufvitte Gas=5 → Jufvitte.Gas.A through Jufvitte.Gas.E
+  const instances = [];
   for (const [sys, planets] of Object.entries(inventory)) {
     for (const [ptype, count] of Object.entries(planets)) {
-      if (count > 0 && PI_P0_MAP[ptype]) combos.add(sys + '.' + ptype);
+      if (count > 0 && PI_P0_MAP[ptype]) {
+        for (let i = 0; i < count; i++) {
+          instances.push(sys + '.' + ptype + '.' + LETTERS[i]);
+        }
+      }
     }
   }
-  for (const k of Object.keys(rates)) combos.add(k);
-  for (const k of Object.keys(density)) combos.add(k);
+  // Also include any keys from existing data not covered by inventory
+  for (const k of [...Object.keys(rates), ...Object.keys(density)]) {
+    if (!instances.includes(k)) instances.push(k);
+  }
+  instances.sort();
 
-  const sorted = [...combos].sort();
+  // Group by system for accordion
+  const bySys = {};
+  for (const inst of instances) {
+    const sys = inst.split('.')[0];
+    if (!bySys[sys]) bySys[sys] = [];
+    bySys[sys].push(inst);
+  }
+
   let h = '';
-  for (const combo of sorted) {
-    const [sys, ptype] = combo.split('.', 2);
-    const resources = PI_P0_MAP[ptype] || [];
-    if (!resources.length) continue;
-    const rateData = rates[combo] || {};
-    const densData = density[combo] || {};
+  for (const [sys, sysInstances] of Object.entries(bySys).sort((a,b) => a[0].localeCompare(b[0]))) {
+    h += '<details style="margin-bottom:8px;">';
+    h += '<summary style="cursor:pointer;color:var(--text);font-weight:600;font-size:0.85em;padding:4px 0;">' + sys + ' (' + sysInstances.length + ' planets)</summary>';
 
-    h += '<div style="margin-bottom:10px;border:1px solid var(--border);border-radius:6px;padding:8px;">';
-    h += '<strong style="color:var(--accent);font-size:0.85em;">' + combo + '</strong>';
-    h += '<table style="border-collapse:collapse;margin-top:4px;width:100%;"><thead><tr>';
-    h += '<th style="text-align:left;padding:1px 6px;">Resource</th>';
-    h += '<th style="padding:1px 4px;">Density %</th>';
-    h += '<th style="padding:1px 4px;">Observed P0/hr</th>';
-    h += '</tr></thead><tbody>';
-    for (const res of resources) {
-      const key = p0Key(res);
-      const dVal = densData[res] || '';
-      const rVal = rateData[res] || '';
-      h += '<tr><td style="padding:1px 6px;color:var(--dim);">' + res + '</td>';
-      h += '<td style="padding:1px 2px;text-align:center;"><input type="number" class="pi-dens-val" data-combo="' + combo + '" data-res="' + res + '" value="' + dVal + '" placeholder="" min="0" max="100" step="1" style="width:45px;font-size:0.8em;text-align:center;"></td>';
-      h += '<td style="padding:1px 2px;text-align:center;"><input type="number" class="pi-obs-val" data-combo="' + combo + '" data-res="' + res + '" value="' + rVal + '" placeholder="" min="0" step="100" style="width:60px;font-size:0.8em;text-align:center;"></td>';
-      h += '</tr>';
+    for (const combo of sysInstances) {
+      const parts = combo.split('.');
+      const ptype = parts[1] || '';
+      const instance = parts[2] || 'A';
+      const resources = PI_P0_MAP[ptype] || [];
+      if (!resources.length) continue;
+      const rateData = rates[combo] || {};
+      const densData = density[combo] || {};
+
+      h += '<div style="margin:6px 0 6px 12px;border:1px solid var(--border);border-radius:6px;padding:6px 8px;">';
+      h += '<strong style="color:var(--accent);font-size:0.82em;">' + ptype + ' ' + instance + '</strong>';
+      h += '<table style="border-collapse:collapse;margin-top:3px;width:100%;"><thead><tr>';
+      h += '<th style="text-align:left;padding:1px 6px;font-size:0.8em;">Resource</th>';
+      h += '<th style="padding:1px 4px;font-size:0.8em;">Density %</th>';
+      h += '<th style="padding:1px 4px;font-size:0.8em;">Observed P0/hr</th>';
+      h += '</tr></thead><tbody>';
+      for (const res of resources) {
+        const dVal = densData[res] || '';
+        const rVal = rateData[res] || '';
+        h += '<tr><td style="padding:1px 6px;color:var(--dim);font-size:0.8em;">' + res + '</td>';
+        h += '<td style="padding:1px 2px;text-align:center;"><input type="number" class="pi-dens-val" data-combo="' + combo + '" data-res="' + res + '" value="' + dVal + '" placeholder="" min="0" max="100" step="1" style="width:45px;font-size:0.8em;text-align:center;"></td>';
+        h += '<td style="padding:1px 2px;text-align:center;"><input type="number" class="pi-obs-val" data-combo="' + combo + '" data-res="' + res + '" value="' + rVal + '" placeholder="" min="0" step="100" style="width:60px;font-size:0.8em;text-align:center;"></td>';
+        h += '</tr>';
+      }
+      h += '</tbody></table></div>';
     }
-    h += '</tbody></table></div>';
+    h += '</details>';
   }
-  if (!sorted.length) h = '<p style="color:var(--dim);">Add planets to inventory first.</p>';
+  if (!instances.length) h = '<p style="color:var(--dim);">Add planets to inventory first.</p>';
   el.innerHTML = h;
 }
 
@@ -2854,13 +2878,11 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             rates = pi_dossier.load_extraction_rates()
             density = pi_dossier.load_planet_density()
             # Serialize tuple keys to "System.PlanetType" strings
-            rates_json = {f"{s}.{p}": r for (s, p), r in rates.items()}
-            density_json = {f"{s}.{p}": d for (s, p), d in density.items()}
             self._send_json({
                 "config": cfg,
                 "planet_inventory": inv,
-                "extraction_rates": rates_json,
-                "density_data": density_json,
+                "extraction_rates": rates,
+                "density_data": density,
             })
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
