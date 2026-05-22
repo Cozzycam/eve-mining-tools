@@ -1321,6 +1321,40 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .fitter-char .warn { color: var(--yellow); }
 
+  .build-detail { margin: 8px 0 16px 0; font-size: 0.85em; }
+  .build-detail summary {
+    cursor: pointer; color: var(--accent); font-weight: 600;
+    padding: 4px 0; user-select: none;
+  }
+  .build-detail summary:hover { text-decoration: underline; }
+  .build-planet {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px 14px; margin: 8px 0;
+  }
+  .build-planet h4 { color: var(--accent); margin: 0 0 6px; font-size: 0.95em; }
+  .build-row { display: flex; flex-wrap: wrap; gap: 6px 20px; margin: 3px 0; color: var(--dim); }
+  .build-row .lbl { color: var(--dim); min-width: 60px; }
+  .build-row .val { color: var(--text); font-weight: 600; }
+  .build-row .accent { color: var(--accent); }
+  .pg-bar, .cpu-bar {
+    display: inline-block; height: 8px; border-radius: 3px; margin-right: 6px; vertical-align: middle;
+  }
+  .pg-bar { background: #4a9; }
+  .cpu-bar { background: #59c; }
+  .bar-bg { display: inline-block; height: 8px; width: 80px; background: var(--border); border-radius: 3px; vertical-align: middle; position: relative; overflow: hidden; }
+  .bar-bg .bar-fill { position: absolute; left: 0; top: 0; height: 100%; border-radius: 3px; }
+  .bottleneck-box {
+    background: rgba(255,170,50,0.08); border-left: 3px solid var(--yellow);
+    padding: 6px 12px; margin: 8px 0; color: var(--text); font-size: 0.9em;
+  }
+  .market-box {
+    background: rgba(100,180,255,0.06); border-left: 3px solid #59c;
+    padding: 8px 12px; margin: 8px 0; font-size: 0.9em;
+  }
+  .market-box .sell-rec { color: var(--accent); font-weight: 600; margin-bottom: 4px; }
+  .market-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 24px; color: var(--dim); }
+  .market-grid .val { color: var(--text); }
+
   .bonus-list { font-size: 0.85em; margin: 8px 0; }
   .bonus-list strong { color: var(--text); display: block; margin-top: 8px; }
   .bonus-list ul { margin: 0; padding: 0; }
@@ -2751,7 +2785,112 @@ function renderPi(data) {
           h += '<tr><td>' + slot + '</td><td>--</td><td>--</td><td>' + a.layout_type + '</td><td>' + a.output_name + '</td><td class="num">' + fmtIsk(a.net_isk_hr) + '/hr</td></tr>';
         }
       });
-      h += '</tbody></table></div></div>';
+      h += '</tbody></table></div>';
+
+      // Build sheet + market detail per chain
+      (layout.allocated||[]).forEach((a, ai) => {
+        h += '<details class="build-detail"' + (ai === 0 ? ' open' : '') + '>';
+        h += '<summary>' + a.output_name + ' &mdash; Build Sheet &amp; Market</summary>';
+
+        // Per-planet build sheet
+        (a.planets_used||[]).forEach((p, pi) => {
+          h += '<div class="build-planet">';
+          h += '<h4>Planet ' + (pi+1) + ': ' + p.system + ' ' + p.type + '</h4>';
+          h += '<div style="color:var(--dim);margin-bottom:6px;">' + p.role + '</div>';
+
+          // Facilities
+          const fac = p.facilities || {};
+          const facParts = [];
+          if (fac.ecu) facParts.push(fac.ecu + ' ECU (' + (p.ecu_heads||10) + ' heads)');
+          if (fac.bif) facParts.push(fac.bif + ' BIF');
+          if (fac.aif) facParts.push(fac.aif + ' AIF');
+          if (fac.launchpad) facParts.push(fac.launchpad + ' Launchpad');
+          if (fac.storage) facParts.push(fac.storage + ' Storage');
+          if (facParts.length) {
+            h += '<div class="build-row"><span class="lbl">Build:</span><span class="val">' + facParts.join(' &bull; ') + '</span></div>';
+          }
+
+          // Extraction rates
+          const p0hr = p.p0_consumed_hr || [];
+          const rateStr = p.rate_detail || '';
+          const rateStrs = p.rate_details || [];
+          if (rateStrs.length) {
+            rateStrs.forEach(r => {
+              h += '<div class="build-row"><span class="lbl">Extract:</span><span class="val">' + r + '</span></div>';
+            });
+          } else if (rateStr) {
+            h += '<div class="build-row"><span class="lbl">Extract:</span><span class="val">' + rateStr + '</span></div>';
+          }
+
+          // Output
+          if (p.units_hr > 0) {
+            h += '<div class="build-row"><span class="lbl">Output:</span><span class="val accent">' + p.units_hr.toFixed(1) + ' units/hr</span>';
+            if (p.volume_hr > 0) h += ' <span class="dim">(' + p.volume_hr.toFixed(1) + ' m\u00b3/hr)</span>';
+            h += '</div>';
+          }
+
+          // PG / CPU bars
+          if (p.pg_budget > 0) {
+            const pgPct = Math.min(100, p.pg_used / p.pg_budget * 100);
+            const cpuPct = Math.min(100, p.cpu_used / p.cpu_budget * 100);
+            const pgColor = pgPct > 90 ? '#c44' : pgPct > 70 ? '#ca4' : '#4a9';
+            const cpuColor = cpuPct > 90 ? '#c44' : cpuPct > 70 ? '#ca4' : '#59c';
+            h += '<div class="build-row" style="margin-top:4px;">';
+            h += '<span class="lbl">PG:</span>';
+            h += '<span class="bar-bg"><span class="bar-fill" style="width:' + pgPct + '%;background:' + pgColor + '"></span></span> ';
+            h += '<span class="val">' + (p.pg_used||0).toLocaleString() + '</span><span class="dim"> / ' + p.pg_budget.toLocaleString() + ' (' + pgPct.toFixed(0) + '%)</span>';
+            h += '&nbsp;&nbsp;&nbsp;';
+            h += '<span class="lbl">CPU:</span>';
+            h += '<span class="bar-bg"><span class="bar-fill" style="width:' + cpuPct + '%;background:' + cpuColor + '"></span></span> ';
+            h += '<span class="val">' + (p.cpu_used||0).toLocaleString() + '</span><span class="dim"> / ' + p.cpu_budget.toLocaleString() + ' (' + cpuPct.toFixed(0) + '%)</span>';
+            h += '</div>';
+          }
+
+          h += '</div>'; // build-planet
+        });
+
+        // Bottleneck
+        if (a.bottleneck) {
+          h += '<div class="bottleneck-box"><strong>Bottleneck:</strong> ' + a.bottleneck + '</div>';
+        }
+
+        // Market detail
+        const m = a.market || {};
+        if (m.local_buy > 0 || m.jita_buy > 0) {
+          h += '<div class="market-box">';
+          if (m.sell_recommendation) {
+            h += '<div class="sell-rec">' + m.sell_recommendation + '</div>';
+          }
+          h += '<div class="market-grid">';
+          // Local
+          if (m.local_buy > 0) {
+            h += '<div>Local buy: <span class="val">' + fmtIsk(m.local_buy) + '</span> @ ' + (m.buyer_system||'?') + ' (' + (m.buyer_jumps||0) + 'j)</div>';
+            h += '<div>Sustained: <span class="val">' + fmtIsk(m.local_sustained||0) + '</span> (30d blend)</div>';
+            h += '<div>Order depth: <span class="val">' + (m.depth_days||0).toFixed(0) + 'd</span> (' + (m.depth_units||0).toLocaleString() + ' units)</div>';
+            h += '<div>History: <span class="val">' + (m.active_days||0) + '/30d</span> active, ' + (m.avg_daily_vol||0).toFixed(0) + ' units/day</div>';
+          } else {
+            h += '<div style="color:var(--yellow)">No local buy orders in range</div><div></div>';
+          }
+          // Jita
+          if (m.jita_buy > 0 || m.jita_vwap > 0) {
+            h += '<div>Jita buy: <span class="val">' + fmtIsk(m.jita_buy||0) + '</span></div>';
+            h += '<div>Jita VWAP: <span class="val">' + fmtIsk(m.jita_vwap||0) + '</span>, ' + (m.jita_daily_vol||0).toFixed(0) + ' units/day</div>';
+          }
+          // Revenue breakdown
+          h += '<div style="margin-top:4px;grid-column:1/-1;border-top:1px solid var(--border);padding-top:4px;">';
+          h += 'Revenue: <span class="val">' + fmtIsk(a.gross_isk_hr||0) + '/hr</span> gross';
+          h += ' &minus; <span style="color:var(--yellow)">' + fmtIsk(a.tax_per_hr||0) + '/hr</span> tax';
+          h += ' = <span class="val" style="color:var(--accent)">' + fmtIsk(a.net_isk_hr||0) + '/hr</span> net';
+          if (a.haul_minutes_per_day > 0) h += ' &nbsp;|&nbsp; Haul: ' + a.haul_minutes_per_day.toFixed(0) + ' min/day';
+          h += '</div>';
+          h += '</div>'; // market-grid
+          h += '</div>'; // market-box
+        }
+
+        h += '</details>';
+      });
+
+      h += '</div>'; // fitter-section
     });
   }
 

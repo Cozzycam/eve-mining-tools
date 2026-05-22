@@ -1216,6 +1216,20 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
 
     flags = []
 
+    # Build P0 -> P1 name lookup from schematics
+    p0_to_p1 = {}
+    for _sid, _sch in schematics.items():
+        _s_inputs = _sch.get("inputs", [])
+        _s_output = _sch.get("output", {})
+        if len(_s_inputs) == 1:
+            _inp_t = pi_types.get(_s_inputs[0]["type_id"])
+            _out_t = pi_types.get(_s_output["type_id"])
+            if (_inp_t and _out_t
+                    and _inp_t.get("tier") == "P0"
+                    and _out_t.get("tier") == "P1"):
+                p0_to_p1[_inp_t["name"]] = {
+                    "name": _out_t["name"], "volume": _out_t["volume"]}
+
     # Find best extraction planet for each unique P0
     extraction_planets = []
     all_tags = []
@@ -1227,11 +1241,20 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
             flags.append(f"NO {', '.join(compatible_ptypes)} (for {p0_name})")
             continue
 
+        # Compute real P1 layout for this extraction planet
+        p1_info = p0_to_p1.get(p0_name, {"name": "P1", "volume": 0.38})
+        p1_chain = {"volume": p1_info["volume"], "tier": "P1"}
+        p1_layout = compute_p1_layout(p1_chain, best_rate, pg_budget, cpu_budget)
+        if not p1_layout:
+            flags.append(f"POWER LIMIT (for {p0_name})")
+            continue
+
         inst_label = best_inst if best_inst and best_inst != "?" else "A"
         extraction_planets.append({
             "system": best_sys, "type": f"{best_ptype} {inst_label}",
-            "role": f"Extract {p0_name} -> P1",
-            "layout": {"role": "extractor"},
+            "role": f"Extract {p0_name} -> {p1_info['name']}",
+            "layout": p1_layout,
+            "p1_output_hr": p1_layout["units_hr"],
             "rate_detail": f"{p0_name}: {best_rate:.0f}/hr [{tag}]",
         })
         all_tags.append(tag)
@@ -1406,6 +1429,10 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
             if spread_pct > 30:
                 vc["flags"].append(f"JITA +{spread_pct:.0f}%")
 
+        # ── Build sheet helpers ──
+        vc["bottleneck"] = _identify_bottleneck(vc)
+        vc["sell_recommendation"] = _sell_recommendation(vc)
+
 
 def _compute_chain_tax(vc, pi_types, cfg):
     """Compute total POCO tax per unit of output product."""
@@ -1526,6 +1553,98 @@ def _compute_haul_time(vc, cfg):
         return total_sec / 60
 
     return 0
+
+
+def _identify_bottleneck(vc):
+    """Identify the throughput bottleneck for a chain. Returns description string."""
+    layout_type = vc.get("layout_type", "")
+    planets = vc.get("planets_used", [])
+
+    if layout_type == "p1_extractor" and planets:
+        layout = planets[0].get("layout", {})
+        fac = layout.get("facilities", {})
+        p0_hr = layout.get("p0_consumed_hr", 0)
+        num_bifs = fac.get("bif", 0)
+        units_hr = layout.get("units_hr", 0)
+        if num_bifs > 0 and p0_hr < num_bifs * 6000 * 0.95:
+            pct = p0_hr / max(num_bifs * 6000, 1) * 100
+            return (f"Extraction: {p0_hr:,.0f} P0/hr feeds {num_bifs} BIF "
+                    f"at {pct:.0f}% -> {units_hr:.0f} P1/hr")
+        return f"PG/CPU: fits {num_bifs} BIF at full capacity -> {units_hr:.0f} P1/hr"
+
+    elif layout_type == "p2_selfcontained" and planets:
+        layout = planets[0].get("layout", {})
+        fac = layout.get("facilities", {})
+        p0_rates = layout.get("p0_consumed_hr", [])
+        num_aifs = fac.get("aif", 0)
+        units_hr = layout.get("units_hr", 0)
+        if isinstance(p0_rates, list) and len(p0_rates) >= 2:
+            slow = min(p0_rates)
+            fast = max(p0_rates)
+            if slow < fast * 0.9:
+                return (f"Slower P0 line at {slow:,.0f}/hr limits "
+                        f"{num_aifs} AIF -> {units_hr:.1f} P2/hr")
+        return f"{num_aifs} AIF on single planet -> {units_hr:.1f} P2/hr"
+
+    elif layout_type == "p2_factory":
+        extractors = [p for p in planets
+                      if p.get("layout", {}).get("role") == "extractor"]
+        factory = [p for p in planets
+                   if p.get("layout", {}).get("role") == "factory"]
+        if extractors:
+            p1_rates = [p.get("p1_output_hr",
+                              p.get("layout", {}).get("units_hr", 0))
+                        for p in extractors]
+            min_p1 = min(p1_rates) if p1_rates else 0
+            if factory:
+                fac_aifs = factory[0].get("layout", {}).get(
+                    "facilities", {}).get("aif", 0)
+                aif_need = fac_aifs * 40
+                if min_p1 < aif_need:
+                    return (f"Slowest extractor: {min_p1:.0f} P1/hr "
+                            f"(factory {fac_aifs} AIFs need {aif_need}/hr)")
+                return f"Factory: {fac_aifs} AIFs (fully supplied)"
+        return "Supply chain"
+
+    elif layout_type == "p3_multi":
+        extractors = [p for p in planets
+                      if p.get("layout", {}).get("role") == "extractor"]
+        if extractors:
+            p1_rates = [p.get("p1_output_hr", 0) for p in extractors]
+            if p1_rates and min(p1_rates) > 0:
+                min_rate = min(p1_rates)
+                min_planet = extractors[p1_rates.index(min_rate)]
+                return (f"Slowest P1 line: {min_planet.get('role', '')} "
+                        f"at {min_rate:.0f}/hr")
+        return "Multi-planet supply chain"
+
+    return ""
+
+
+def _sell_recommendation(vc):
+    """Generate a sell location recommendation string."""
+    local_buy = vc.get("local_buy_price", 0)
+    buyer_sys = vc.get("local_buyer_system", "")
+    buyer_jumps = vc.get("local_buyer_jumps", 0)
+    depth_days = vc.get("local_real_buy_days", 0)
+    jita_buy = vc.get("jita_buy_price", 0)
+    jita_vwap = vc.get("jita_vwap", 0)
+
+    if local_buy <= 0 and jita_buy > 0:
+        return f"Jita buy orders at {jita_buy:,.0f} ISK (no local buyers)"
+    if local_buy <= 0:
+        return "No buyers found in range"
+
+    # Compare local vs Jita
+    if jita_buy > local_buy * 1.30 and jita_buy > 100:
+        pct = (jita_buy - local_buy) / local_buy * 100
+        return (f"Consider Jita at {jita_buy:,.0f} ISK "
+                f"(+{pct:.0f}% vs {buyer_sys} {buyer_jumps}j)")
+
+    depth_str = ""
+    if depth_days > 0:
+        depth_str = f", {depth_days:.0f}d order depth"
+    return f"Sell at {buyer_sys} ({buyer_jumps}j) -- {local_buy:,.0f} ISK{depth_str}"
 
 
 # ── Ranking & allocation ──────────────────────────────────────
@@ -1999,22 +2118,67 @@ def generate_pi_dossier_data(overrides=None):
             ],
         })
 
+    pg_budget = cfg["pg_budget"]
+    cpu_budget = cfg["cpu_budget"]
+
     layouts_json = []
     for layout in layouts:
         layout_entries = []
         for vc in layout["allocated"]:
             chain = vc["chain"]
+            # Per-planet build sheet
+            planets_detail = []
+            for p in vc.get("planets_used", []):
+                pl = p.get("layout", {})
+                fac = pl.get("facilities", {})
+                p0_consumed = pl.get("p0_consumed_hr", 0)
+                # Normalise p0_consumed to a list for display
+                if isinstance(p0_consumed, (int, float)):
+                    p0_consumed = [p0_consumed] if p0_consumed > 0 else []
+                pd = {
+                    "system": p.get("system", ""),
+                    "type": p.get("type", ""),
+                    "role": p.get("role", ""),
+                    "facilities": fac,
+                    "ecu_heads": DEFAULT_ECU_HEADS if fac.get("ecu", 0) > 0 else 0,
+                    "p0_consumed_hr": p0_consumed,
+                    "units_hr": pl.get("units_hr", 0),
+                    "volume_hr": pl.get("volume_hr", 0),
+                    "pg_used": pl.get("pg_used", 0),
+                    "cpu_used": pl.get("cpu_used", 0),
+                    "pg_budget": pg_budget,
+                    "cpu_budget": cpu_budget,
+                    "rate_detail": p.get("rate_detail", ""),
+                    "rate_details": p.get("rate_details", []),
+                }
+                planets_detail.append(pd)
+
             layout_entries.append({
                 "output_name": chain["output_name"],
                 "tier": chain["tier"],
                 "layout_type": vc.get("layout_type", ""),
                 "units_hr": vc.get("units_hr", 0),
                 "net_isk_hr": vc.get("net_isk_hr", 0),
-                "planets_used": [
-                    {"system": p.get("system", ""), "type": p.get("type", ""),
-                     "role": p.get("role", "")}
-                    for p in vc.get("planets_used", [])
-                ],
+                "gross_isk_hr": vc.get("gross_isk_hr", 0),
+                "tax_per_hr": vc.get("tax_per_hr", 0),
+                "haul_minutes_per_day": vc.get("haul_minutes_per_day", 0),
+                "planets_used": planets_detail,
+                "bottleneck": vc.get("bottleneck", ""),
+                "flags": vc.get("flags", []),
+                "market": {
+                    "local_buy": vc.get("local_buy_price", 0),
+                    "local_sustained": vc.get("local_sustained", 0),
+                    "buyer_system": vc.get("local_buyer_system", ""),
+                    "buyer_jumps": vc.get("local_buyer_jumps", 0),
+                    "depth_days": vc.get("local_real_buy_days", 0),
+                    "depth_units": vc.get("local_real_depth", 0),
+                    "avg_daily_vol": vc.get("local_avg_daily_vol", 0),
+                    "active_days": vc.get("local_active_days", 0),
+                    "jita_buy": vc.get("jita_buy_price", 0),
+                    "jita_vwap": vc.get("jita_vwap", 0),
+                    "jita_daily_vol": vc.get("jita_avg_daily_vol", 0),
+                    "sell_recommendation": vc.get("sell_recommendation", ""),
+                },
             })
         layouts_json.append({
             "strategy": layout["strategy"],
