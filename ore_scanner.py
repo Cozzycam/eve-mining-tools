@@ -2903,14 +2903,14 @@ function renderPi(data) {
   }
 
   // All chains by tier
-  ['P1','P2','P3'].forEach(tier => {
+  ['P1','P2','P3','P4'].forEach(tier => {
     const chains = (data.chains||[]).filter(c => c.tier === tier);
     if (!chains.length) return;
-    const tierLabel = {P1:'P1 (Self-contained)',P2:'P2 (Refined)',P3:'P3 (Specialized)'}[tier]||tier;
+    const tierLabel = {P1:'P1 (Self-contained)',P2:'P2 (Refined)',P3:'P3 (Specialized)',P4:'P4 (Advanced — full chain)'}[tier]||tier;
     h += '<div class="fitter-section"><h2>' + tierLabel + '</h2>';
     h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>Product</th><th>Setup</th><th class="num">Units/hr</th><th class="num">Sustained</th><th class="num">Net ISK/hr</th><th class="num">Adj ISK/hr</th><th class="num">Trades</th><th class="num">Haul</th><th>Flags</th></tr></thead><tbody>';
     chains.forEach((c, i) => {
-      const setup = c.layout_type === 'p1_extractor' ? '1 planet' : c.layout_type === 'p2_selfcontained' ? '1 planet (self)' : c.layout_type === 'p2_factory' ? c.planet_count + 'p (factory)' : c.planet_count + ' planets';
+      const setup = c.layout_type === 'p1_extractor' ? '1 planet' : c.layout_type === 'p2_selfcontained' ? '1 planet (self)' : c.layout_type === 'p2_factory' ? c.planet_count + 'p (factory)' : c.layout_type === 'p4_full' ? c.planet_count + 'p (' + (c.unique_p0_count||'?') + ' P0s)' : c.planet_count + ' planets';
       const flags = (c.flags && c.flags.length) ? c.flags.join(', ') : '--';
       const rowCls = c.viable ? '' : ' style="opacity:0.5"';
       const adj = Math.abs(c.adjusted_net_isk_hr - c.net_isk_hr) > 1 ? fmtIsk(c.adjusted_net_isk_hr) : '=';

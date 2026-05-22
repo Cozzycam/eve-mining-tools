@@ -34,6 +34,7 @@ PI_GROUPS = {
     "P1": [1042],               # Basic Commodities
     "P2": [1034],               # Refined Commodities
     "P3": [1040],               # Specialized Commodities
+    "P4": [1041],               # Advanced Commodities
 }
 
 # Planet type → extractable P0 resource names (stable EVE game design data).
@@ -71,6 +72,7 @@ FACILITY_COSTS = {
     "aif":          {"pg": 700,  "cpu": 500},
     "launchpad":    {"pg": 700,  "cpu": 3600},
     "storage":      {"pg": 700,  "cpu": 500},
+    "htif":         {"pg": 400,  "cpu": 1100},  # High-Tech Industry Facility (P4)
 }
 
 DEFAULT_ECU_HEADS = 10
@@ -1003,6 +1005,11 @@ def find_viable_chains(chains, pi_types, schematics, planet_inv,
             result = _analyse_p3_chain(chain, pi_types, schematics, flat_inv,
                                        total_by_type, rate_ctx,
                                        pg_budget, cpu_budget)
+        elif tier == "P4":
+            result = _analyse_p4_chain(chain, pi_types, schematics, flat_inv,
+                                       total_by_type, rate_ctx,
+                                       pg_budget, cpu_budget,
+                                       cfg["max_planets"])
         else:
             continue
 
@@ -1438,6 +1445,123 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
     }
 
 
+def _min_extraction_planets(p0_names, flat_inv):
+    """Estimate minimum extraction planets by greedily pairing P0s.
+
+    Two P0s can share one planet if both are available on the same planet
+    type in the inventory. Max 2 ECU per planet (PG budget ~14100/17000
+    for 2 ECU + 2 BIF + 1 LP at CCU 4).
+    """
+    available = {}
+    for p0_name in p0_names:
+        ptypes = P0_PLANET_MAP.get(p0_name, set())
+        avail = set()
+        for pt in ptypes:
+            if any(count > 0 for _, count in flat_inv.get(pt, [])):
+                avail.add(pt)
+        available[p0_name] = avail
+
+    remaining = list(p0_names)
+    planets = 0
+    while remaining:
+        p0 = remaining.pop(0)
+        ptypes_a = available.get(p0, set())
+        paired = False
+        for i, other in enumerate(remaining):
+            if ptypes_a & available.get(other, set()):
+                remaining.pop(i)
+                planets += 1
+                paired = True
+                break
+        if not paired:
+            planets += 1
+    return planets
+
+
+def _analyse_p4_chain(chain, pi_types, schematics, flat_inv, total_by_type,
+                      rate_ctx, pg_budget, cpu_budget, max_planets):
+    """Analyse a P4 chain. Full vertical integration — all P0 through P4.
+
+    P4 products are produced in a High-Tech Industry Facility (HTIF).
+    Full-chain production requires extraction planets for every P0 input
+    plus factory planets for P2/P3/P4 processing.
+    """
+    p0_names = list(chain["all_p0_names"])
+    flags = []
+
+    # Estimate minimum planets needed
+    min_extraction = _min_extraction_planets(p0_names, flat_inv)
+    factory_planets = 1  # P2/P3/P4 processing combined
+    total_needed = min_extraction + factory_planets
+
+    # HTIF output: 1 unit per cycle (all P4 schematics)
+    p4_cycle = chain["schematic"]["cycle_time"]
+    p4_out_qty = chain["schematic"]["output"]["quantity"]
+    units_hr = p4_out_qty * (3600 / p4_cycle)
+
+    # Check if any P0 has no available planet type
+    missing_p0 = []
+    for p0_name in p0_names:
+        ptypes = P0_PLANET_MAP.get(p0_name, set())
+        if not any(total_by_type.get(pt, 0) > 0 for pt in ptypes):
+            missing_p0.append(p0_name)
+    if missing_p0:
+        flags.append(f"MISSING PLANETS ({', '.join(missing_p0)})")
+
+    if total_needed > max_planets:
+        flags.append(f"REQUIRES {total_needed} PLANETS (have {max_planets})")
+
+    # Check factory PG/CPU for combined P2+P3+P4 processing
+    # Conservative estimate: count P2 AIFs + P3 AIFs + HTIF + LP
+    # Each P3 input needs ~2 P2 AIFs + 1 P3 AIF (from P3 analysis pattern)
+    p3_inputs = [inp for inp in chain["inputs"] if inp["tier"] == "P3"]
+    p1_inputs = [inp for inp in chain["inputs"] if inp["tier"] == "P1"]
+
+    # Count upstream P2 intermediaries needed for each P3
+    total_p2_aifs = 0
+    total_p3_aifs = 0
+    for p3_inp in p3_inputs:
+        p3_type = pi_types.get(p3_inp["type_id"])
+        if not p3_type:
+            continue
+        # Each P3 needs its own P2 AIFs — estimate 2 per P3 input type
+        p3_sch = None
+        for sid in p3_type.get("produced_by", []):
+            p3_sch = schematics.get(sid)
+            if p3_sch:
+                break
+        if p3_sch:
+            total_p2_aifs += len(p3_sch["inputs"])  # 1 P2 AIF per P2 input
+            total_p3_aifs += 1
+
+    # Factory planet facilities
+    fac = {"aif": total_p2_aifs + total_p3_aifs, "htif": 1, "launchpad": 1}
+    pg_rem, cpu_rem = _planet_budget_remaining(pg_budget, cpu_budget, fac)
+    if pg_rem < 0 or cpu_rem < 0:
+        # Try splitting across 2 factory planets
+        factory_planets = 2
+        total_needed = min_extraction + factory_planets
+        if total_needed > max_planets:
+            flags.append(f"FACTORY SPLIT NEEDS {total_needed} PLANETS")
+
+    viable = not any("REQUIRES" in f or "MISSING" in f or "FACTORY SPLIT" in f
+                     for f in flags)
+
+    return {
+        "chain": chain,
+        "viable": viable,
+        "layout_type": "p4_full",
+        "planets_used": [],
+        "planet_count": total_needed,
+        "unique_p0_count": len(p0_names),
+        "extraction_planets": min_extraction,
+        "factory_planets": factory_planets,
+        "units_hr": units_hr if viable else 0,
+        "volume_hr": (units_hr * chain["volume"]) if viable else 0,
+        "flags": flags,
+    }
+
+
 # ── Economics ─────────────────────────────────────────────────
 
 def compute_economics(viable_chains, market_prices, cfg, pi_types):
@@ -1626,6 +1750,21 @@ def _compute_chain_tax(vc, pi_types, cfg):
         total_tax += output_base * 0.5 * tax_rate
         return total_tax
 
+    elif layout_type == "p4_full":
+        # Full vertical chain: many POCO transitions
+        # Rough estimate: P1 transitions + P2 transitions + P3 transitions + P4 export
+        total_tax = 0
+        for p0 in chain["p0_inputs"]:
+            total_tax += 1 * 0.5 * tax_rate * 2
+        for inp in chain["inputs"]:
+            inp_type = pi_types.get(inp["type_id"])
+            if inp_type:
+                output_qty = chain["schematic"]["output"]["quantity"]
+                per_unit = inp["quantity"] / output_qty
+                total_tax += per_unit * inp_type["base_price"] * 0.5 * tax_rate * 2
+        total_tax += output_base * 0.5 * tax_rate
+        return total_tax
+
     return 0
 
 
@@ -1680,6 +1819,15 @@ def _compute_haul_time(vc, cfg):
     elif layout_type == "p3_multi":
         # Rough estimate based on planet count
         planet_count = vc.get("planet_count", 5)
+        daily_volume = volume_hr * 24
+        trips = max(2, math.ceil(daily_volume / hauler_m3) + planet_count - 1)
+        time_per_trip = (planet_count * haul["sec_per_planet"]
+                         + haul["sec_per_station"])
+        total_sec = trips * time_per_trip + haul["daily_overhead"]
+        return total_sec / 60
+
+    elif layout_type == "p4_full":
+        planet_count = vc.get("planet_count", 10)
         daily_volume = volume_hr * 24
         trips = max(2, math.ceil(daily_volume / hauler_m3) + planet_count - 1)
         time_per_trip = (planet_count * haul["sec_per_planet"]
@@ -1752,6 +1900,13 @@ def _identify_bottleneck(vc):
                 return (f"Slowest P1 line: {min_planet.get('role', '')} "
                         f"at {min_rate:.0f}/hr")
         return "Multi-planet supply chain"
+
+    elif layout_type == "p4_full":
+        pc = vc.get("planet_count", 0)
+        mp = 5  # typical max
+        if pc > mp:
+            return f"Planet count: {pc} needed (have {mp})"
+        return "Full P4 supply chain"
 
     return ""
 
@@ -1924,10 +2079,27 @@ def compute_projections(top_chains, pi_skills, cfg):
     # IC 5 projection
     if pi_skills["ic"] < 5:
         next_level = pi_skills["ic"] + 1
+        new_max = next_level + 1
+        # Check if any P4 chains become viable at this planet count
+        p4_viable_at_next = [vc for vc in top_chains
+                             if vc["chain"]["tier"] == "P4"
+                             and vc.get("planet_count", 99) <= new_max]
+        p4_note = ""
+        if p4_viable_at_next:
+            names = [vc["chain"]["output_name"] for vc in p4_viable_at_next]
+            p4_note = f" P4 viable: {', '.join(names)}."
+        else:
+            # Find closest P4 for context
+            p4_all = [vc for vc in top_chains if vc["chain"]["tier"] == "P4"]
+            if p4_all:
+                closest = min(p4_all, key=lambda vc: vc.get("planet_count", 99))
+                p4_note = (f" P4 still infeasible (closest: "
+                           f"{closest['chain']['output_name']} needs "
+                           f"{closest.get('planet_count', '?')} planets).")
         projections.append({
             "skill": f"Interplanetary Consolidation {next_level}",
-            "effect": f"+1 planet slot ({next_level + 1} total)",
-            "detail": "Allows one more production planet",
+            "effect": f"+1 planet slot ({new_max} total)",
+            "detail": f"Allows one more production planet.{p4_note}",
         })
 
     # Planetology projection — no direct yield bonus, improves scan resolution
@@ -2033,14 +2205,15 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
         lines.append("")
 
     # All chains ranked by tier
-    for tier in ["P1", "P2", "P3"]:
+    for tier in ["P1", "P2", "P3", "P4"]:
         tier_chains = [vc for vc in ranked_by_tier if vc["chain"]["tier"] == tier]
         if not tier_chains:
             continue
 
         tier_label = {"P1": "P1 (Self-contained extraction)",
                       "P2": "P2 (Refined Commodities)",
-                      "P3": "P3 (Specialized Commodities)"}
+                      "P3": "P3 (Specialized Commodities)",
+                      "P4": "P4 (Advanced Commodities — full chain)"}
         lines.append(f"### {tier_label.get(tier, tier)}")
         lines.append("")
         lines.append("| Rank | Product | Setup | Units/hr | Sustained | Net ISK/hr | Adj ISK/hr | Trades | Haul/day | Flags |")
@@ -2058,6 +2231,9 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
                 setup_str = f"{pc} planets (factory)"
             elif setup == "p3_multi":
                 setup_str = f"{pc} planets"
+            elif setup == "p4_full":
+                up0 = vc.get("unique_p0_count", "?")
+                setup_str = f"{pc}p ({up0} P0s)"
             else:
                 setup_str = setup
 
@@ -2209,7 +2385,7 @@ def generate_pi_dossier_data(overrides=None):
     layouts = allocate_5_planets(ranked, planet_inv, cfg["max_planets"],
                                  max_haul_minutes=cfg["max_haul_minutes"])
 
-    projections = compute_projections(ranked[:5], pi_skills, cfg)
+    projections = compute_projections(ranked, pi_skills, cfg)
 
     markdown = render_markdown(layouts, ranked, cfg, char_info, pi_skills,
                                projections, market_prices, pi_types)
@@ -2224,6 +2400,7 @@ def generate_pi_dossier_data(overrides=None):
             "tier": chain["tier"],
             "layout_type": vc.get("layout_type", ""),
             "planet_count": vc.get("planet_count", len(vc.get("planets_used", []))),
+            "unique_p0_count": vc.get("unique_p0_count", 0),
             "units_hr": vc.get("units_hr", 0),
             "volume_hr": vc.get("volume_hr", 0),
             "local_sustained": vc.get("local_sustained", 0),
@@ -2437,6 +2614,8 @@ def self_test():
     extraction_rates = load_extraction_rates()
     check("planet_extraction.ini loads", True)
 
+    density_data = load_planet_density()
+
     # 2. EVE Ref type fetching
     print("\nEVE Ref data:")
     pi_types, by_name = fetch_pi_types(progress=True)
@@ -2532,6 +2711,38 @@ def self_test():
     if factory:
         check("P2 factory has AIFs", factory["facilities"]["aif"] > 0,
               f"aifs={factory['facilities']['aif']}")
+
+    # P4 chain checks
+    p4_chains = {tid: c for tid, c in chains.items() if c["tier"] == "P4"}
+    check("P4 chains built", len(p4_chains) == 8, f"got {len(p4_chains)}")
+
+    if p4_chains:
+        sample_p4 = list(p4_chains.values())[0]
+        check("P4 has P0 trace", len(sample_p4["all_p0_names"]) >= 4,
+              f"p0s={sample_p4['all_p0_names']}")
+        check("P4 has 3 inputs", len(sample_p4["inputs"]) == 3,
+              f"inputs={[i['name'] for i in sample_p4['inputs']]}")
+        check("P4 cycle time 3600s", sample_p4["schematic"]["cycle_time"] == 3600,
+              f"cycle={sample_p4['schematic']['cycle_time']}")
+        check("P4 output qty 1", sample_p4["schematic"]["output"]["quantity"] == 1,
+              f"qty={sample_p4['schematic']['output']['quantity']}")
+
+        # Verify HTIF in FACILITY_COSTS
+        check("HTIF in FACILITY_COSTS", "htif" in FACILITY_COSTS,
+              f"keys={list(FACILITY_COSTS.keys())}")
+        check("HTIF PG=400", FACILITY_COSTS["htif"]["pg"] == 400, "")
+        check("HTIF CPU=1100", FACILITY_COSTS["htif"]["cpu"] == 1100, "")
+
+        # All P4 chains should require >5 planets for full vertical integration
+        viable = find_viable_chains(chains, pi_types, schematics,
+                                    planet_inv, extraction_rates,
+                                    density_data, cfg)
+        p4_viable = [vc for vc in viable if vc["chain"]["tier"] == "P4"]
+        check("P4 chains analysed", len(p4_viable) == 8,
+              f"got {len(p4_viable)}")
+        min_planets = min(vc.get("planet_count", 99) for vc in p4_viable) if p4_viable else 0
+        check("P4 min planets >= 6", min_planets >= 6,
+              f"min_planets={min_planets}")
 
     print(f"\n{'='*40}")
     if errors:
