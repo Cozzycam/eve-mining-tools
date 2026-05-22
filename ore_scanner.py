@@ -2595,10 +2595,16 @@ function collectPiExtraction() {
 
 async function savePiInventory() {
   const inv = collectPiInventory();
+  // Capture current extraction rates before re-render
+  const currentRates = collectPiExtraction();
   try {
     const resp = await fetch('/api/pi/save-inventory', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(inv)});
     const r = await resp.json();
-    if (r.ok) piStatus('Inventory saved.'); else piStatus(r.error||'Save failed',true);
+    if (r.ok) {
+      piStatus('Inventory saved.');
+      // Re-render extraction editor so new systems appear
+      renderPiExtractionEditor(currentRates);
+    } else piStatus(r.error||'Save failed',true);
   } catch(e) { piStatus('Save failed: '+e.message,true); }
 }
 
