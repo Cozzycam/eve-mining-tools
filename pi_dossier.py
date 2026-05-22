@@ -1212,25 +1212,34 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
                       rate_ctx, pg_budget, cpu_budget):
     """Analyse a P3 chain. These need multiple planets."""
     # P3 needs 2-3 P2 inputs, each of which needs its own P1+P0 chain
-    # Count total planets needed
     p0_names = list(chain["all_p0_names"])
 
-    # Each unique P0 needs at least one extraction planet
-    # Plus at least 1 factory planet for P2 production, 1 for P3 production
-    extraction_count = len(p0_names)
-    factory_count = 2  # at minimum: P2 factory + P3 factory (could share)
-    total_needed = extraction_count + 1  # Simplified: extractors + 1 combined factory
-
     flags = []
+
+    # Find best extraction planet for each unique P0
+    extraction_planets = []
+    all_tags = []
+    for p0_name in p0_names:
+        compatible_ptypes = P0_PLANET_MAP.get(p0_name, set())
+        best_sys, best_ptype, best_inst, best_rate, tag = _best_system_for_p0(
+            p0_name, compatible_ptypes, flat_inv, rate_ctx)
+        if not best_sys:
+            flags.append(f"NO {', '.join(compatible_ptypes)} (for {p0_name})")
+            continue
+
+        inst_label = best_inst if best_inst and best_inst != "?" else "A"
+        extraction_planets.append({
+            "system": best_sys, "type": f"{best_ptype} {inst_label}",
+            "role": f"Extract {p0_name} -> P1",
+            "layout": {"role": "extractor"},
+            "rate_detail": f"{p0_name}: {best_rate:.0f}/hr [{tag}]",
+        })
+        all_tags.append(tag)
+
+    total_needed = len(extraction_planets) + 1  # extractors + 1 combined factory
+
     if total_needed > 5:
         flags.append("EXCEEDS 5 PLANETS")
-
-    # Check planet availability
-    for p0_name in p0_names:
-        ptypes = P0_PLANET_MAP.get(p0_name, set())
-        available = any(total_by_type.get(pt, 0) > 0 for pt in ptypes)
-        if not available:
-            flags.append(f"NO {', '.join(ptypes)} (for {p0_name})")
 
     # Estimate output: P3 factory output
     factory_layout = compute_factory_layout(chain, pg_budget, cpu_budget)
@@ -1247,16 +1256,29 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
     units_hr = estimated_aifs * 3
     volume_hr = units_hr * chain["volume"]
 
-    viable = "EXCEEDS 5 PLANETS" not in flags and not any("NO " in f for f in flags)
+    # Build planets_used: extraction planets + factory planet
+    planets = list(extraction_planets)
+    factory_system = extraction_planets[0]["system"] if extraction_planets else ""
+    planets.append({
+        "system": factory_system,
+        "type": "Any",
+        "role": f"Factory -> {chain['output_name']}",
+        "layout": factory_layout,
+    })
+
+    viable = ("EXCEEDS 5 PLANETS" not in flags
+              and not any("NO " in f for f in flags)
+              and len(extraction_planets) == len(p0_names))
 
     return {
         "chain": chain,
         "viable": viable,
         "layout_type": "p3_multi",
-        "planets_used": [],  # Complex — show planet count estimate
+        "planets_used": planets,
         "planet_count": total_needed,
         "units_hr": units_hr,
         "volume_hr": volume_hr,
+        "rate_sources": all_tags,
         "flags": flags,
     }
 
