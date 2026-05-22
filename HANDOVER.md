@@ -1,6 +1,67 @@
-# Fit Dossier — Handover Notes
+# EVE Mining Tools — Handover Notes
 
-## v1.2 fixes
+## PI Dossier (v1.0) — 2026-05-22
+
+### New module: `pi_dossier.py`
+
+Planetary Industry production chain analyser. Ranks all PI products (P1/P2/P3)
+by net ISK/hr at local buy orders, accounting for POCO taxes and haul time.
+Generates recommended 5-planet layouts using a greedy allocator.
+
+### New config files
+
+- `pi_config.ini` — home system, tax rate, hauler capacity, PG/CPU budgets, haul model
+- `planet_inventory.ini` — available planets per system (editable via web UI)
+- `planet_extraction.ini` — observed P0/hr extraction rates per planet type/system
+
+### Skills.ini extension
+
+Added `[planetary_industry]` section is NOT used (PI skills are read from the
+existing `[skills]` section as `Command Center Upgrades`, `Interplanetary
+Consolidation`, `Planetology`, `Advanced Planetology`, `Remote Sensing`).
+
+### Data sources
+
+- **EVE Ref SDE API** (`ref-data.everef.net`): PI schematics (cycle times, inputs,
+  outputs), type info (volumes, base prices). Cached 30 days.
+- **ESI**: market buy orders for all PI products (local region + Jita). Cached 5 min.
+- **ESI groups**: type discovery for P0 (groups 1032/1033/1035), P1 (1042), P2 (1034), P3 (1040).
+
+### Layout computation
+
+Three layout types modeled:
+1. **P1 extractor**: 1 planet — ECU + BIFs + launchpad
+2. **P2 self-contained**: 1 planet — 2 ECUs + BIFs + AIF + launchpad (when both P0s exist on same planet type)
+3. **P2 factory**: 3 planets — 2 extraction planets + 1 factory planet
+4. **P3 multi-planet**: estimated planet count based on P0 dependency tree
+
+### Web UI
+
+New "PI Dossier" tab in ore_scanner.py with:
+- Config controls (tax, hauler, max haul, market jumps)
+- Planet inventory editor (editable table, saved via POST)
+- Extraction rates editor
+- Generate button → structured results + copy markdown
+
+### API endpoints
+
+- `GET /api/pi/config` — returns current config, inventory, extraction rates
+- `GET /api/pi/generate?tax=&hauler_m3=&max_haul_minutes=&max_market_jumps=` — generate dossier
+- `POST /api/pi/save-inventory` — save planet inventory JSON
+- `POST /api/pi/save-extraction` — save extraction rates JSON
+
+### Known limitations (v1)
+
+- P3 chains show estimated planet counts but don't generate detailed per-planet layouts
+- Planet type name "Microorganisms" (one word) matches EVE Ref; earlier code used "Micro Organisms"
+- CCU budget table may not match user's in-game values exactly — user provides actual PG/CPU in config
+- P4 production out of scope
+- No POCO ownership auto-discovery
+- No extractor cycle decay modeling (steady-state averages only)
+
+---
+
+## Fit Dossier — v1.2 fixes
 
 ### CPU/PG skill bonus application — now reads from ESI dogma
 

@@ -1379,11 +1379,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 
 <h1>&#9935; EVE Mining Tools</h1>
-<p class="subtitle">Ore profitability scanner &amp; ship fitting dossier</p>
+<p class="subtitle">Ore profitability scanner &amp; ship fitting dossier &amp; PI planner</p>
 
 <div class="tab-bar">
   <button class="tab active" data-tab="scanner" onclick="switchTab('scanner')">Ore Scanner</button>
   <button class="tab" data-tab="fitter" onclick="switchTab('fitter')">Ship Fitter</button>
+  <button class="tab" data-tab="pi" onclick="switchTab('pi')">PI Dossier</button>
 </div>
 
 <div id="tab-scanner">
@@ -1528,6 +1529,50 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div id="fitter-status"></div>
 <div id="fitter-results" class="hidden"></div>
 </div><!-- /tab-fitter -->
+
+<div id="tab-pi" class="hidden">
+<div id="pi-public-note" class="fitter-note hidden">
+  Not available publicly yet.
+</div>
+<div class="controls" style="flex-wrap:wrap;gap:12px;">
+  <div class="field">
+    <label>Tax rate %</label>
+    <input type="number" id="pi-tax" placeholder="15" min="0" max="100" step="0.5" value="15" style="width:70px">
+  </div>
+  <div class="field">
+    <label>Hauler m&sup3;</label>
+    <input type="number" id="pi-hauler" placeholder="9000" min="100" step="100" value="9000" style="width:80px">
+  </div>
+  <div class="field">
+    <label>Max haul min/day</label>
+    <input type="number" id="pi-maxhaul" placeholder="60" min="10" step="5" value="60" style="width:70px">
+  </div>
+  <div class="field">
+    <label>Max market jumps</label>
+    <input type="number" id="pi-jumps" placeholder="5" min="0" step="1" value="5" style="width:60px">
+  </div>
+  <button id="pi-btn" onclick="doPi()">Generate PI Dossier</button>
+</div>
+
+<details style="margin:12px 0;">
+  <summary style="cursor:pointer;color:var(--dim);font-size:0.85em;">Planet Inventory &amp; Extraction Rates (click to edit)</summary>
+  <div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:8px;">
+    <div>
+      <h4 style="color:var(--dim);margin:0 0 6px;">Planet Inventory</h4>
+      <div id="pi-inventory-editor" style="font-size:0.82em;"></div>
+      <button onclick="savePiInventory()" style="margin-top:6px;font-size:0.8em;">Save Inventory</button>
+    </div>
+    <div>
+      <h4 style="color:var(--dim);margin:0 0 6px;">Extraction Rates (P0/hr per 10-head ECU)</h4>
+      <div id="pi-extraction-editor" style="font-size:0.82em;"></div>
+      <button onclick="savePiExtraction()" style="margin-top:6px;font-size:0.8em;">Save Rates</button>
+    </div>
+  </div>
+</details>
+
+<div id="pi-status"></div>
+<div id="pi-results" class="hidden"></div>
+</div><!-- /tab-pi -->
 
 <script>
 const REGIONS = __REGIONS_JSON__;
@@ -2110,15 +2155,19 @@ function switchTab(tab) {
   document.querySelectorAll('.tab-bar button').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-scanner').classList.add('hidden');
   document.getElementById('tab-fitter').classList.add('hidden');
+  document.getElementById('tab-pi').classList.add('hidden');
   document.getElementById('tab-' + tab).classList.remove('hidden');
   document.querySelector('.tab-bar button[data-tab="' + tab + '"]').classList.add('active');
   try { localStorage.setItem('activeTab', tab); } catch(e) {}
+  if (tab === 'pi' && !piConfigLoaded) loadPiConfig();
 }
 
 // Show public note if not running locally
 if (location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
   const note = document.getElementById('fitter-public-note');
   if (note) note.classList.remove('hidden');
+  const piNote = document.getElementById('pi-public-note');
+  if (piNote) piNote.classList.remove('hidden');
 }
 
 // Populate fitter region dropdown
@@ -2141,6 +2190,7 @@ try {
   if (fs.role) document.getElementById('fitter-role').value = fs.role;
   const savedTab = localStorage.getItem('activeTab');
   if (savedTab === 'fitter') switchTab('fitter');
+  if (savedTab === 'pi') switchTab('pi');
 } catch(e) {}
 
 // ── Fitter logic ──
@@ -2434,6 +2484,230 @@ function copyDossier() {
     setTimeout(() => { btn.textContent = 'Copy Markdown to Clipboard'; }, 2000);
   });
 }
+
+// ── PI Dossier logic ──
+let piConfigLoaded = false;
+let piMarkdown = '';
+
+function piStatus(msg, isError) {
+  const el = document.getElementById('pi-status');
+  el.className = isError ? 'error' : '';
+  el.innerHTML = msg;
+}
+
+async function loadPiConfig() {
+  try {
+    const resp = await fetch('/api/pi/config');
+    const data = await resp.json();
+    if (data.planet_inventory) renderPiInventoryEditor(data.planet_inventory);
+    if (data.extraction_rates) renderPiExtractionEditor(data.extraction_rates);
+    if (data.config) {
+      if (data.config.tax_rate) document.getElementById('pi-tax').value = (data.config.tax_rate * 100).toFixed(0);
+      if (data.config.hauler_m3) document.getElementById('pi-hauler').value = data.config.hauler_m3;
+      if (data.config.max_haul_minutes) document.getElementById('pi-maxhaul').value = data.config.max_haul_minutes;
+      if (data.config.max_market_jumps) document.getElementById('pi-jumps').value = data.config.max_market_jumps;
+    }
+    piConfigLoaded = true;
+  } catch(e) { piStatus('Failed to load config: ' + e.message, true); }
+}
+
+const PI_PLANET_TYPES = ['Barren','Gas','Ice','Lava','Oceanic','Plasma','Storm','Temperate'];
+
+function renderPiInventoryEditor(inv) {
+  const el = document.getElementById('pi-inventory-editor');
+  let h = '<table style="border-collapse:collapse;"><thead><tr><th style="padding:2px 6px;">System</th>';
+  PI_PLANET_TYPES.forEach(t => { h += '<th style="padding:2px 4px;font-size:0.8em;">' + t + '</th>'; });
+  h += '<th></th></tr></thead><tbody>';
+  for (const [sys, planets] of Object.entries(inv)) {
+    h += '<tr><td style="padding:2px 6px;"><input type="text" class="pi-inv-sys" value="' + sys + '" style="width:80px;font-size:0.8em;"></td>';
+    PI_PLANET_TYPES.forEach(t => {
+      const v = planets[t] || 0;
+      h += '<td style="padding:2px 2px;"><input type="number" class="pi-inv-val" data-type="' + t + '" value="' + v + '" min="0" max="20" style="width:32px;font-size:0.8em;text-align:center;"></td>';
+    });
+    h += '<td><button onclick="this.closest(\'tr\').remove()" style="font-size:0.7em;">X</button></td></tr>';
+  }
+  h += '</tbody></table>';
+  h += '<button onclick="addPiInvRow()" style="font-size:0.75em;margin-top:4px;">+ Add System</button>';
+  el.innerHTML = h;
+}
+
+function addPiInvRow() {
+  const tbody = document.querySelector('#pi-inventory-editor tbody');
+  let h = '<tr><td style="padding:2px 6px;"><input type="text" class="pi-inv-sys" value="" style="width:80px;font-size:0.8em;" placeholder="System"></td>';
+  PI_PLANET_TYPES.forEach(t => {
+    h += '<td style="padding:2px 2px;"><input type="number" class="pi-inv-val" data-type="' + t + '" value="0" min="0" max="20" style="width:32px;font-size:0.8em;text-align:center;"></td>';
+  });
+  h += '<td><button onclick="this.closest(\'tr\').remove()" style="font-size:0.7em;">X</button></td></tr>';
+  tbody.insertAdjacentHTML('beforeend', h);
+}
+
+function renderPiExtractionEditor(rates) {
+  const el = document.getElementById('pi-extraction-editor');
+  let h = '<table style="border-collapse:collapse;"><thead><tr><th style="padding:2px 6px;">System</th>';
+  PI_PLANET_TYPES.forEach(t => { h += '<th style="padding:2px 4px;font-size:0.8em;">' + t + '</th>'; });
+  h += '</tr></thead><tbody>';
+  // Show all systems from inventory
+  const invRows = document.querySelectorAll('#pi-inventory-editor .pi-inv-sys');
+  const systems = new Set();
+  invRows.forEach(inp => { if(inp.value.trim()) systems.add(inp.value.trim()); });
+  for (const [sys] of Object.entries(rates)) systems.add(sys);
+  for (const sys of systems) {
+    const sysRates = rates[sys] || {};
+    h += '<tr><td style="padding:2px 6px;font-size:0.8em;">' + sys + '</td>';
+    PI_PLANET_TYPES.forEach(t => {
+      const v = sysRates[t] || '';
+      h += '<td style="padding:2px 2px;"><input type="number" class="pi-ext-val" data-sys="' + sys + '" data-type="' + t + '" value="' + v + '" placeholder="8000" min="0" step="1000" style="width:50px;font-size:0.8em;text-align:center;"></td>';
+    });
+    h += '</tr>';
+  }
+  h += '</tbody></table>';
+  h += '<p style="font-size:0.7em;color:var(--dim);margin:4px 0;">Leave blank for default (8000). Enter observed values from in-game.</p>';
+  el.innerHTML = h;
+}
+
+function collectPiInventory() {
+  const rows = document.querySelectorAll('#pi-inventory-editor tbody tr');
+  const inv = {};
+  rows.forEach(row => {
+    const sys = row.querySelector('.pi-inv-sys').value.trim();
+    if (!sys) return;
+    inv[sys] = {};
+    row.querySelectorAll('.pi-inv-val').forEach(inp => {
+      const v = parseInt(inp.value) || 0;
+      if (v > 0) inv[sys][inp.dataset.type] = v;
+    });
+  });
+  return inv;
+}
+
+function collectPiExtraction() {
+  const rates = {};
+  document.querySelectorAll('.pi-ext-val').forEach(inp => {
+    const sys = inp.dataset.sys;
+    const v = parseInt(inp.value) || 0;
+    if (v > 0) {
+      if (!rates[sys]) rates[sys] = {};
+      rates[sys][inp.dataset.type] = v;
+    }
+  });
+  return rates;
+}
+
+async function savePiInventory() {
+  const inv = collectPiInventory();
+  try {
+    const resp = await fetch('/api/pi/save-inventory', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(inv)});
+    const r = await resp.json();
+    if (r.ok) piStatus('Inventory saved.'); else piStatus(r.error||'Save failed',true);
+  } catch(e) { piStatus('Save failed: '+e.message,true); }
+}
+
+async function savePiExtraction() {
+  const rates = collectPiExtraction();
+  try {
+    const resp = await fetch('/api/pi/save-extraction', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(rates)});
+    const r = await resp.json();
+    if (r.ok) piStatus('Extraction rates saved.'); else piStatus(r.error||'Save failed',true);
+  } catch(e) { piStatus('Save failed: '+e.message,true); }
+}
+
+async function doPi() {
+  const btn = document.getElementById('pi-btn');
+  btn.disabled = true;
+  piStatus('<span class="spinner"></span>Generating PI dossier&hellip; this takes 30-60s, first run slower');
+  document.getElementById('pi-results').classList.add('hidden');
+
+  const tax = parseFloat(document.getElementById('pi-tax').value) / 100;
+  const hauler = parseFloat(document.getElementById('pi-hauler').value);
+  const maxHaul = parseFloat(document.getElementById('pi-maxhaul').value);
+  const maxJumps = parseInt(document.getElementById('pi-jumps').value);
+
+  const params = new URLSearchParams({tax, hauler_m3: hauler, max_haul_minutes: maxHaul, max_market_jumps: maxJumps});
+  try {
+    const resp = await fetch('/api/pi/generate?' + params.toString());
+    const data = await resp.json();
+    if (data.error) {
+      piStatus(data.error, true);
+    } else {
+      piMarkdown = data.markdown || '';
+      renderPi(data);
+      const ts = new Date();
+      piStatus('Generated at ' + ts.getHours().toString().padStart(2,'0') + ':' + ts.getMinutes().toString().padStart(2,'0'));
+    }
+  } catch(e) {
+    piStatus('Request failed: ' + e.message, true);
+  }
+  btn.disabled = false;
+}
+
+function renderPi(data) {
+  const el = document.getElementById('pi-results');
+  let h = '';
+
+  // Character info
+  h += '<div class="fitter-char"><strong>' + data.char_info.name + '</strong> &mdash; CCU ' + data.pi_skills.ccu + ', IC ' + data.pi_skills.ic + ', Planetology ' + data.pi_skills.planetology + '</div>';
+
+  // Recommended layout
+  if (data.allocated && data.allocated.length) {
+    h += '<div class="fitter-section"><h2>Recommended Layout</h2>';
+    let totalNet = 0;
+    data.allocated.forEach(a => { totalNet += a.net_isk_hr || 0; });
+    h += '<p><strong>Total:</strong> ' + fmtIsk(totalNet) + '/hr net</p>';
+    h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>System</th><th>Type</th><th>Role</th><th>Product</th><th class="num">Net ISK/hr</th></tr></thead><tbody>';
+    let slot = 0;
+    data.allocated.forEach(a => {
+      if (a.planets_used && a.planets_used.length) {
+        a.planets_used.forEach(p => {
+          slot++;
+          h += '<tr><td>' + slot + '</td><td>' + p.system + '</td><td>' + p.type + '</td><td>' + p.role + '</td><td>' + a.output_name + '</td><td class="num">' + fmtIsk(a.net_isk_hr) + '</td></tr>';
+        });
+      } else {
+        slot++;
+        h += '<tr><td>' + slot + '</td><td>--</td><td>--</td><td>' + a.layout_type + '</td><td>' + a.output_name + '</td><td class="num">' + fmtIsk(a.net_isk_hr) + '</td></tr>';
+      }
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  // All chains by tier
+  ['P1','P2','P3'].forEach(tier => {
+    const chains = (data.chains||[]).filter(c => c.tier === tier);
+    if (!chains.length) return;
+    const tierLabel = {P1:'P1 (Self-contained)',P2:'P2 (Refined)',P3:'P3 (Specialized)'}[tier]||tier;
+    h += '<div class="fitter-section"><h2>' + tierLabel + '</h2>';
+    h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>Product</th><th>Setup</th><th class="num">Units/hr</th><th class="num">30d VWAP</th><th class="num">Live Buy</th><th class="num">Net ISK/hr</th><th class="num">Vol/day</th><th class="num">Haul</th><th>Flags</th></tr></thead><tbody>';
+    chains.forEach((c, i) => {
+      const setup = c.layout_type === 'p1_extractor' ? '1 planet' : c.layout_type === 'p2_selfcontained' ? '1 planet (self)' : c.layout_type === 'p2_factory' ? c.planet_count + 'p (factory)' : c.planet_count + ' planets';
+      const flags = (c.flags && c.flags.length) ? c.flags.join(', ') : '--';
+      const rowCls = c.viable ? '' : ' style="opacity:0.5"';
+      const vol = c.local_avg_daily_vol > 0 ? Math.round(c.local_avg_daily_vol).toLocaleString() : '--';
+      h += '<tr' + rowCls + '><td>' + (i+1) + '</td><td>' + c.output_name + '</td><td>' + setup + '</td><td class="num">' + c.units_hr + '</td><td class="num">' + fmtIsk(c.local_vwap||0) + '</td><td class="num">' + fmtIsk(c.local_buy_price) + '</td><td class="num">' + fmtIsk(c.net_isk_hr) + '</td><td class="num">' + vol + '</td><td class="num">' + c.haul_minutes_per_day.toFixed(0) + 'm</td><td>' + flags + '</td></tr>';
+    });
+    h += '</tbody></table></div></div>';
+  });
+
+  // Projections
+  if (data.projections && data.projections.length) {
+    h += '<div class="fitter-section"><h2>Skill Projections</h2><ul>';
+    data.projections.forEach(p => { h += '<li><strong>' + p.skill + '</strong>: ' + p.effect + '<br><span style="color:var(--dim);font-size:0.85em;">' + p.detail + '</span></li>'; });
+    h += '</ul></div>';
+  }
+
+  // Copy markdown button
+  h += '<button id="copy-pi-md-btn" onclick="copyPiMarkdown()" style="margin-top:12px;">Copy Markdown to Clipboard</button>';
+
+  el.innerHTML = h;
+  el.classList.remove('hidden');
+}
+
+function copyPiMarkdown() {
+  if (!piMarkdown) return;
+  navigator.clipboard.writeText(piMarkdown).then(() => {
+    const btn = document.getElementById('copy-pi-md-btn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy Markdown to Clipboard'; }, 2000);
+  });
+}
 </script>
 </body>
 </html>"""
@@ -2480,6 +2754,14 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             self._handle_fitter(parse_qs(parsed.query))
             return
 
+        if parsed.path == "/api/pi/config":
+            self._handle_pi_config()
+            return
+
+        if parsed.path == "/api/pi/generate":
+            self._handle_pi_generate(parse_qs(parsed.query))
+            return
+
         self.send_error(404)
 
     def _handle_fitter(self, qs):
@@ -2505,6 +2787,79 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             return
         print(f"  Fitter: done.")
         self._send_json(data)
+
+    def _handle_pi_config(self):
+        import pi_dossier
+        try:
+            cfg = pi_dossier.load_pi_config()
+            inv = pi_dossier.load_planet_inventory()
+            rates = pi_dossier.load_extraction_rates()
+            self._send_json({
+                "config": cfg,
+                "planet_inventory": inv,
+                "extraction_rates": rates,
+            })
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def _handle_pi_generate(self, qs):
+        import pi_dossier
+        overrides = {}
+        if "tax" in qs:
+            try: overrides["tax_rate"] = float(qs["tax"][0])
+            except ValueError: pass
+        if "hauler_m3" in qs:
+            try: overrides["hauler_m3"] = float(qs["hauler_m3"][0])
+            except ValueError: pass
+        if "max_haul_minutes" in qs:
+            try: overrides["max_haul_minutes"] = float(qs["max_haul_minutes"][0])
+            except ValueError: pass
+        if "max_market_jumps" in qs:
+            try: overrides["max_market_jumps"] = int(qs["max_market_jumps"][0])
+            except ValueError: pass
+
+        print(f"  PI: generating dossier...")
+        try:
+            data = pi_dossier.generate_pi_dossier_data(
+                overrides=overrides if overrides else None)
+        except Exception as e:
+            self._send_json({"error": f"PI dossier generation failed: {e}"}, 500)
+            return
+        print(f"  PI: done.")
+        self._send_json(data)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        content_len = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_len) if content_len > 0 else b""
+
+        if parsed.path == "/api/pi/save-inventory":
+            self._handle_pi_save_inventory(body)
+            return
+
+        if parsed.path == "/api/pi/save-extraction":
+            self._handle_pi_save_extraction(body)
+            return
+
+        self.send_error(404)
+
+    def _handle_pi_save_inventory(self, body):
+        import pi_dossier
+        try:
+            data = json.loads(body.decode())
+            pi_dossier.save_planet_inventory(data)
+            self._send_json({"ok": True})
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def _handle_pi_save_extraction(self, body):
+        import pi_dossier
+        try:
+            data = json.loads(body.decode())
+            pi_dossier.save_extraction_rates(data)
+            self._send_json({"ok": True})
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
 
     def _handle_scan(self, qs):
         region_key = qs.get("region", ["verge"])[0]
