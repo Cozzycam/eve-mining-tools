@@ -2822,8 +2822,16 @@ function renderPi(data) {
             h += '<div class="build-row"><span class="lbl">Extract:</span><span class="val">' + rateStr + '</span></div>';
           }
 
+          // AIF breakdown (P3 factory planets)
+          const aifBd = p.aif_breakdown || [];
+          if (aifBd.length) {
+            aifBd.forEach(line => {
+              h += '<div class="build-row"><span class="lbl">AIF:</span><span class="val">' + line + '</span></div>';
+            });
+          }
+
           // Output
-          if (p.units_hr > 0) {
+          if (p.units_hr > 0 && !aifBd.length) {
             h += '<div class="build-row"><span class="lbl">Output:</span><span class="val accent">' + p.units_hr.toFixed(1) + ' units/hr</span>';
             if (p.volume_hr > 0) h += ' <span class="dim">(' + p.volume_hr.toFixed(1) + ' m\u00b3/hr)</span>';
             h += '</div>';

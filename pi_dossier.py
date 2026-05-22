@@ -1216,7 +1216,7 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
 
     flags = []
 
-    # Build P0 -> P1 name lookup from schematics
+    # Build P0 -> P1 lookup from schematics (including type_id for supply mapping)
     p0_to_p1 = {}
     for _sid, _sch in schematics.items():
         _s_inputs = _sch.get("inputs", [])
@@ -1228,7 +1228,8 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
                     and _inp_t.get("tier") == "P0"
                     and _out_t.get("tier") == "P1"):
                 p0_to_p1[_inp_t["name"]] = {
-                    "name": _out_t["name"], "volume": _out_t["volume"]}
+                    "name": _out_t["name"], "volume": _out_t["volume"],
+                    "type_id": _s_output["type_id"]}
 
     # Find best extraction planet for each unique P0
     extraction_planets = []
@@ -1242,7 +1243,8 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
             continue
 
         # Compute real P1 layout for this extraction planet
-        p1_info = p0_to_p1.get(p0_name, {"name": "P1", "volume": 0.38})
+        p1_info = p0_to_p1.get(p0_name, {"name": "P1", "volume": 0.38,
+                                          "type_id": 0})
         p1_chain = {"volume": p1_info["volume"], "tier": "P1"}
         p1_layout = compute_p1_layout(p1_chain, best_rate, pg_budget, cpu_budget)
         if not p1_layout:
@@ -1255,6 +1257,8 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
             "role": f"Extract {p0_name} -> {p1_info['name']}",
             "layout": p1_layout,
             "p1_output_hr": p1_layout["units_hr"],
+            "p1_name": p1_info["name"],
+            "p1_type_id": p1_info["type_id"],
             "rate_detail": f"{p0_name}: {best_rate:.0f}/hr [{tag}]",
         })
         all_tags.append(tag)
@@ -1264,20 +1268,130 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
     if total_needed > 5:
         flags.append("EXCEEDS 5 PLANETS")
 
-    # Estimate output: P3 factory output
-    factory_layout = compute_factory_layout(chain, pg_budget, cpu_budget)
-    if not factory_layout:
-        flags.append("POWER LIMIT")
+    # ── P3 factory: trace real P1 -> P2 -> P3 supply chain ──
+    #
+    # Build P1 supply map from extraction planets
+    p1_supply = {}  # P1 type_id -> units/hr
+    for ep in extraction_planets:
+        p1_tid = ep.get("p1_type_id", 0)
+        if p1_tid:
+            p1_supply[p1_tid] = p1_supply.get(p1_tid, 0) + ep["p1_output_hr"]
+
+    p3_cycle = chain["schematic"]["cycle_time"]
+    p3_out_qty = chain["schematic"]["output"]["quantity"]
+    p3_out_per_aif_hr = p3_out_qty * (3600 / p3_cycle)
+
+    # For each P2 input of the P3 chain, compute max AIFs from P1 supply
+    p2_aif_details = []
+    for p2_inp in chain["inputs"]:
+        p2_tid = p2_inp["type_id"]
+        p2_type = pi_types.get(p2_tid)
+        if not p2_type:
+            continue
+
+        # Find P2 production schematic
+        p2_sch = None
+        for sid in p2_type.get("produced_by", []):
+            p2_sch = schematics.get(sid)
+            if p2_sch:
+                break
+        if not p2_sch:
+            flags.append(f"NO SCHEMATIC ({p2_type['name']})")
+            continue
+
+        p2_cycle = p2_sch["cycle_time"]
+        p2_out_qty = p2_sch["output"]["quantity"]
+        p2_out_per_aif_hr = p2_out_qty * (3600 / p2_cycle)
+
+        # Max P2 AIFs from P1 supply (each P2 AIF needs X P1/hr per input)
+        max_aifs = float('inf')
+        for p1_inp in p2_sch["inputs"]:
+            p1_tid = p1_inp["type_id"]
+            p1_need_per_aif_hr = p1_inp["quantity"] * (3600 / p2_cycle)
+            supply = p1_supply.get(p1_tid, 0)
+            if p1_need_per_aif_hr > 0:
+                max_aifs = min(max_aifs, supply / p1_need_per_aif_hr)
+
+        aif_count = int(max_aifs) if max_aifs != float('inf') else 0
+        p2_aif_details.append({
+            "name": p2_type["name"],
+            "type_id": p2_tid,
+            "aif_count": aif_count,
+            "out_per_aif_hr": p2_out_per_aif_hr,
+            "total_hr": aif_count * p2_out_per_aif_hr,
+        })
+
+    # P3 AIFs limited by P2 supply
+    max_p3_aifs = 0.0
+    if p2_aif_details:
+        max_p3_aifs = float('inf')
+        for i, p2_inp in enumerate(chain["inputs"]):
+            p2_need_per_p3_hr = p2_inp["quantity"] * (3600 / p3_cycle)
+            p2_supply = p2_aif_details[i]["total_hr"] if i < len(p2_aif_details) else 0
+            if p2_need_per_p3_hr > 0:
+                max_p3_aifs = min(max_p3_aifs, p2_supply / p2_need_per_p3_hr)
+        if max_p3_aifs == float('inf'):
+            max_p3_aifs = 0.0
+
+    p3_aif_count = int(max_p3_aifs)
+    if p3_aif_count == 0 and max_p3_aifs >= 0.1:
+        p3_aif_count = 1  # allow partial throughput
+
+    actual_p3 = min(p3_aif_count, max_p3_aifs)
+    units_hr = actual_p3 * p3_out_per_aif_hr
+
+    # Trim excess P2 AIFs — don't produce more P2 than the P3 stage consumes
+    for i, p2_inp in enumerate(chain["inputs"]):
+        if i < len(p2_aif_details):
+            p2_need_total = p2_inp["quantity"] * (3600 / p3_cycle) * actual_p3
+            out_per = p2_aif_details[i]["out_per_aif_hr"]
+            if out_per > 0:
+                needed = math.ceil(p2_need_total / out_per)
+                p2_aif_details[i]["aif_count"] = min(
+                    p2_aif_details[i]["aif_count"], needed)
+                p2_aif_details[i]["total_hr"] = (
+                    p2_aif_details[i]["aif_count"] * out_per)
+
+    total_p2_aifs = sum(d["aif_count"] for d in p2_aif_details)
+    total_aifs = total_p2_aifs + p3_aif_count
+
+    # Check PG/CPU
+    facilities = {"aif": total_aifs, "launchpad": 1}
+    pg_rem, cpu_rem = _planet_budget_remaining(pg_budget, cpu_budget, facilities)
+
+    if pg_rem < 0 or cpu_rem < 0:
+        flags.append("FACTORY POWER LIMIT")
         return {
             "chain": chain, "viable": False, "flags": flags,
             "planets_used": [], "units_hr": 0, "volume_hr": 0,
         }
 
-    # P3 AIF: 3 units/hr per AIF (60 min cycle, 3 output)
-    # Limited to probably 1-2 AIFs in practice due to input supply
-    estimated_aifs = min(factory_layout["facilities"]["aif"], 2)
-    units_hr = estimated_aifs * 3
+    if units_hr <= 0:
+        flags.append("NO P1 SUPPLY")
+        return {
+            "chain": chain, "viable": False, "flags": flags,
+            "planets_used": [], "units_hr": 0, "volume_hr": 0,
+        }
+
     volume_hr = units_hr * chain["volume"]
+
+    # Build AIF breakdown for display
+    aif_breakdown = []
+    for d in p2_aif_details:
+        aif_breakdown.append(
+            f"{d['aif_count']} AIF -> {d['total_hr']:.0f} {d['name']}/hr")
+    aif_breakdown.append(
+        f"{p3_aif_count} AIF -> {units_hr:.1f} {chain['output_name']}/hr")
+
+    factory_layout = {
+        "facilities": facilities,
+        "units_hr": units_hr,
+        "volume_hr": volume_hr,
+        "pg_used": pg_budget - pg_rem,
+        "cpu_used": cpu_budget - cpu_rem,
+        "role": "factory",
+        "aif_breakdown": aif_breakdown,
+    }
 
     # Build planets_used: extraction planets + factory planet
     planets = list(extraction_planets)
@@ -2150,6 +2264,7 @@ def generate_pi_dossier_data(overrides=None):
                     "cpu_budget": cpu_budget,
                     "rate_detail": p.get("rate_detail", ""),
                     "rate_details": p.get("rate_details", []),
+                    "aif_breakdown": pl.get("aif_breakdown", []),
                 }
                 planets_detail.append(pd)
 
