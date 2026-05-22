@@ -996,21 +996,21 @@ def find_viable_chains(chains, pi_types, schematics, planet_inv,
 
 def _get_p0_rate_for_planet(system, ptype, p0_name, rate_ctx):
     """Get P0 rate for a specific resource on a specific planet type in a system.
-    Returns: (rate, tag) — drops instance for backward compat with callers.
+    Returns: (rate, tag, instance)
     """
-    rate, tag, _instance = get_p0_rate(system, ptype, p0_name,
-                                        rate_ctx["extraction_rates"],
-                                        rate_ctx["density_data"])
-    return rate, tag
+    return get_p0_rate(system, ptype, p0_name,
+                       rate_ctx["extraction_rates"],
+                       rate_ctx["density_data"])
 
 
 def _best_system_for_p0(p0_name, compatible_ptypes, flat_inv, rate_ctx):
-    """Find best system+planet type for extracting a specific P0 resource.
+    """Find best system+planet type+instance for extracting a specific P0.
 
-    Returns: (system, ptype, rate, source_tag) or (None, None, 0, "")
+    Returns: (system, ptype, instance, rate, source_tag) or (None, None, "", 0, "")
     """
     best_sys = None
     best_ptype = None
+    best_instance = ""
     best_rate = 0
     best_tag = ""
     for ptype in compatible_ptypes:
@@ -1018,13 +1018,15 @@ def _best_system_for_p0(p0_name, compatible_ptypes, flat_inv, rate_ctx):
         for system, count in entries:
             if count <= 0:
                 continue
-            rate, tag = _get_p0_rate_for_planet(system, ptype, p0_name, rate_ctx)
+            rate, tag, instance = _get_p0_rate_for_planet(
+                system, ptype, p0_name, rate_ctx)
             if rate > best_rate:
                 best_rate = rate
                 best_sys = system
                 best_ptype = ptype
+                best_instance = instance
                 best_tag = tag
-    return best_sys, best_ptype, best_rate, best_tag
+    return best_sys, best_ptype, best_instance, best_rate, best_tag
 
 
 def _analyse_p1_chain(chain, pi_types, flat_inv, total_by_type,
@@ -1036,7 +1038,7 @@ def _analyse_p1_chain(chain, pi_types, flat_inv, total_by_type,
     p0_name = chain["p0_inputs"][0]["name"]
     compatible_ptypes = P0_PLANET_MAP.get(p0_name, set())
 
-    best_sys, best_ptype, best_rate, tag = _best_system_for_p0(
+    best_sys, best_ptype, best_inst, best_rate, tag = _best_system_for_p0(
         p0_name, compatible_ptypes, flat_inv, rate_ctx)
 
     if not best_sys:
@@ -1053,10 +1055,11 @@ def _analyse_p1_chain(chain, pi_types, flat_inv, total_by_type,
             "planets_used": [], "units_hr": 0, "volume_hr": 0,
         }
 
+    inst_label = best_inst if best_inst and best_inst != "?" else "A"
     rate_detail = f"{p0_name}: {best_rate:.0f}/hr [{tag}]"
     return {
         "chain": chain, "viable": True, "layout_type": "p1_extractor",
-        "planets_used": [{"system": best_sys, "type": best_ptype,
+        "planets_used": [{"system": best_sys, "type": f"{best_ptype} {inst_label}",
                           "role": f"Extract {p0_name} -> {chain['output_name']}",
                           "layout": layout, "rate_detail": rate_detail}],
         "planet_count": 1,
@@ -1088,18 +1091,22 @@ def _analyse_p2_chain(chain, pi_types, schematics, flat_inv, total_by_type,
             # Get per-resource rates for both P0s on this planet
             rates = []
             tags = []
+            instances = []
             for p0_name in p0_names:
-                rate, tag = _get_p0_rate_for_planet(system, ptype, p0_name, rate_ctx)
+                rate, tag, inst = _get_p0_rate_for_planet(system, ptype, p0_name, rate_ctx)
                 rates.append(rate)
                 tags.append(tag)
+                instances.append(inst)
 
             layout = compute_p2_selfcontained_layout(
                 chain, rates, pg_budget, cpu_budget)
             if layout:
                 if not best_selfcontained or layout["units_hr"] > best_selfcontained["layout"]["units_hr"]:
+                    # Use the first instance that had data (both P0s on same planet)
+                    best_inst = instances[0] if instances[0] != "?" else (instances[1] if len(instances) > 1 else "A")
                     best_selfcontained = {
-                        "system": system, "type": ptype, "layout": layout,
-                        "rates": rates, "tags": tags,
+                        "system": system, "type": ptype, "instance": best_inst,
+                        "layout": layout, "rates": rates, "tags": tags,
                     }
 
     if best_selfcontained:
@@ -1114,11 +1121,15 @@ def _analyse_p2_chain(chain, pi_types, schematics, flat_inv, total_by_type,
             rate_details.append(f"{p0_name}: {rate:.0f}/hr [{tag}] "
                                 f"({headroom:+.0f}% headroom){marker}")
 
+        sc_inst = best_selfcontained.get("instance", "A")
+        if not sc_inst or sc_inst == "?":
+            sc_inst = "A"
+        sc_label = f"{best_selfcontained['type']} {sc_inst}"
         return {
             "chain": chain, "viable": True, "layout_type": "p2_selfcontained",
             "planets_used": [{
                 "system": best_selfcontained["system"],
-                "type": best_selfcontained["type"],
+                "type": sc_label,
                 "role": f"Extract+Process -> {chain['output_name']}",
                 "layout": layout,
                 "rate_details": rate_details,
@@ -1134,7 +1145,7 @@ def _analyse_p2_chain(chain, pi_types, schematics, flat_inv, total_by_type,
     extraction_planets = []
     all_tags = []
     for i, p0_name in enumerate(p0_names):
-        best_sys, best_ptype, best_rate, tag = _best_system_for_p0(
+        best_sys, best_ptype, best_inst, best_rate, tag = _best_system_for_p0(
             p0_name, p0_ptypes[i], flat_inv, rate_ctx)
         if not best_sys:
             return {
@@ -1156,8 +1167,9 @@ def _analyse_p2_chain(chain, pi_types, schematics, flat_inv, total_by_type,
                 "planets_used": [], "units_hr": 0, "volume_hr": 0,
             }
 
+        inst_label = best_inst if best_inst and best_inst != "?" else "A"
         extraction_planets.append({
-            "system": best_sys, "type": best_ptype,
+            "system": best_sys, "type": f"{best_ptype} {inst_label}",
             "role": f"Extract {p0_name} -> {p1_type['name']}",
             "layout": p1_layout,
             "p1_output_hr": p1_layout["units_hr"],
@@ -1526,15 +1538,17 @@ def _run_greedy_allocation(candidates, planet_inv, max_planets, max_haul_minutes
 
         needed = {}
         for p in vc.get("planets_used", []):
-            ptype = p.get("type")
+            ptype_full = p.get("type", "")
             system = p.get("system")
-            if ptype and ptype != "Any" and system:
-                key = (system, ptype)
+            # Strip instance letter: "Barren A" → "Barren"
+            base_ptype = ptype_full.rsplit(" ", 1)[0] if " " in ptype_full else ptype_full
+            if base_ptype and base_ptype != "Any" and system:
+                key = (system, base_ptype)
                 needed[key] = needed.get(key, 0) + 1
 
         can_allocate = True
-        for (sys, ptype), count in needed.items():
-            avail = remaining.get(sys, {}).get(ptype, 0)
+        for (sys, base_ptype), count in needed.items():
+            avail = remaining.get(sys, {}).get(base_ptype, 0)
             if avail < count:
                 can_allocate = False
                 break
@@ -1542,8 +1556,8 @@ def _run_greedy_allocation(candidates, planet_inv, max_planets, max_haul_minutes
         if not can_allocate:
             continue
 
-        for (sys, ptype), count in needed.items():
-            remaining[sys][ptype] -= count
+        for (sys, base_ptype), count in needed.items():
+            remaining[sys][base_ptype] -= count
 
         allocated.append(vc)
         planets_used += pc
