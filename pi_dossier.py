@@ -1493,34 +1493,19 @@ def rank_chains(viable_chains):
     return sorted(viable_chains, key=lambda c: c.get("net_isk_hr", 0), reverse=True)
 
 
-def allocate_5_planets(ranked_chains, planet_inv, max_planets=5, max_haul_minutes=None):
-    """Allocate planet slots to maximize total ISK/hr.
+def _run_greedy_allocation(candidates, planet_inv, max_planets, max_haul_minutes):
+    """Run one greedy allocation pass over pre-sorted candidates.
 
-    Ranks chains by ISK/hr per planet slot consumed, then fills greedily.
-    Self-contained 1-planet chains naturally win over factory chains unless
-    the factory's per-slot contribution exceeds the next-best alternative.
+    candidates: [(sort_key, planet_count, vc), ...] already sorted descending.
+    Returns: (allocated_list, total_net_isk_hr)
     """
-    # Pre-compute per-slot value for each chain
-    candidates = []
-    for vc in ranked_chains:
-        if not vc.get("viable"):
-            continue
-        pc = vc.get("planet_count", len(vc.get("planets_used", [])))
-        if pc == 0:
-            pc = 1
-        net = vc.get("net_isk_hr", 0)
-        per_slot = net / pc
-        candidates.append((per_slot, pc, vc))
-
-    # Sort by ISK/hr per slot, descending
-    candidates.sort(key=lambda x: x[0], reverse=True)
-
     allocated = []
     remaining = copy.deepcopy(planet_inv)
     planets_used = 0
     total_haul = 0
+    total_net = 0
 
-    for per_slot, pc, vc in candidates:
+    for _, pc, vc in candidates:
         if planets_used >= max_planets:
             break
         if planets_used + pc > max_planets:
@@ -1530,7 +1515,6 @@ def allocate_5_planets(ranked_chains, planet_inv, max_planets=5, max_haul_minute
         if max_haul_minutes and total_haul + chain_haul > max_haul_minutes * 1.5:
             continue
 
-        # Check planet availability
         needed = {}
         for p in vc.get("planets_used", []):
             ptype = p.get("type")
@@ -1555,8 +1539,59 @@ def allocate_5_planets(ranked_chains, planet_inv, max_planets=5, max_haul_minute
         allocated.append(vc)
         planets_used += pc
         total_haul += chain_haul
+        total_net += vc.get("net_isk_hr", 0)
 
-    return allocated
+    return allocated, total_net
+
+
+def allocate_5_planets(ranked_chains, planet_inv, max_planets=5, max_haul_minutes=None):
+    """Generate top 3 layout alternatives by varying allocation strategy.
+
+    Returns: list of layouts, each = {"allocated": [...], "total_net": float,
+             "strategy": str}. Sorted by total_net descending, deduplicated.
+    """
+    viable = [vc for vc in ranked_chains if vc.get("viable")]
+
+    # Build candidate lists with different sort keys
+    def _make_candidates(sort_fn):
+        cands = []
+        for vc in viable:
+            pc = vc.get("planet_count", len(vc.get("planets_used", []))) or 1
+            key = sort_fn(vc, pc)
+            cands.append((key, pc, vc))
+        cands.sort(key=lambda x: x[0], reverse=True)
+        return cands
+
+    strategies = [
+        ("Per-slot ISK/hr",
+         lambda vc, pc: vc.get("net_isk_hr", 0) / pc),
+        ("Total ISK/hr (favours factories)",
+         lambda vc, pc: vc.get("net_isk_hr", 0)),
+        ("Self-contained only",
+         lambda vc, pc: vc.get("net_isk_hr", 0) / pc if pc == 1 else -1),
+    ]
+
+    layouts = []
+    seen_signatures = set()
+
+    for strategy_name, sort_fn in strategies:
+        cands = _make_candidates(sort_fn)
+        alloc, total = _run_greedy_allocation(cands, planet_inv,
+                                               max_planets, max_haul_minutes)
+        # Dedup by set of chain output names
+        sig = frozenset(vc["chain"]["output_name"] for vc in alloc)
+        if sig in seen_signatures:
+            continue
+        seen_signatures.add(sig)
+        layouts.append({
+            "allocated": alloc,
+            "total_net": total,
+            "strategy": strategy_name,
+        })
+
+    # Sort by total net descending
+    layouts.sort(key=lambda l: l["total_net"], reverse=True)
+    return layouts[:3]
 
 
 # ── Skill projections ─────────────────────────────────────────
@@ -1631,7 +1666,43 @@ def _fmt_num(value, decimals=0):
     return f"{value:,.{decimals}f}"
 
 
-def render_markdown(allocated, ranked_by_tier, cfg, char_info, pi_skills,
+def _render_layout_table(layout, cfg, lines):
+    """Render one layout as a markdown table."""
+    allocated = layout["allocated"]
+    total_net = layout["total_net"]
+    total_haul = sum(vc.get("haul_minutes_per_day", 0) for vc in allocated)
+    products = [vc["chain"]["output_name"] for vc in allocated]
+
+    lines.append(f"**{_fmt_isk(total_net)}/hr net** -- {', '.join(products)}  |  "
+                 f"Haul: {total_haul:.0f} min/day  |  *{layout['strategy']}*")
+    lines.append("")
+    lines.append("| Slot | System | Type | Role | Product | ISK/hr (chain) |")
+    lines.append("|------|--------|------|------|---------|----------------|")
+
+    slot = 0
+    for vc in allocated:
+        chain = vc["chain"]
+        net = vc.get("net_isk_hr", 0)
+        planets = vc.get("planets_used", [])
+        for i, p in enumerate(planets):
+            slot += 1
+            isk_col = _fmt_isk(net) + "/hr" if i == 0 else ""
+            lines.append(
+                f"| {slot} | {p.get('system','?')} | {p.get('type','?')} | "
+                f"{p.get('role','?')} | {chain['output_name']} | {isk_col} |"
+            )
+        if not planets:
+            pc = vc.get("planet_count", 1)
+            slot += pc
+            lines.append(
+                f"| {slot} | {cfg['home_system']} | -- | "
+                f"{vc.get('layout_type','')} | {chain['output_name']} | "
+                f"{_fmt_isk(net)}/hr |"
+            )
+    lines.append("")
+
+
+def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
                     projections, market_prices, pi_types):
     """Generate the full dossier markdown."""
     lines = []
@@ -1649,41 +1720,16 @@ def render_markdown(allocated, ranked_by_tier, cfg, char_info, pi_skills,
     lines.append("---")
     lines.append("")
 
-    # Recommended layout
-    if allocated:
-        total_net = sum(vc.get("net_isk_hr", 0) for vc in allocated)
-        total_haul = sum(vc.get("haul_minutes_per_day", 0) for vc in allocated)
-        lines.append("## Recommended 5-Planet Layout")
+    # Top layouts
+    if layouts:
+        lines.append("## Recommended Layouts")
         lines.append("")
-        lines.append(f"**Total expected:** {_fmt_isk(total_net)}/hr net  |  "
-                     f"Daily haul: {total_haul:.0f} min")
-        lines.append("")
-        lines.append("| Slot | System | Type | Role | Product | ISK/hr (chain) |")
-        lines.append("|------|--------|------|------|---------|----------------|")
+        for i, layout in enumerate(layouts):
+            label = ["Best", "Second-best", "Third-best"][i] if i < 3 else f"#{i+1}"
+            lines.append(f"### {label} Layout")
+            lines.append("")
+            _render_layout_table(layout, cfg, lines)
 
-        slot = 0
-        for vc in allocated:
-            chain = vc["chain"]
-            pc = vc.get("planet_count", len(vc.get("planets_used", []))) or 1
-            net = vc.get("net_isk_hr", 0)
-            planets = vc.get("planets_used", [])
-            for i, p in enumerate(planets):
-                slot += 1
-                # Show chain total on first row, blank on subsequent
-                isk_col = _fmt_isk(net) + "/hr" if i == 0 else ""
-                lines.append(
-                    f"| {slot} | {p.get('system','?')} | {p.get('type','?')} | "
-                    f"{p.get('role','?')} | {chain['output_name']} | {isk_col} |"
-                )
-            if not planets:
-                slot += pc
-                lines.append(
-                    f"| {slot} | {cfg['home_system']} | -- | "
-                    f"{vc.get('layout_type','')} | {chain['output_name']} | "
-                    f"{_fmt_isk(net)}/hr |"
-                )
-
-        lines.append("")
         lines.append("---")
         lines.append("")
 
@@ -1860,12 +1906,12 @@ def generate_pi_dossier_data(overrides=None):
     compute_economics(viable, market_prices, cfg, pi_types)
 
     ranked = rank_chains(viable)
-    allocated = allocate_5_planets(ranked, planet_inv, cfg["max_planets"],
-                                    max_haul_minutes=cfg["max_haul_minutes"])
+    layouts = allocate_5_planets(ranked, planet_inv, cfg["max_planets"],
+                                 max_haul_minutes=cfg["max_haul_minutes"])
 
     projections = compute_projections(ranked[:5], pi_skills, cfg)
 
-    markdown = render_markdown(allocated, ranked, cfg, char_info, pi_skills,
+    markdown = render_markdown(layouts, ranked, cfg, char_info, pi_skills,
                                projections, market_prices, pi_types)
 
     # Build JSON response
@@ -1907,20 +1953,27 @@ def generate_pi_dossier_data(overrides=None):
             ],
         })
 
-    allocated_json = []
-    for vc in allocated:
-        chain = vc["chain"]
-        allocated_json.append({
-            "output_name": chain["output_name"],
-            "tier": chain["tier"],
-            "layout_type": vc.get("layout_type", ""),
-            "units_hr": vc.get("units_hr", 0),
-            "net_isk_hr": vc.get("net_isk_hr", 0),
-            "planets_used": [
-                {"system": p.get("system", ""), "type": p.get("type", ""),
-                 "role": p.get("role", "")}
-                for p in vc.get("planets_used", [])
-            ],
+    layouts_json = []
+    for layout in layouts:
+        layout_entries = []
+        for vc in layout["allocated"]:
+            chain = vc["chain"]
+            layout_entries.append({
+                "output_name": chain["output_name"],
+                "tier": chain["tier"],
+                "layout_type": vc.get("layout_type", ""),
+                "units_hr": vc.get("units_hr", 0),
+                "net_isk_hr": vc.get("net_isk_hr", 0),
+                "planets_used": [
+                    {"system": p.get("system", ""), "type": p.get("type", ""),
+                     "role": p.get("role", "")}
+                    for p in vc.get("planets_used", [])
+                ],
+            })
+        layouts_json.append({
+            "strategy": layout["strategy"],
+            "total_net": layout["total_net"],
+            "allocated": layout_entries,
         })
 
     return {
@@ -1940,7 +1993,7 @@ def generate_pi_dossier_data(overrides=None):
         "extraction_rates": extraction_rates,
         "density_data": density_data,
         "chains": chains_json,
-        "allocated": allocated_json,
+        "layouts": layouts_json,
         "projections": projections,
         "markdown": markdown,
     }

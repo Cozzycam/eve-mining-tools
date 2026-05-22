@@ -2729,27 +2729,30 @@ function renderPi(data) {
   // Character info
   h += '<div class="fitter-char"><strong>' + data.char_info.name + '</strong> &mdash; CCU ' + data.pi_skills.ccu + ', IC ' + data.pi_skills.ic + ', Planetology ' + data.pi_skills.planetology + '</div>';
 
-  // Recommended layout
-  if (data.allocated && data.allocated.length) {
-    h += '<div class="fitter-section"><h2>Recommended Layout</h2>';
-    let totalNet = 0;
-    data.allocated.forEach(a => { totalNet += a.net_isk_hr || 0; });
-    h += '<p><strong>Total:</strong> ' + fmtIsk(totalNet) + '/hr net</p>';
-    h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>System</th><th>Type</th><th>Role</th><th>Product</th><th class="num">ISK/hr (chain)</th></tr></thead><tbody>';
-    let slot = 0;
-    data.allocated.forEach(a => {
-      if (a.planets_used && a.planets_used.length) {
-        a.planets_used.forEach((p, i) => {
+  // Recommended layouts (top 3)
+  const layouts = data.layouts || [];
+  if (layouts.length) {
+    const labels = ['Best', 'Second-best', 'Third-best'];
+    layouts.forEach((layout, li) => {
+      const label = labels[li] || '#' + (li+1);
+      h += '<div class="fitter-section"><h2>' + label + ' Layout</h2>';
+      h += '<p><strong>' + fmtIsk(layout.total_net) + '/hr net</strong> &mdash; <span style="color:var(--dim)">' + layout.strategy + '</span></p>';
+      h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>System</th><th>Type</th><th>Role</th><th>Product</th><th class="num">ISK/hr (chain)</th></tr></thead><tbody>';
+      let slot = 0;
+      (layout.allocated||[]).forEach(a => {
+        if (a.planets_used && a.planets_used.length) {
+          a.planets_used.forEach((p, i) => {
+            slot++;
+            const iskCol = i === 0 ? fmtIsk(a.net_isk_hr) + '/hr' : '';
+            h += '<tr><td>' + slot + '</td><td>' + p.system + '</td><td>' + p.type + '</td><td>' + p.role + '</td><td>' + a.output_name + '</td><td class="num">' + iskCol + '</td></tr>';
+          });
+        } else {
           slot++;
-          const iskCol = i === 0 ? fmtIsk(a.net_isk_hr) + '/hr' : '';
-          h += '<tr><td>' + slot + '</td><td>' + p.system + '</td><td>' + p.type + '</td><td>' + p.role + '</td><td>' + a.output_name + '</td><td class="num">' + iskCol + '</td></tr>';
-        });
-      } else {
-        slot++;
-        h += '<tr><td>' + slot + '</td><td>--</td><td>--</td><td>' + a.layout_type + '</td><td>' + a.output_name + '</td><td class="num">' + fmtIsk(a.net_isk_hr) + '/hr</td></tr>';
-      }
+          h += '<tr><td>' + slot + '</td><td>--</td><td>--</td><td>' + a.layout_type + '</td><td>' + a.output_name + '</td><td class="num">' + fmtIsk(a.net_isk_hr) + '/hr</td></tr>';
+        }
+      });
+      h += '</tbody></table></div></div>';
     });
-    h += '</tbody></table></div></div>';
   }
 
   // All chains by tier
