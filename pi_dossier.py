@@ -86,7 +86,7 @@ DEFAULT_EXTRACTION_RATE = 8000  # P0/hr per 10-head ECU (conservative)
 #    5% density, 7 heads → 770/head/hr
 DENSITY_YIELD_PER_HEAD = {
     # (min_pct, max_pct): per_head_hr at 10 heads (default estimation target)
-    (0, 3):    300,    # very low — barely extractable, hard to find viable hotspot
+    (0, 3):    300,    # very low (1-3%) — barely extractable, hard to find viable hotspot
     (3, 6):    750,    # low
     (6, 10):   1000,   # low-medium
     (10, 15):  1350,   # medium (calibrated: 13% → 1798/4heads, but 10-head yields less/head)
@@ -281,9 +281,13 @@ def load_planet_density():
 
 
 def _estimate_from_density(density_pct, heads=DEFAULT_ECU_HEADS):
-    """Estimate P0/hr from density % using the calibrated lookup table."""
+    """Estimate P0/hr from density % using the calibrated lookup table.
+    Returns 0 for 0% density — resource cannot be extracted.
+    """
+    if density_pct <= 0:
+        return 0
     for (lo, hi), per_head in DENSITY_YIELD_PER_HEAD.items():
-        if lo <= density_pct < hi:
+        if lo < density_pct <= hi:  # exclusive lower bound: 0% yields nothing
             return per_head * heads
     return 2200 * heads
 
@@ -309,6 +313,8 @@ def get_p0_rate(system, ptype, p0_name, extraction_rates, density_data,
     if not instance_keys:
         instance_keys = [f"{system}.{ptype}.A"]
 
+    has_any_scan_data = False
+
     for key in instance_keys:
         instance = key.split(".")[-1]
 
@@ -319,18 +325,28 @@ def get_p0_rate(system, ptype, p0_name, extraction_rates, density_data,
                 best_rate = obs
                 best_tag = "OBS"
                 best_instance = instance
+            has_any_scan_data = True
             continue
 
         # Check density estimate
-        density = density_data.get(key, {}).get(p0_name)
-        if density is not None and density > 0:
-            est = _estimate_from_density(density, heads)
-            if est > best_rate:
-                best_rate = est
-                best_tag = "EST"
-                best_instance = instance
+        dens_for_planet = density_data.get(key, {})
+        if dens_for_planet:
+            # This planet has been scanned
+            has_any_scan_data = True
+            density = dens_for_planet.get(p0_name)
+            if density is not None and density > 0:
+                est = _estimate_from_density(density, heads)
+                if est > best_rate:
+                    best_rate = est
+                    best_tag = "EST"
+                    best_instance = instance
+            # else: resource is 0% or absent on a scanned planet → yields 0
 
     if best_rate == 0:
+        if has_any_scan_data:
+            # Scanned planet(s) exist but this resource isn't available → 0
+            return 0, "EST:0%", "?"
+        # No data at all — use conservative default
         return DEFAULT_EXTRACTION_RATE, "DFL", "?"
 
     return best_rate, best_tag, best_instance
