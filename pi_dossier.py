@@ -2460,7 +2460,7 @@ def allocate_system_first(ranked_chains, planet_inv, matrix, home_id,
 
 def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
                               home_id, layouts):
-    """Generate an SVG map showing systems, connections, and top layout route."""
+    """Generate an SVG map showing systems, gate connections, and top layout route."""
     if not positions or len(positions) < 2:
         return ""
 
@@ -2471,8 +2471,8 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
     range_x = max_x - min_x or 1
     range_z = max_z - min_z or 1
 
-    W, H = 600, 400
-    PAD = 50
+    W, H = 900, 540
+    PAD = 60
 
     def proj(x, z):
         px = PAD + (x - min_x) / range_x * (W - 2 * PAD)
@@ -2480,12 +2480,18 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
         return px, py
 
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" '
-           f'style="width:100%;max-width:{W}px;background:#1a1a2e;border-radius:8px;">']
+           f'style="width:100%;max-width:{W}px;background:#1a1a2e;'
+           f'border-radius:8px;">']
 
-    # Edges between system pairs
+    # Arrow marker for route
+    svg.append('<defs><marker id="arr" markerWidth="8" markerHeight="6" '
+               'refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" '
+               'fill="#4af" opacity="0.8"/></marker></defs>')
+
+    # Gate connections — only 1-jump neighbors (actual stargates)
     drawn = set()
     for (a, b), jumps in matrix.items():
-        if a >= b or (a, b) in drawn:
+        if a >= b or (a, b) in drawn or jumps != 1:
             continue
         drawn.add((a, b))
         name_a = name_b = None
@@ -2500,60 +2506,102 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
             continue
         x1, y1 = proj(*positions[name_a])
         x2, y2 = proj(*positions[name_b])
-        if jumps == 1:
-            svg.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" '
-                       f'y2="{y2:.1f}" stroke="#334" stroke-width="1"/>')
-        elif 0 < jumps <= 5:
-            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-            svg.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" '
-                       f'y2="{y2:.1f}" stroke="#223" stroke-width="1" '
-                       f'stroke-dasharray="4,4"/>')
-            svg.append(f'<text x="{mx:.1f}" y="{my:.1f}" fill="#556" '
-                       f'font-size="10" text-anchor="middle" '
-                       f'dominant-baseline="middle">{jumps}j</text>')
+        svg.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" '
+                   f'y2="{y2:.1f}" stroke="#334" stroke-width="1"/>')
 
-    # Route highlight for top layout
+    # Route highlight for top layout — with arrows and jump labels
     if layouts:
-        route = layouts[0].get("route", {})
-        ordered = route.get("systems_ordered", [])
+        route_info = layouts[0].get("route", {})
+        ordered = route_info.get("systems_ordered", [])
         if ordered:
             id_to_name = {v: k for k, v in system_ids.items()}
             home_name = id_to_name.get(home_id, "")
             route_names = [home_name] + ordered + [home_name]
             for i in range(len(route_names) - 1):
                 na, nb = route_names[i], route_names[i + 1]
-                if na in positions and nb in positions:
-                    x1, y1 = proj(*positions[na])
-                    x2, y2 = proj(*positions[nb])
-                    svg.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" '
-                               f'x2="{x2:.1f}" y2="{y2:.1f}" '
-                               f'stroke="#4af" stroke-width="2" opacity="0.7"/>')
+                if na not in positions or nb not in positions:
+                    continue
+                x1, y1 = proj(*positions[na])
+                x2, y2 = proj(*positions[nb])
+                # Shorten line so arrow doesn't overlap node
+                dx, dy = x2 - x1, y2 - y1
+                length = (dx * dx + dy * dy) ** 0.5
+                if length > 0:
+                    shrink = 14 / length
+                    x2s = x2 - dx * shrink
+                    y2s = y2 - dy * shrink
+                else:
+                    x2s, y2s = x2, y2
+                svg.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" '
+                           f'x2="{x2s:.1f}" y2="{y2s:.1f}" '
+                           f'stroke="#4af" stroke-width="2.5" opacity="0.8" '
+                           f'marker-end="url(#arr)"/>')
+                # Jump label on route leg
+                aid = system_ids.get(na, 0)
+                bid = system_ids.get(nb, 0)
+                leg_jumps = matrix.get((aid, bid), -1)
+                if leg_jumps > 0:
+                    mx = (x1 + x2) / 2
+                    my = (y1 + y2) / 2
+                    # Offset label perpendicular to line to avoid overlap
+                    if length > 0:
+                        ox, oy = -dy / length * 12, dx / length * 12
+                    else:
+                        ox, oy = 0, -12
+                    svg.append(
+                        f'<text x="{mx + ox:.1f}" y="{my + oy:.1f}" '
+                        f'fill="#4af" font-size="11" text-anchor="middle" '
+                        f'dominant-baseline="middle" font-family="monospace" '
+                        f'opacity="0.9">{leg_jumps}j</text>')
 
     # Nodes
     planet_counts = {}
     for sys_name, planets in planet_inv.items():
         planet_counts[sys_name] = sum(planets.values())
 
+    # Determine which systems are in top layout route for highlighting
+    route_systems = set()
+    if layouts:
+        for a in layouts[0].get("allocated", []):
+            for p in a.get("planets_used", []):
+                if p.get("system"):
+                    route_systems.add(p["system"])
+        ri = layouts[0].get("route", {})
+        if ri.get("sell_system"):
+            route_systems.add(ri["sell_system"])
+
     for name, (x, z) in positions.items():
         px, py = proj(x, z)
         sid = system_ids.get(name, 0)
         count = planet_counts.get(name, 0)
-        r = 6 + min(count, 10) * 1.5
+        r = 8 + min(count, 10) * 1.5
+        is_home = sid == home_id
+        in_route = name in route_systems or is_home
 
-        fill = "#4af" if sid == home_id else "#668"
+        if is_home:
+            fill = "#4af"
+        elif in_route:
+            fill = "#5bc"
+        else:
+            fill = "#556"
+        opacity = "0.9" if in_route else "0.5"
+
         svg.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{r:.1f}" '
-                   f'fill="{fill}" opacity="0.8" class="sys-node" '
+                   f'fill="{fill}" opacity="{opacity}" class="sys-node" '
                    f'data-system="{name}"/>')
-        if sid == home_id:
-            svg.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{r + 3:.1f}" '
-                       f'fill="none" stroke="#4af" stroke-width="2" '
-                       f'opacity="0.5"/>')
-        svg.append(f'<text x="{px:.1f}" y="{py + r + 12:.1f}" fill="#aab" '
-                   f'font-size="11" text-anchor="middle" '
+        if is_home:
+            svg.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" '
+                       f'r="{r + 4:.1f}" fill="none" stroke="#4af" '
+                       f'stroke-width="2" opacity="0.6"/>')
+
+        text_fill = "#ccd" if in_route else "#778"
+        svg.append(f'<text x="{px:.1f}" y="{py + r + 14:.1f}" '
+                   f'fill="{text_fill}" font-size="12" '
+                   f'text-anchor="middle" '
                    f'font-family="monospace">{name}</text>')
         if count > 0:
             svg.append(f'<text x="{px:.1f}" y="{py + 4:.1f}" fill="#fff" '
-                       f'font-size="9" text-anchor="middle" '
+                       f'font-size="10" text-anchor="middle" '
                        f'dominant-baseline="middle" '
                        f'font-family="monospace">{count}</text>')
 
