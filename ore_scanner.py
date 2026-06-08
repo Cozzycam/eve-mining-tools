@@ -1570,10 +1570,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 <div class="controls" style="flex-wrap:wrap;gap:12px;">
   <div class="field">
-    <label>Tax rate %</label>
-    <input type="number" id="pi-tax" placeholder="15" min="0" max="100" step="0.5" value="15" style="width:70px">
-  </div>
-  <div class="field">
     <label>Hauler m&sup3;</label>
     <input type="number" id="pi-hauler" placeholder="9000" min="100" step="100" value="9000" style="width:80px">
   </div>
@@ -2540,7 +2536,6 @@ async function loadPiConfig() {
     if (data.planet_inventory) renderPiInventoryEditor(data.planet_inventory);
     renderPiResourceEditor(data.extraction_rates || {}, data.density_data || {}, data.planet_inventory || {}, data.planet_taxes || {});
     if (data.config) {
-      if (data.config.tax_rate) document.getElementById('pi-tax').value = (data.config.tax_rate * 100).toFixed(0);
       if (data.config.hauler_m3) document.getElementById('pi-hauler').value = data.config.hauler_m3;
       if (data.config.max_haul_minutes) document.getElementById('pi-maxhaul').value = data.config.max_haul_minutes;
       if (data.config.max_market_jumps) document.getElementById('pi-jumps').value = data.config.max_market_jumps;
@@ -2749,12 +2744,11 @@ async function doPi() {
   piStatus('<span class="spinner"></span>Generating PI dossier&hellip; this takes 30-60s, first run slower');
   document.getElementById('pi-results').classList.add('hidden');
 
-  const tax = parseFloat(document.getElementById('pi-tax').value) / 100;
   const hauler = parseFloat(document.getElementById('pi-hauler').value);
   const maxHaul = parseFloat(document.getElementById('pi-maxhaul').value);
   const maxJumps = parseInt(document.getElementById('pi-jumps').value);
 
-  const params = new URLSearchParams({tax, hauler_m3: hauler, max_haul_minutes: maxHaul, max_market_jumps: maxJumps});
+  const params = new URLSearchParams({hauler_m3: hauler, max_haul_minutes: maxHaul, max_market_jumps: maxJumps});
   try {
     const resp = await fetch('/api/pi/generate?' + params.toString());
     const data = await resp.json();
