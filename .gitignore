@@ -1,3 +1,11 @@
 __pycache__/
 *.pyc
 *.lnk
+*.backup
+
+# User data files — per-instance, not shared via git
+planet_inventory.ini
+planet_extraction.ini
+planet_density.ini
+planet_taxes.ini
+pi_config.ini
