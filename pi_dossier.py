@@ -2370,12 +2370,20 @@ def allocate_system_first(ranked_chains, planet_inv, matrix, home_id,
             if total_pool < 1:
                 continue
 
-            # Filter chains whose type requirements can be met from pool
+            # Filter chains whose planets are IN this combo and types fit
+            combo_set = set(combo)
             eligible = []
             for vc in viable:
                 types_needed = vc["_alloc_types"]
                 pc = vc["_alloc_pc"]
                 if pc > max_planets:
+                    continue
+
+                # System membership: all planets_used systems must be in combo
+                chain_systems = {p.get("system", "")
+                                 for p in vc.get("planets_used", [])
+                                 if p.get("system", "")}
+                if chain_systems and not chain_systems.issubset(combo_set):
                     continue
 
                 fits = True
@@ -2408,8 +2416,16 @@ def allocate_system_first(ranked_chains, planet_inv, matrix, home_id,
 
             planet_stops = sum(vc["_alloc_pc"] for vc in best_combo)
 
+            # Route uses actual planet systems, not the combo
+            actual_systems = set()
+            for vc in best_combo:
+                for p in vc.get("planets_used", []):
+                    s = p.get("system", "")
+                    if s:
+                        actual_systems.add(s)
+
             route = _compute_route_cost(
-                set(combo), home_id, sell_system_id, system_ids,
+                actual_systems, home_id, sell_system_id, system_ids,
                 matrix, haul_cfg, planet_stops)
 
             trips_per_day = _compute_trips_per_day(best_combo, cfg["hauler_m3"])
@@ -2421,7 +2437,7 @@ def allocate_system_first(ranked_chains, planet_inv, matrix, home_id,
             route["trips_per_day"] = trips_per_day
             route["daily_haul_minutes"] = daily_haul_minutes
 
-            label = " + ".join(combo)
+            label = " + ".join(sorted(actual_systems))
             if subset_size > 1:
                 label += f" ({subset_size} systems)"
 
