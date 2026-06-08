@@ -2815,6 +2815,11 @@ function renderPi(data) {
   // Character info
   h += '<div class="fitter-char"><strong>' + data.char_info.name + '</strong> &mdash; CCU ' + data.pi_skills.ccu + ', IC ' + data.pi_skills.ic + ', Planetology ' + data.pi_skills.planetology + '</div>';
 
+  // System map SVG
+  if (data.system_map_svg) {
+    h += '<div style="margin:12px 0;text-align:center;">' + data.system_map_svg + '</div>';
+  }
+
   // Recommended layouts (top 3)
   const layouts = data.layouts || [];
   if (layouts.length) {
@@ -2822,7 +2827,20 @@ function renderPi(data) {
     layouts.forEach((layout, li) => {
       const label = labels[li] || '#' + (li+1);
       h += '<div class="fitter-section"><h2>' + label + ' Layout</h2>';
-      h += '<p><strong>' + fmtIsk(layout.total_net) + '/hr net</strong> &mdash; <span style="color:var(--dim)">' + layout.strategy + '</span></p>';
+      const rt = layout.route || {};
+      let haulStr = '';
+      if (rt.daily_haul_minutes != null) {
+        const trips = rt.trips_per_day || 1;
+        haulStr = rt.daily_haul_minutes.toFixed(0) + ' min/day (' + trips + ' trip' + (trips > 1 ? 's' : '') + ')';
+      }
+      h += '<p><strong>' + fmtIsk(layout.total_net) + '/hr net</strong> &mdash; <span style="color:var(--dim)">' + layout.strategy + '</span>';
+      if (haulStr) h += ' &nbsp;|&nbsp; Haul: ' + haulStr;
+      h += '</p>';
+      if (rt.systems_ordered && rt.systems_ordered.length) {
+        const sell = rt.sell_system || '';
+        const parts = rt.systems_ordered.map(s => s === sell ? s + ' (sell)' : s);
+        h += '<div style="color:var(--dim);font-size:0.85em;margin:-6px 0 6px 0;">Route: Home &rarr; ' + parts.join(' &rarr; ') + ' &rarr; Home &nbsp;|&nbsp; ' + (rt.tour_jumps||0) + ' jumps, ' + (rt.planet_stops||0) + ' POCO stops</div>';
+      }
       h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>System</th><th>Type</th><th>Role</th><th>Product</th><th class="num">ISK/hr (chain)</th></tr></thead><tbody>';
       let slot = 0;
       (layout.allocated||[]).forEach(a => {
@@ -2960,7 +2978,7 @@ function renderPi(data) {
     if (!chains.length) return;
     const tierLabel = {P1:'P1 (Self-contained)',P2:'P2 (Refined)',P3:'P3 (Specialized)',P4:'P4 (Advanced — full chain)'}[tier]||tier;
     h += '<div class="fitter-section"><h2>' + tierLabel + '</h2>';
-    h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>Product</th><th>Setup</th><th class="num">Units/hr</th><th class="num">Sustained</th><th class="num">Net ISK/hr</th><th class="num">Adj ISK/hr</th><th class="num">Trades</th><th class="num">Haul</th><th>Flags</th></tr></thead><tbody>';
+    h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>Product</th><th>Setup</th><th class="num">Units/hr</th><th class="num">Sustained</th><th class="num">Net ISK/hr</th><th class="num">Adj ISK/hr</th><th class="num">Trades</th><th class="num">Haul (est.)</th><th>Flags</th></tr></thead><tbody>';
     chains.forEach((c, i) => {
       const setup = c.layout_type === 'p1_extractor' ? '1 planet' : c.layout_type === 'p2_selfcontained' ? '1 planet (self)' : c.layout_type === 'p2_factory' ? c.planet_count + 'p (factory)' : c.layout_type === 'p4_full' ? c.planet_count + 'p (' + (c.unique_p0_count||'?') + ' P0s)' : c.planet_count + ' planets';
       const flags = (c.flags && c.flags.length) ? c.flags.join(', ') : '--';
@@ -2984,6 +3002,31 @@ function renderPi(data) {
 
   el.innerHTML = h;
   el.classList.remove('hidden');
+
+  // Interactive SVG highlighting: clicking a layout section highlights its systems
+  if (data.system_map_svg && layouts.length) {
+    layouts.forEach((layout, li) => {
+      const section = el.querySelectorAll('.fitter-section')[li];
+      if (!section) return;
+      const sysList = new Set();
+      (layout.allocated||[]).forEach(a => {
+        (a.planets_used||[]).forEach(p => { if (p.system) sysList.add(p.system); });
+      });
+      section.addEventListener('mouseenter', () => {
+        el.querySelectorAll('.sys-node').forEach(node => {
+          const sn = node.getAttribute('data-system');
+          node.style.opacity = sysList.has(sn) ? '1' : '0.25';
+          node.style.filter = sysList.has(sn) ? 'brightness(1.3)' : '';
+        });
+      });
+      section.addEventListener('mouseleave', () => {
+        el.querySelectorAll('.sys-node').forEach(node => {
+          node.style.opacity = '0.8';
+          node.style.filter = '';
+        });
+      });
+    });
+  }
 }
 
 function copyPiMarkdown() {

@@ -185,6 +185,93 @@ def get_jump_count(origin_id, dest_id):
     return jumps
 
 
+# ── Jump matrix and positions ────────────────────────────────
+
+CACHE_TTL_ROUTE = 30 * 86400  # 30 days — routes rarely change
+
+
+def build_jump_matrix(system_names):
+    """Build a pairwise jump matrix for a set of system names.
+
+    Resolves names to IDs, fetches all pairwise shortest routes with
+    file-caching (30-day TTL) and parallel ESI calls.
+
+    Returns: (system_ids: dict[str,int], matrix: dict[tuple[int,int], int])
+    Matrix keyed both directions: matrix[(a,b)] == matrix[(b,a)].
+    Unreachable pairs stored as -1.
+    """
+    import concurrent.futures
+
+    # Resolve names to IDs
+    system_ids = {}
+    for name in system_names:
+        sid = search_system_id(name)
+        if sid:
+            system_ids[name] = sid
+
+    # Build pairs — N*(N-1)/2
+    ids = list(system_ids.values())
+    pairs = []
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            pairs.append((ids[i], ids[j]))
+
+    matrix = {}
+    for sid in ids:
+        matrix[(sid, sid)] = 0
+
+    def _fetch_pair(a, b):
+        cache_key = f"route:{min(a, b)}:{max(a, b)}"
+        cached = cache_get(cache_key, CACHE_TTL_ROUTE)
+        if cached is not None:
+            return a, b, cached
+        data = esi_get(f"{ESI_BASE}/route/{a}/{b}/?datasource=tranquility&flag=shortest")
+        if data and isinstance(data, list):
+            jumps = len(data) - 1
+        else:
+            jumps = -1  # unreachable
+        cache_set(cache_key, jumps)
+        return a, b, jumps
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [pool.submit(_fetch_pair, a, b) for a, b in pairs]
+        for fut in concurrent.futures.as_completed(futures):
+            a, b, jumps = fut.result()
+            matrix[(a, b)] = jumps
+            matrix[(b, a)] = jumps
+
+    return system_ids, matrix
+
+
+def get_system_positions(system_ids):
+    """Fetch 2D galaxy-plane positions for systems.
+
+    Uses ESI /universe/systems/{id}/ to get x,z coordinates.
+    File-cached with 30-day TTL.
+
+    Args:
+        system_ids: dict[str, int] — system name -> ID
+    Returns:
+        dict[str, tuple[float, float]] — name -> (x, z)
+    """
+    positions = {}
+    for name, sid in system_ids.items():
+        cache_key = f"syspos:{sid}"
+        cached = cache_get(cache_key, CACHE_TTL_ROUTE)
+        if cached is not None:
+            positions[name] = tuple(cached)
+            continue
+        data = esi_get(f"{ESI_BASE}/universe/systems/{sid}/?datasource=tranquility")
+        if data and "position" in data:
+            pos = data["position"]
+            x, z = pos.get("x", 0), pos.get("z", 0)
+            positions[name] = (x, z)
+            cache_set(cache_key, [x, z])
+        else:
+            positions[name] = (0, 0)
+    return positions
+
+
 # ── Market ────────────────────────────────────────────────────
 
 def fetch_buy_orders(region_id, type_id):

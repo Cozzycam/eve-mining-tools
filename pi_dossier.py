@@ -14,6 +14,7 @@ import configparser
 import concurrent.futures
 import copy
 import datetime
+import itertools
 import math
 import os
 import sys
@@ -1586,7 +1587,9 @@ def _analyse_p4_chain(chain, pi_types, schematics, flat_inv, total_by_type,
 
 # ── Economics ─────────────────────────────────────────────────
 
-def compute_economics(viable_chains, market_prices, cfg, pi_types):
+def compute_economics(viable_chains, market_prices, cfg, pi_types,
+                      matrix=None, home_id=None, system_ids=None,
+                      planet_taxes=None):
     """Compute ISK/hr, tax, haul time for each viable chain.
 
     Primary price: sustained realised price — walks the buy order book within
@@ -1648,7 +1651,7 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         vc["gross_isk_hr"] = units_hr * sustained_price
 
         # Tax
-        tax_per_unit = _compute_chain_tax(vc, pi_types, cfg)
+        tax_per_unit = _compute_chain_tax(vc, pi_types, cfg, planet_taxes)
         vc["tax_per_hr"] = tax_per_unit * units_hr
 
         # Net ISK/hr = gross - tax
@@ -1671,8 +1674,12 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         vc["jita_gross_isk_hr"] = units_hr * jita_vwap
         vc["jita_haul_min"] = jita_round_trip_min
 
-        # Haul time for daily production
-        vc["haul_minutes_per_day"] = _compute_haul_time(vc, cfg)
+        # Haul time estimate for per-chain display (est.)
+        if matrix and home_id and system_ids:
+            vc["haul_minutes_per_day"] = _estimate_chain_haul_minutes(
+                vc, matrix, home_id, system_ids, cfg["haul"])
+        else:
+            vc["haul_minutes_per_day"] = _compute_haul_time(vc, cfg)
 
         # ── Flags ──
 
@@ -1715,76 +1722,84 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types):
         vc["sell_recommendation"] = _sell_recommendation(vc)
 
 
-def _compute_chain_tax(vc, pi_types, cfg):
-    """Compute total POCO tax per unit of output product."""
-    tax_rate = cfg["tax_rate"]
-    layout_type = vc.get("layout_type", "")
+def _compute_chain_tax(vc, pi_types, cfg, planet_taxes=None):
+    """Compute total POCO tax per unit of output product.
 
+    Uses per-planet tax rates from planet_taxes where available,
+    falling back to cfg["tax_rate"] as default.
+    """
+    if planet_taxes is None:
+        planet_taxes = {}
+    default_rate = cfg["tax_rate"]
+
+    def _planet_rate(system, ptype_full):
+        if not system or not ptype_full or not planet_taxes:
+            return default_rate
+        parts = ptype_full.rsplit(" ", 1)
+        base_ptype = parts[0]
+        instance = parts[1] if len(parts) > 1 and len(parts[1]) <= 2 else "A"
+        return planet_taxes.get(f"{system}.{base_ptype}.{instance}", default_rate)
+
+    layout_type = vc.get("layout_type", "")
     chain = vc["chain"]
     output_base = chain["base_price"]
+    planets = vc.get("planets_used", [])
 
     if layout_type == "p1_extractor":
-        # P1 extraction: product exported from planet
-        # Export tax on P1
-        return output_base * 0.5 * tax_rate
+        rate = _planet_rate(planets[0]["system"], planets[0]["type"]) if planets else default_rate
+        return output_base * 0.5 * rate
 
     elif layout_type == "p2_selfcontained":
-        # P2 self-contained: product exported from planet
-        # Only export tax on P2 (P0→P1→P2 all on-planet, no POCO transitions)
-        return output_base * 0.5 * tax_rate
+        rate = _planet_rate(planets[0]["system"], planets[0]["type"]) if planets else default_rate
+        return output_base * 0.5 * rate
 
     elif layout_type == "p2_factory":
-        # P2 factory: P1 exported from extraction planets + imported to factory + P2 exported
-        # Per unit of P2:
-        #   - Each P1 input: export from extractor planet + import to factory planet
-        #   - P2: export from factory planet
         total_tax = 0
-        for inp in chain["inputs"]:
+        fac_planet = planets[-1] if planets else {}
+        fac_rate = _planet_rate(fac_planet.get("system"), fac_planet.get("type"))
+        for i, inp in enumerate(chain["inputs"]):
             inp_type = pi_types.get(inp["type_id"])
             if inp_type:
                 p1_base = inp_type["base_price"]
-                # Export P1 from extractor + Import P1 to factory
-                # Quantity: per cycle the AIF needs inp["quantity"] P1 per cycle
-                # Per unit P2 output: inp["quantity"] / output_quantity
                 output_qty = chain["schematic"]["output"]["quantity"]
                 p1_per_p2 = inp["quantity"] / output_qty
-                total_tax += p1_per_p2 * p1_base * 0.5 * tax_rate * 2  # export + import
-        # Export P2 from factory
-        total_tax += output_base * 0.5 * tax_rate
+                ext_planet = planets[i] if i < len(planets) - 1 else {}
+                ext_rate = _planet_rate(ext_planet.get("system"), ext_planet.get("type"))
+                total_tax += p1_per_p2 * p1_base * 0.5 * ext_rate   # export from extractor
+                total_tax += p1_per_p2 * p1_base * 0.5 * fac_rate   # import to factory
+        total_tax += output_base * 0.5 * fac_rate
         return total_tax
 
     elif layout_type == "p3_multi":
-        # Simplified: count all POCO transitions
-        # P0→P1 export, P1 import to P2 factory, P2 export,
-        # P2 import to P3 factory, P3 export
         total_tax = 0
-        # P1 exports + imports (rough: 2 transitions per P1 type)
-        for p0 in chain["p0_inputs"]:
-            total_tax += 1 * 0.5 * tax_rate * 2  # base_price ~1 for P1
-        # P2 exports + imports
+        extractors = [p for p in planets if p.get("layout", {}).get("role") == "extractor"]
+        factory = [p for p in planets if p.get("layout", {}).get("role") == "factory"]
+        fac_planet = factory[0] if factory else (planets[-1] if planets else {})
+        fac_rate = _planet_rate(fac_planet.get("system"), fac_planet.get("type"))
+        for ext_p in extractors:
+            ext_rate = _planet_rate(ext_p.get("system"), ext_p.get("type"))
+            total_tax += 1 * 0.5 * ext_rate   # P1 export
+            total_tax += 1 * 0.5 * fac_rate    # P1 import
         for inp in chain["inputs"]:
             inp_type = pi_types.get(inp["type_id"])
             if inp_type:
                 output_qty = chain["schematic"]["output"]["quantity"]
                 p2_per_p3 = inp["quantity"] / output_qty
-                total_tax += p2_per_p3 * inp_type["base_price"] * 0.5 * tax_rate * 2
-        # P3 export
-        total_tax += output_base * 0.5 * tax_rate
+                total_tax += p2_per_p3 * inp_type["base_price"] * 0.5 * fac_rate * 2
+        total_tax += output_base * 0.5 * fac_rate
         return total_tax
 
     elif layout_type == "p4_full":
-        # Full vertical chain: many POCO transitions
-        # Rough estimate: P1 transitions + P2 transitions + P3 transitions + P4 export
         total_tax = 0
         for p0 in chain["p0_inputs"]:
-            total_tax += 1 * 0.5 * tax_rate * 2
+            total_tax += 1 * 0.5 * default_rate * 2
         for inp in chain["inputs"]:
             inp_type = pi_types.get(inp["type_id"])
             if inp_type:
                 output_qty = chain["schematic"]["output"]["quantity"]
                 per_unit = inp["quantity"] / output_qty
-                total_tax += per_unit * inp_type["base_price"] * 0.5 * tax_rate * 2
-        total_tax += output_base * 0.5 * tax_rate
+                total_tax += per_unit * inp_type["base_price"] * 0.5 * default_rate * 2
+        total_tax += output_base * 0.5 * default_rate
         return total_tax
 
     return 0
@@ -1858,6 +1873,41 @@ def _compute_haul_time(vc, cfg):
         return total_sec / 60
 
     return 0
+
+
+def _estimate_chain_haul_minutes(vc, matrix, home_id, system_ids, haul_cfg):
+    """Estimate haul time for a single chain using actual jump distances.
+
+    Rough per-chain estimate for display in ranking tables (marked 'est.').
+    NOT the layout-level route time (which uses TSP).
+    """
+    planets = vc.get("planets_used", [])
+    if not planets:
+        pc = vc.get("planet_count", 1) or 1
+        return (pc * haul_cfg["sec_per_planet"] + haul_cfg["daily_overhead"]) / 60
+
+    # Collect unique systems
+    systems = set()
+    for p in planets:
+        sys_name = p.get("system", "")
+        if sys_name:
+            systems.add(sys_name)
+
+    # Simple estimate: sum round-trip jumps to each unique system
+    total_jumps = 0
+    for sys_name in systems:
+        sid = system_ids.get(sys_name)
+        if sid and sid != home_id:
+            jumps = matrix.get((home_id, sid), -1)
+            if jumps > 0:
+                total_jumps += jumps * 2
+
+    planet_stops = len(planets)
+    time_sec = (total_jumps * haul_cfg["sec_per_jump"]
+                + planet_stops * haul_cfg["sec_per_planet"]
+                + haul_cfg["sec_per_station"]
+                + haul_cfg["daily_overhead"])
+    return time_sec / 60
 
 
 def _identify_bottleneck(vc):
@@ -2070,6 +2120,447 @@ def allocate_5_planets(ranked_chains, planet_inv, max_planets=5, max_haul_minute
     return layouts[:3]
 
 
+# ── TSP solver + route cost ───────────────────────────────────
+
+def _solve_tsp(waypoints, home_id, matrix):
+    """Brute-force TSP for small waypoint sets (max ~6 = 720 perms).
+
+    Computes home -> w1 -> w2 -> ... -> wN -> home, returns shortest.
+    Returns: (ordered_route: list[int], total_jumps: int)
+    """
+    if not waypoints:
+        return [], 0
+
+    reachable = [w for w in waypoints
+                 if matrix.get((home_id, w), -1) >= 0]
+    if not reachable:
+        return [], -1
+
+    if len(reachable) == 1:
+        d = matrix.get((home_id, reachable[0]), -1)
+        if d < 0:
+            return [], -1
+        return list(reachable), d * 2
+
+    best_route = None
+    best_dist = float('inf')
+
+    for perm in itertools.permutations(reachable):
+        dist = matrix.get((home_id, perm[0]), -1)
+        if dist < 0:
+            continue
+        total = dist
+        valid = True
+        for i in range(len(perm) - 1):
+            d = matrix.get((perm[i], perm[i + 1]), -1)
+            if d < 0:
+                valid = False
+                break
+            total += d
+        if not valid:
+            continue
+        d = matrix.get((perm[-1], home_id), -1)
+        if d < 0:
+            continue
+        total += d
+        if total < best_dist:
+            best_dist = total
+            best_route = list(perm)
+
+    if best_route is None:
+        return list(reachable), -1
+    return best_route, best_dist
+
+
+def _compute_route_cost(system_set, home_id, sell_system_id, system_ids,
+                        matrix, haul_cfg, planet_stops):
+    """Compute route cost for a layout's daily circuit.
+
+    Route: home -> extraction/factory systems (TSP) -> sell hub -> home.
+    Sell system is included as a TSP waypoint.
+    """
+    id_to_name = {v: k for k, v in system_ids.items()}
+
+    waypoint_ids = set()
+    for sys_name in system_set:
+        sid = system_ids.get(sys_name)
+        if sid and sid != home_id:
+            waypoint_ids.add(sid)
+
+    if sell_system_id and sell_system_id != home_id:
+        waypoint_ids.add(sell_system_id)
+        # Ensure matrix has entries for sell system
+        all_nodes = [home_id] + list(waypoint_ids)
+        for nid in all_nodes:
+            if (sell_system_id, nid) not in matrix and nid != sell_system_id:
+                jumps = esi.get_jump_count(sell_system_id, nid)
+                matrix[(sell_system_id, nid)] = jumps
+                matrix[(nid, sell_system_id)] = jumps
+
+    waypoints = list(waypoint_ids)
+    route, total_jumps = _solve_tsp(waypoints, home_id, matrix)
+
+    if total_jumps < 0:
+        total_jumps = sum(max(0, matrix.get((home_id, w), 5)) for w in waypoints) * 2
+
+    route_seconds = (total_jumps * haul_cfg["sec_per_jump"]
+                     + planet_stops * haul_cfg["sec_per_planet"]
+                     + haul_cfg["sec_per_station"]
+                     + haul_cfg["daily_overhead"])
+
+    # Resolve any IDs not in system_ids (e.g. sell system from market data)
+    for sid in route:
+        if sid not in id_to_name:
+            id_to_name[sid] = esi.resolve_system_name(sid)
+    if sell_system_id and sell_system_id not in id_to_name:
+        id_to_name[sell_system_id] = esi.resolve_system_name(sell_system_id)
+
+    systems_ordered = [id_to_name.get(sid, f"System {sid}") for sid in route]
+    sell_name = id_to_name.get(sell_system_id, "")
+    sell_jumps = matrix.get((home_id, sell_system_id), 0) if sell_system_id else 0
+
+    return {
+        "systems_ordered": systems_ordered,
+        "tour_jumps": total_jumps,
+        "planet_stops": planet_stops,
+        "sell_system": sell_name,
+        "sell_jumps": max(0, sell_jumps) if sell_jumps else 0,
+        "route_seconds": route_seconds,
+        "route_minutes": route_seconds / 60,
+    }
+
+
+# ── System-first allocator ───────────────────────────────────
+
+def _best_chain_combo(eligible, max_planets, pool):
+    """Find best combination of chains fitting in max_planets with type constraints.
+
+    Uses branch-and-bound with suffix-sum pruning.
+    """
+    # Sort by adjusted ISK/hr descending for better pruning
+    eligible.sort(key=lambda vc: vc.get("adjusted_net_isk_hr", 0), reverse=True)
+
+    # Precompute suffix sums for upper-bound pruning
+    n = len(eligible)
+    suffix_sum = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix_sum[i] = suffix_sum[i + 1] + eligible[i].get("adjusted_net_isk_hr", 0)
+
+    best = [0, []]  # [total_net, chains]
+
+    def _check_types(selected):
+        agg = {}
+        any_count = 0
+        for vc in selected:
+            for t, c in vc["_alloc_types"].items():
+                if t == "Any":
+                    any_count += c
+                else:
+                    agg[t] = agg.get(t, 0) + c
+        for t, c in agg.items():
+            if pool.get(t, 0) < c:
+                return False
+        used_specific = sum(agg.values())
+        total_pool = sum(pool.values())
+        return any_count <= total_pool - used_specific
+
+    def search(idx, remaining, total_net, selected):
+        if total_net > best[0] and selected:
+            if _check_types(selected):
+                best[0] = total_net
+                best[1] = list(selected)
+        if remaining <= 0 or idx >= n:
+            return
+        if total_net + suffix_sum[idx] <= best[0]:
+            return
+        for i in range(idx, n):
+            vc = eligible[i]
+            pc = vc["_alloc_pc"]
+            if pc > remaining:
+                continue
+            if total_net + suffix_sum[i] <= best[0]:
+                break
+            selected.append(vc)
+            search(i + 1, remaining - pc,
+                   total_net + vc.get("adjusted_net_isk_hr", 0), selected)
+            selected.pop()
+
+    search(0, max_planets, 0, [])
+    return best[0], best[1]
+
+
+def _determine_sell_system(allocated, market_prices, system_ids):
+    """Determine sell system for a layout based on dominant product by volume."""
+    best_vol = 0
+    sell_sys_name = ""
+    for vc in allocated:
+        vol = vc.get("volume_hr", 0) * 24
+        if vol > best_vol:
+            best_vol = vol
+            sell_sys_name = vc.get("local_buyer_system", "")
+    if sell_sys_name:
+        return system_ids.get(sell_sys_name) or esi.search_system_id(sell_sys_name)
+    return None
+
+
+def _compute_trips_per_day(allocated, hauler_m3):
+    """Compute trips/day based on peak loaded leg volume."""
+    peak_daily_m3 = 0
+    for vc in allocated:
+        input_vol = 0
+        output_vol = vc.get("volume_hr", 0) * 24
+        for p in vc.get("planets_used", []):
+            layout = p.get("layout", {})
+            if layout.get("role") == "extractor":
+                input_vol += layout.get("volume_hr", 0) * 24
+        peak_daily_m3 += max(input_vol, output_vol)
+    if hauler_m3 <= 0:
+        return 1
+    return max(1, math.ceil(peak_daily_m3 / hauler_m3))
+
+
+def allocate_system_first(ranked_chains, planet_inv, matrix, home_id,
+                          system_ids, cfg, market_prices):
+    """System-first allocator: finds best chain combinations per system subset.
+
+    Replaces allocate_5_planets(). Evaluates every combination of 1..4 systems
+    from the planet inventory, pools their planet types, then finds the
+    best chain combination that fits within max_planets using exact
+    brute-force knapsack. Route cost (TSP including sell system) determines
+    daily haul minutes.
+
+    Returns: list of top 3 layouts with route info, sorted by total_net.
+    """
+    max_planets = cfg["max_planets"]
+    max_haul_minutes = cfg["max_haul_minutes"]
+    haul_cfg = cfg["haul"]
+
+    viable = [vc for vc in ranked_chains if vc.get("viable")]
+    if not viable:
+        return []
+
+    # Pre-compute planet type requirements for each chain
+    for vc in viable:
+        types_needed = {}
+        pc = 0
+        for p in vc.get("planets_used", []):
+            ptype_full = p.get("type", "")
+            base_ptype = ptype_full.rsplit(" ", 1)[0] if " " in ptype_full else ptype_full
+            if not base_ptype:
+                base_ptype = "Any"
+            types_needed[base_ptype] = types_needed.get(base_ptype, 0) + 1
+            pc += 1
+        if pc == 0:
+            pc = vc.get("planet_count", 1) or 1
+        vc["_alloc_types"] = types_needed
+        vc["_alloc_pc"] = pc
+
+    all_systems = list(planet_inv.keys())
+    candidates = []
+
+    for subset_size in range(1, min(len(all_systems), 4) + 1):
+        for combo in itertools.combinations(all_systems, subset_size):
+            # Build pooled planet-type inventory
+            pool = {}
+            for sys_name in combo:
+                for ptype, count in planet_inv.get(sys_name, {}).items():
+                    pool[ptype] = pool.get(ptype, 0) + count
+
+            total_pool = sum(pool.values())
+            if total_pool < 1:
+                continue
+
+            # Filter chains whose type requirements can be met from pool
+            eligible = []
+            for vc in viable:
+                types_needed = vc["_alloc_types"]
+                pc = vc["_alloc_pc"]
+                if pc > max_planets:
+                    continue
+
+                fits = True
+                any_needed = types_needed.get("Any", 0)
+                specific_needed = 0
+                for t, c in types_needed.items():
+                    if t == "Any":
+                        continue
+                    if pool.get(t, 0) < c:
+                        fits = False
+                        break
+                    specific_needed += c
+                if not fits:
+                    continue
+                if any_needed > total_pool - specific_needed:
+                    continue
+
+                eligible.append(vc)
+
+            if not eligible:
+                continue
+
+            best_net, best_combo = _best_chain_combo(
+                list(eligible), max_planets, pool)
+            if not best_combo:
+                continue
+
+            sell_system_id = _determine_sell_system(
+                best_combo, market_prices, system_ids)
+
+            planet_stops = sum(vc["_alloc_pc"] for vc in best_combo)
+
+            route = _compute_route_cost(
+                set(combo), home_id, sell_system_id, system_ids,
+                matrix, haul_cfg, planet_stops)
+
+            trips_per_day = _compute_trips_per_day(best_combo, cfg["hauler_m3"])
+            daily_haul_minutes = route["route_minutes"] * trips_per_day
+
+            if max_haul_minutes and daily_haul_minutes > max_haul_minutes:
+                continue
+
+            route["trips_per_day"] = trips_per_day
+            route["daily_haul_minutes"] = daily_haul_minutes
+
+            label = " + ".join(combo)
+            if subset_size > 1:
+                label += f" ({subset_size} systems)"
+
+            candidates.append({
+                "strategy": label,
+                "total_net": best_net,
+                "allocated": best_combo,
+                "route": route,
+            })
+
+    # Sort by total_net desc, secondary by lower haul
+    candidates.sort(key=lambda c: (-c["total_net"],
+                                    c["route"]["daily_haul_minutes"]))
+
+    # Deduplicate by chain set
+    seen = set()
+    results = []
+    for c in candidates:
+        sig = frozenset(vc["chain"]["output_name"] for vc in c["allocated"])
+        if sig in seen:
+            continue
+        seen.add(sig)
+        results.append(c)
+        if len(results) >= 3:
+            break
+
+    # Clean up temp allocator fields
+    for vc in viable:
+        vc.pop("_alloc_types", None)
+        vc.pop("_alloc_pc", None)
+
+    return results
+
+
+# ── System map SVG ───────────────────────────────────────────
+
+def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
+                              home_id, layouts):
+    """Generate an SVG map showing systems, connections, and top layout route."""
+    if not positions or len(positions) < 2:
+        return ""
+
+    xs = [p[0] for p in positions.values()]
+    zs = [p[1] for p in positions.values()]
+    min_x, max_x = min(xs), max(xs)
+    min_z, max_z = min(zs), max(zs)
+    range_x = max_x - min_x or 1
+    range_z = max_z - min_z or 1
+
+    W, H = 600, 400
+    PAD = 50
+
+    def proj(x, z):
+        px = PAD + (x - min_x) / range_x * (W - 2 * PAD)
+        py = PAD + (z - min_z) / range_z * (H - 2 * PAD)
+        return px, py
+
+    svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" '
+           f'style="width:100%;max-width:{W}px;background:#1a1a2e;border-radius:8px;">']
+
+    # Edges between system pairs
+    drawn = set()
+    for (a, b), jumps in matrix.items():
+        if a >= b or (a, b) in drawn:
+            continue
+        drawn.add((a, b))
+        name_a = name_b = None
+        for n, sid in system_ids.items():
+            if sid == a:
+                name_a = n
+            if sid == b:
+                name_b = n
+        if not name_a or not name_b:
+            continue
+        if name_a not in positions or name_b not in positions:
+            continue
+        x1, y1 = proj(*positions[name_a])
+        x2, y2 = proj(*positions[name_b])
+        if jumps == 1:
+            svg.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" '
+                       f'y2="{y2:.1f}" stroke="#334" stroke-width="1"/>')
+        elif 0 < jumps <= 5:
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            svg.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" '
+                       f'y2="{y2:.1f}" stroke="#223" stroke-width="1" '
+                       f'stroke-dasharray="4,4"/>')
+            svg.append(f'<text x="{mx:.1f}" y="{my:.1f}" fill="#556" '
+                       f'font-size="10" text-anchor="middle" '
+                       f'dominant-baseline="middle">{jumps}j</text>')
+
+    # Route highlight for top layout
+    if layouts:
+        route = layouts[0].get("route", {})
+        ordered = route.get("systems_ordered", [])
+        if ordered:
+            id_to_name = {v: k for k, v in system_ids.items()}
+            home_name = id_to_name.get(home_id, "")
+            route_names = [home_name] + ordered + [home_name]
+            for i in range(len(route_names) - 1):
+                na, nb = route_names[i], route_names[i + 1]
+                if na in positions and nb in positions:
+                    x1, y1 = proj(*positions[na])
+                    x2, y2 = proj(*positions[nb])
+                    svg.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" '
+                               f'x2="{x2:.1f}" y2="{y2:.1f}" '
+                               f'stroke="#4af" stroke-width="2" opacity="0.7"/>')
+
+    # Nodes
+    planet_counts = {}
+    for sys_name, planets in planet_inv.items():
+        planet_counts[sys_name] = sum(planets.values())
+
+    for name, (x, z) in positions.items():
+        px, py = proj(x, z)
+        sid = system_ids.get(name, 0)
+        count = planet_counts.get(name, 0)
+        r = 6 + min(count, 10) * 1.5
+
+        fill = "#4af" if sid == home_id else "#668"
+        svg.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{r:.1f}" '
+                   f'fill="{fill}" opacity="0.8" class="sys-node" '
+                   f'data-system="{name}"/>')
+        if sid == home_id:
+            svg.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{r + 3:.1f}" '
+                       f'fill="none" stroke="#4af" stroke-width="2" '
+                       f'opacity="0.5"/>')
+        svg.append(f'<text x="{px:.1f}" y="{py + r + 12:.1f}" fill="#aab" '
+                   f'font-size="11" text-anchor="middle" '
+                   f'font-family="monospace">{name}</text>')
+        if count > 0:
+            svg.append(f'<text x="{px:.1f}" y="{py + 4:.1f}" fill="#fff" '
+                       f'font-size="9" text-anchor="middle" '
+                       f'dominant-baseline="middle" '
+                       f'font-family="monospace">{count}</text>')
+
+    svg.append('</svg>')
+    return '\n'.join(svg)
+
+
 # ── Skill projections ─────────────────────────────────────────
 
 def compute_projections(top_chains, pi_skills, cfg):
@@ -2166,8 +2657,27 @@ def _render_layout_table(layout, cfg, lines):
     total_haul = sum(vc.get("haul_minutes_per_day", 0) for vc in allocated)
     products = [vc["chain"]["output_name"] for vc in allocated]
 
-    lines.append(f"**{_fmt_isk(total_net)}/hr net** -- {', '.join(products)}  |  "
-                 f"Haul: {total_haul:.0f} min/day  |  *{layout['strategy']}*")
+    route = layout.get("route", {})
+    if route and route.get("tour_jumps"):
+        trips = route.get("trips_per_day", 1)
+        haul_min = route.get("daily_haul_minutes", total_haul)
+        lines.append(f"**{_fmt_isk(total_net)}/hr net** -- {', '.join(products)}  |  "
+                     f"Haul: {haul_min:.0f} min/day ({trips} trip{'s' if trips > 1 else ''})  |  "
+                     f"*{layout['strategy']}*")
+        route_parts = []
+        id_to_name_local = {}  # not available here, use systems_ordered
+        ordered = route.get("systems_ordered", [])
+        sell = route.get("sell_system", "")
+        for sn in ordered:
+            label = f"{sn} (sell)" if sn == sell else sn
+            route_parts.append(label)
+        if route_parts:
+            lines.append(f"  Route: Home -> {' -> '.join(route_parts)} -> Home  |  "
+                         f"{route.get('tour_jumps', 0)} jumps | "
+                         f"{route.get('planet_stops', 0)} POCO stops")
+    else:
+        lines.append(f"**{_fmt_isk(total_net)}/hr net** -- {', '.join(products)}  |  "
+                     f"Haul: {total_haul:.0f} min/day  |  *{layout['strategy']}*")
     lines.append("")
     lines.append("| Slot | System | Type | Role | Product | ISK/hr (chain) |")
     lines.append("|------|--------|------|------|---------|----------------|")
@@ -2238,8 +2748,8 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
                       "P4": "P4 (Advanced Commodities — full chain)"}
         lines.append(f"### {tier_label.get(tier, tier)}")
         lines.append("")
-        lines.append("| Rank | Product | Setup | Units/hr | Sustained | Net ISK/hr | Adj ISK/hr | Trades | Haul/day | Flags |")
-        lines.append("|------|---------|-------|----------|-----------|------------|------------|--------|----------|-------|")
+        lines.append("| Rank | Product | Setup | Units/hr | Sustained | Net ISK/hr | Adj ISK/hr | Trades | Haul (est.) | Flags |")
+        lines.append("|------|---------|-------|----------|-----------|------------|------------|--------|-------------|-------|")
 
         for rank, vc in enumerate(tier_chains, 1):
             chain = vc["chain"]
@@ -2398,14 +2908,27 @@ def generate_pi_dossier_data(overrides=None):
     market_prices = fetch_pi_market(pi_types, local_region_id, home_system_id,
                                     cfg["max_market_jumps"], progress=True)
 
+    # Build jump matrix and system positions
+    print("  PI Dossier: building jump matrix...")
+    all_systems = list(set(list(planet_inv.keys()) + [cfg["home_system"]]))
+    system_ids, matrix = esi.build_jump_matrix(all_systems)
+    system_positions = esi.get_system_positions(system_ids)
+    home_id = system_ids.get(cfg["home_system"])
+    planet_taxes = load_planet_taxes()
+
     print("  PI Dossier: computing layouts and economics...")
     viable = find_viable_chains(chains, pi_types, schematics,
                                 planet_inv, extraction_rates, density_data, cfg)
-    compute_economics(viable, market_prices, cfg, pi_types)
+    compute_economics(viable, market_prices, cfg, pi_types,
+                      matrix, home_id, system_ids, planet_taxes)
 
     ranked = rank_chains(viable)
-    layouts = allocate_5_planets(ranked, planet_inv, cfg["max_planets"],
-                                 max_haul_minutes=cfg["max_haul_minutes"])
+    layouts = allocate_system_first(ranked, planet_inv, matrix, home_id,
+                                    system_ids, cfg, market_prices)
+
+    # Generate system map SVG
+    map_svg = _generate_system_map_svg(planet_inv, matrix, system_ids,
+                                        system_positions, home_id, layouts)
 
     projections = compute_projections(ranked, pi_skills, cfg)
 
@@ -2523,6 +3046,7 @@ def generate_pi_dossier_data(overrides=None):
             "strategy": layout["strategy"],
             "total_net": layout["total_net"],
             "allocated": layout_entries,
+            "route": layout.get("route", {}),
         })
 
     return {
@@ -2543,6 +3067,7 @@ def generate_pi_dossier_data(overrides=None):
         "density_data": density_data,
         "chains": chains_json,
         "layouts": layouts_json,
+        "system_map_svg": map_svg,
         "projections": projections,
         "markdown": markdown,
     }
@@ -2784,6 +3309,71 @@ def self_test():
         min_planets = min(vc.get("planet_count", 99) for vc in p4_viable) if p4_viable else 0
         check("P4 min planets >= 6", min_planets >= 6,
               f"min_planets={min_planets}")
+
+    # ── TSP solver tests ──
+    print("\nTSP solver:")
+    mock_matrix = {
+        (1, 1): 0, (2, 2): 0, (3, 3): 0, (4, 4): 0,
+        (1, 2): 3, (2, 1): 3,
+        (1, 3): 5, (3, 1): 5,
+        (1, 4): 7, (4, 1): 7,
+        (2, 3): 2, (3, 2): 2,
+        (2, 4): 4, (4, 2): 4,
+        (3, 4): 1, (4, 3): 1,
+    }
+    tsp_route, tsp_total = _solve_tsp([2, 3, 4], 1, mock_matrix)
+    # Optimal: 1->2->3->4->1 = 3+2+1+7=13 or 1->4->3->2->1 = 7+1+2+3=13
+    check("TSP 3-node solves", tsp_total == 13, f"got {tsp_total}")
+    check("TSP route has 3 waypoints", len(tsp_route) == 3, f"got {len(tsp_route)}")
+
+    tsp_empty, tsp_zero = _solve_tsp([], 1, mock_matrix)
+    check("TSP empty returns 0 jumps", tsp_zero == 0)
+
+    tsp_one, tsp_one_d = _solve_tsp([2], 1, mock_matrix)
+    check("TSP single waypoint = round trip", tsp_one_d == 6, f"got {tsp_one_d}")
+
+    # ── Route cost test ──
+    print("\nRoute cost:")
+    mock_haul = {"sec_per_jump": 45, "sec_per_planet": 180,
+                 "sec_per_station": 180, "daily_overhead": 300}
+    mock_sids = {"SysA": 2, "SysB": 3, "Home": 1}
+    rc = _compute_route_cost({"SysA", "SysB"}, 1, None, mock_sids,
+                              mock_matrix, mock_haul, 3)
+    check("Route cost has tour_jumps >= 0", rc["tour_jumps"] >= 0,
+          f"jumps={rc['tour_jumps']}")
+    check("Route cost has route_minutes > 0", rc["route_minutes"] > 0,
+          f"min={rc['route_minutes']:.1f}")
+    expected_sec = (rc["tour_jumps"] * 45 + 3 * 180 + 180 + 300)
+    check("Route cost formula consistent", abs(rc["route_seconds"] - expected_sec) < 1,
+          f"expected={expected_sec}, got={rc['route_seconds']}")
+
+    # ── Per-planet tax test ──
+    print("\nPer-planet tax:")
+    test_vc = {
+        "chain": {"base_price": 1000, "inputs": [], "p0_inputs": [],
+                  "schematic": {"output": {"quantity": 1}}},
+        "layout_type": "p1_extractor",
+        "planets_used": [{"system": "Jufvitte", "type": "Gas A",
+                          "layout": {}}],
+    }
+    test_taxes = {"Jufvitte.Gas.A": 0.05}
+    tax_with = _compute_chain_tax(test_vc, {}, {"tax_rate": 0.15}, test_taxes)
+    tax_without = _compute_chain_tax(test_vc, {}, {"tax_rate": 0.15}, {})
+    check("Per-planet tax uses specific rate",
+          abs(tax_with - 1000 * 0.5 * 0.05) < 0.01, f"got {tax_with}")
+    check("Per-planet tax falls back to default",
+          abs(tax_without - 1000 * 0.5 * 0.15) < 0.01, f"got {tax_without}")
+
+    # ── Estimate chain haul test ──
+    print("\nChain haul estimate:")
+    test_haul_vc = {
+        "planets_used": [
+            {"system": "SysA", "layout": {"role": "extractor", "volume_hr": 5}},
+        ],
+    }
+    est = _estimate_chain_haul_minutes(test_haul_vc, mock_matrix, 1,
+                                        mock_sids, mock_haul)
+    check("Estimate haul > 0", est > 0, f"got {est:.1f} min")
 
     print(f"\n{'='*40}")
     if errors:
