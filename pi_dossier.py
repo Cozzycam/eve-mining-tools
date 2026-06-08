@@ -282,6 +282,28 @@ def load_planet_density():
     return densities
 
 
+def load_planet_taxes():
+    """Load planet_taxes.ini → per-planet tax rates.
+
+    Returns: {section_key_str: tax_rate_float}
+    e.g. {"Jufvitte.Gas.A": 0.15, "Jufvitte.Barren.B": 0.10}
+    """
+    path = _ini_path("planet_taxes.ini")
+    if not os.path.exists(path):
+        return {}
+    cp = configparser.ConfigParser()
+    cp.optionxform = str
+    cp.read(path, encoding="utf-8")
+    taxes = {}
+    if cp.has_section("taxes"):
+        for key, val in cp.items("taxes"):
+            try:
+                taxes[key] = float(val)
+            except ValueError:
+                pass
+    return taxes
+
+
 def _estimate_from_density(density_pct, heads=DEFAULT_ECU_HEADS):
     """Estimate P0/hr from density % using the calibrated lookup table.
     Returns 0 for 0% density — resource cannot be extracted.
@@ -2576,6 +2598,25 @@ def save_planet_density(data):
     with open(path, "w", encoding="utf-8") as f:
         f.write("# planet_density.ini\n")
         f.write("# Per-resource density % from in-game scan\n\n")
+        cp.write(f)
+
+
+def save_planet_taxes(data):
+    """Save per-planet tax rates to planet_taxes.ini.
+
+    data: {"System.PlanetType.Instance": tax_rate, ...}
+    """
+    cp = configparser.ConfigParser()
+    cp.optionxform = str
+    cp.add_section("taxes")
+    for key, rate in sorted(data.items()):
+        if isinstance(rate, (int, float)) and rate >= 0:
+            cp.set("taxes", key, str(rate))
+    path = _ini_path("planet_taxes.ini")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# planet_taxes.ini\n")
+        f.write("# Per-planet POCO tax rates\n")
+        f.write("# Format: System.PlanetType.Instance = rate\n\n")
         cp.write(f)
 
 

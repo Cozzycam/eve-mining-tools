@@ -2538,7 +2538,7 @@ async function loadPiConfig() {
     const data = await resp.json();
     piServerData = data;
     if (data.planet_inventory) renderPiInventoryEditor(data.planet_inventory);
-    renderPiResourceEditor(data.extraction_rates || {}, data.density_data || {}, data.planet_inventory || {});
+    renderPiResourceEditor(data.extraction_rates || {}, data.density_data || {}, data.planet_inventory || {}, data.planet_taxes || {});
     if (data.config) {
       if (data.config.tax_rate) document.getElementById('pi-tax').value = (data.config.tax_rate * 100).toFixed(0);
       if (data.config.hauler_m3) document.getElementById('pi-hauler').value = data.config.hauler_m3;
@@ -2594,7 +2594,8 @@ function addPiInvRow() {
   tbody.insertAdjacentHTML('beforeend', h);
 }
 
-function renderPiResourceEditor(rates, density, inventory) {
+function renderPiResourceEditor(rates, density, inventory, taxes) {
+  taxes = taxes || {};
   const el = document.getElementById('pi-extraction-editor');
   const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
@@ -2637,9 +2638,14 @@ function renderPiResourceEditor(rates, density, inventory) {
       if (!resources.length) continue;
       const rateData = rates[combo] || {};
       const densData = density[combo] || {};
+      const taxVal = taxes[combo];
+      const taxDisplay = (taxVal !== undefined && taxVal !== null) ? (taxVal * 100).toFixed(1) : '';
 
       h += '<div style="margin:6px 0 6px 12px;border:1px solid var(--border);border-radius:6px;padding:6px 8px;">';
+      h += '<div style="display:flex;align-items:center;justify-content:space-between;">';
       h += '<strong style="color:var(--accent);font-size:0.82em;">' + ptype + ' ' + instance + '</strong>';
+      h += '<label style="font-size:0.78em;color:var(--dim);">Tax % <input type="number" class="pi-tax-val" data-combo="' + combo + '" value="' + taxDisplay + '" placeholder="" min="0" max="100" step="0.1" style="width:50px;font-size:0.85em;text-align:center;margin-left:3px;"></label>';
+      h += '</div>';
       h += '<table style="border-collapse:collapse;margin-top:3px;width:100%;"><thead><tr>';
       h += '<th style="text-align:left;padding:1px 6px;font-size:0.8em;">Resource</th>';
       h += '<th style="padding:1px 4px;font-size:0.8em;">Density %</th>';
@@ -2679,6 +2685,7 @@ function collectPiInventory() {
 function collectPiResourceData() {
   const rates = {};
   const density = {};
+  const taxes = {};
   document.querySelectorAll('.pi-obs-val').forEach(inp => {
     const combo = inp.dataset.combo;
     const res = inp.dataset.res;
@@ -2697,33 +2704,42 @@ function collectPiResourceData() {
       density[combo][res] = v;
     }
   });
-  return {rates, density};
+  document.querySelectorAll('.pi-tax-val').forEach(inp => {
+    const combo = inp.dataset.combo;
+    const v = inp.value.trim();
+    if (v !== '') {
+      taxes[combo] = parseFloat(v) / 100;
+    }
+  });
+  return {rates, density, taxes};
 }
 
 async function savePiInventory() {
   const inv = collectPiInventory();
-  const {rates, density} = collectPiResourceData();
+  const {rates, density, taxes} = collectPiResourceData();
   try {
     const resp = await fetch('/api/pi/save-inventory', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(inv)});
     const r = await resp.json();
     if (r.ok) {
       piStatus('Inventory saved.');
-      renderPiResourceEditor(rates, density, inv);
+      renderPiResourceEditor(rates, density, inv, taxes);
     } else piStatus(r.error||'Save failed',true);
   } catch(e) { piStatus('Save failed: '+e.message,true); }
 }
 
 async function savePiExtraction() {
-  const {rates, density} = collectPiResourceData();
+  const {rates, density, taxes} = collectPiResourceData();
   try {
-    const [r1, r2] = await Promise.all([
+    const [r1, r2, r3] = await Promise.all([
       fetch('/api/pi/save-extraction', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(rates)}),
       fetch('/api/pi/save-density', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(density)}),
+      fetch('/api/pi/save-taxes', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(taxes)}),
     ]);
     const d1 = await r1.json();
     const d2 = await r2.json();
-    if (d1.ok && d2.ok) piStatus('Resource data saved.');
-    else piStatus((d1.error||'') + ' ' + (d2.error||'Save failed'), true);
+    const d3 = await r3.json();
+    if (d1.ok && d2.ok && d3.ok) piStatus('Resource data saved.');
+    else piStatus((d1.error||'') + ' ' + (d2.error||'') + ' ' + (d3.error||'Save failed'), true);
   } catch(e) { piStatus('Save failed: '+e.message,true); }
 }
 
@@ -3029,12 +3045,14 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             inv = pi_dossier.load_planet_inventory()
             rates = pi_dossier.load_extraction_rates()
             density = pi_dossier.load_planet_density()
+            taxes = pi_dossier.load_planet_taxes()
             # Serialize tuple keys to "System.PlanetType" strings
             self._send_json({
                 "config": cfg,
                 "planet_inventory": inv,
                 "extraction_rates": rates,
                 "density_data": density,
+                "planet_taxes": taxes,
             })
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
@@ -3082,6 +3100,10 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             self._handle_pi_save_density(body)
             return
 
+        if parsed.path == "/api/pi/save-taxes":
+            self._handle_pi_save_taxes(body)
+            return
+
         self.send_error(404)
 
     def _handle_pi_save_inventory(self, body):
@@ -3107,6 +3129,15 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
         try:
             data = json.loads(body.decode())
             pi_dossier.save_planet_density(data)
+            self._send_json({"ok": True})
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def _handle_pi_save_taxes(self, body):
+        import pi_dossier
+        try:
+            data = json.loads(body.decode())
+            pi_dossier.save_planet_taxes(data)
             self._send_json({"ok": True})
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
