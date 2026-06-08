@@ -65,6 +65,18 @@ for _ptype, _p0s in PLANET_P0_MAP.items():
     for _p0 in _p0s:
         P0_PLANET_MAP.setdefault(_p0, set()).add(_ptype)
 
+# POCO tax estimated prices per unit (NPC-set, stable since Rubicon 2013).
+# These are NOT market prices — they're the fixed values POCOs use for tax.
+# Export tax = quantity × estimated_price × tax_rate
+# Import tax = quantity × estimated_price × 0.5 × tax_rate
+PI_TAX_BASE = {
+    "P0": 5,
+    "P1": 500,
+    "P2": 9000,
+    "P3": 70000,
+    "P4": 1350000,
+}
+
 # PI facility power/CPU costs (from SDE, extremely stable)
 FACILITY_COSTS = {
     "ecu_base":     {"pg": 400,  "cpu": 200},
@@ -1725,7 +1737,11 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types,
 def _compute_chain_tax(vc, pi_types, cfg, planet_taxes=None):
     """Compute total POCO tax per unit of output product.
 
-    Uses per-planet tax rates from planet_taxes where available,
+    Uses the fixed PI estimated prices (PI_TAX_BASE) and correct EVE mechanics:
+      Export = estimated_price × tax_rate          (1.0× multiplier)
+      Import = estimated_price × 0.5 × tax_rate   (0.5× multiplier)
+
+    Per-planet tax rates from planet_taxes where available,
     falling back to cfg["tax_rate"] as default.
     """
     if planet_taxes is None:
@@ -1742,64 +1758,84 @@ def _compute_chain_tax(vc, pi_types, cfg, planet_taxes=None):
 
     layout_type = vc.get("layout_type", "")
     chain = vc["chain"]
-    output_base = chain["base_price"]
+    output_tier = chain["tier"]
     planets = vc.get("planets_used", [])
 
     if layout_type == "p1_extractor":
+        # 1 export: P1 leaves the planet
         rate = _planet_rate(planets[0]["system"], planets[0]["type"]) if planets else default_rate
-        return output_base * 0.5 * rate
+        return PI_TAX_BASE["P1"] * rate
 
     elif layout_type == "p2_selfcontained":
+        # 1 export: P2 leaves the planet (P0->P1->P2 all on-planet, no intermediates)
         rate = _planet_rate(planets[0]["system"], planets[0]["type"]) if planets else default_rate
-        return output_base * 0.5 * rate
+        return PI_TAX_BASE["P2"] * rate
 
     elif layout_type == "p2_factory":
+        # Per P2 output unit:
+        #   - Export P1 from each extractor planet (1.0×)
+        #   - Import P1 to factory planet (0.5×)
+        #   - Export P2 from factory planet (1.0×)
         total_tax = 0
         fac_planet = planets[-1] if planets else {}
         fac_rate = _planet_rate(fac_planet.get("system"), fac_planet.get("type"))
+        output_qty = chain["schematic"]["output"]["quantity"]
         for i, inp in enumerate(chain["inputs"]):
-            inp_type = pi_types.get(inp["type_id"])
-            if inp_type:
-                p1_base = inp_type["base_price"]
-                output_qty = chain["schematic"]["output"]["quantity"]
-                p1_per_p2 = inp["quantity"] / output_qty
-                ext_planet = planets[i] if i < len(planets) - 1 else {}
-                ext_rate = _planet_rate(ext_planet.get("system"), ext_planet.get("type"))
-                total_tax += p1_per_p2 * p1_base * 0.5 * ext_rate   # export from extractor
-                total_tax += p1_per_p2 * p1_base * 0.5 * fac_rate   # import to factory
-        total_tax += output_base * 0.5 * fac_rate
+            p1_per_p2 = inp["quantity"] / output_qty
+            ext_planet = planets[i] if i < len(planets) - 1 else {}
+            ext_rate = _planet_rate(ext_planet.get("system"), ext_planet.get("type"))
+            total_tax += p1_per_p2 * PI_TAX_BASE["P1"] * ext_rate        # P1 export
+            total_tax += p1_per_p2 * PI_TAX_BASE["P1"] * 0.5 * fac_rate  # P1 import
+        total_tax += PI_TAX_BASE["P2"] * fac_rate  # P2 export
         return total_tax
 
     elif layout_type == "p3_multi":
+        # Per P3 output unit:
+        #   - Export P1 from each extractor (1.0×)
+        #   - Import P1 to factory (0.5×)
+        #   - P1->P2->P3 processing on factory planet (no POCO tax)
+        #   - Export P3 from factory (1.0×)
         total_tax = 0
         extractors = [p for p in planets if p.get("layout", {}).get("role") == "extractor"]
         factory = [p for p in planets if p.get("layout", {}).get("role") == "factory"]
         fac_planet = factory[0] if factory else (planets[-1] if planets else {})
         fac_rate = _planet_rate(fac_planet.get("system"), fac_planet.get("type"))
+        p3_units_hr = vc.get("units_hr", 0)
+
+        # P1 transitions: use actual production rates to get P1 per P3 unit
         for ext_p in extractors:
             ext_rate = _planet_rate(ext_p.get("system"), ext_p.get("type"))
-            total_tax += 1 * 0.5 * ext_rate   # P1 export
-            total_tax += 1 * 0.5 * fac_rate    # P1 import
-        for inp in chain["inputs"]:
-            inp_type = pi_types.get(inp["type_id"])
-            if inp_type:
-                output_qty = chain["schematic"]["output"]["quantity"]
-                p2_per_p3 = inp["quantity"] / output_qty
-                total_tax += p2_per_p3 * inp_type["base_price"] * 0.5 * fac_rate * 2
-        total_tax += output_base * 0.5 * fac_rate
+            p1_hr = (ext_p.get("layout", {}).get("units_hr", 0)
+                     or ext_p.get("p1_output_hr", 0))
+            p1_per_p3 = p1_hr / p3_units_hr if p3_units_hr > 0 else 0
+            total_tax += p1_per_p3 * PI_TAX_BASE["P1"] * ext_rate        # P1 export
+            total_tax += p1_per_p3 * PI_TAX_BASE["P1"] * 0.5 * fac_rate  # P1 import
+
+        total_tax += PI_TAX_BASE["P3"] * fac_rate  # P3 export
         return total_tax
 
     elif layout_type == "p4_full":
+        # Rough estimate — P4 chains don't have detailed planet assignments yet.
+        # Per P4 output unit:
+        #   - P1 export + import for each P0 line
+        #   - P3 inputs export + import to final factory
+        #   - P4 export
         total_tax = 0
-        for p0 in chain["p0_inputs"]:
-            total_tax += 1 * 0.5 * default_rate * 2
+        n_p0 = len(chain.get("p0_inputs", []))
+        # Each P0 line produces P1 that gets exported + imported
+        # Rough: ~40 P1/hr per line, P4 = 1/hr → ~40 P1 per P4 unit per line
+        p1_per_p4_per_line = 40
+        total_tax += n_p0 * p1_per_p4_per_line * PI_TAX_BASE["P1"] * default_rate       # P1 export
+        total_tax += n_p0 * p1_per_p4_per_line * PI_TAX_BASE["P1"] * 0.5 * default_rate # P1 import
+        # P3 inputs to P4 factory (export + import)
+        output_qty = chain["schematic"]["output"]["quantity"]
         for inp in chain["inputs"]:
-            inp_type = pi_types.get(inp["type_id"])
-            if inp_type:
-                output_qty = chain["schematic"]["output"]["quantity"]
-                per_unit = inp["quantity"] / output_qty
-                total_tax += per_unit * inp_type["base_price"] * 0.5 * default_rate * 2
-        total_tax += output_base * 0.5 * default_rate
+            per_unit = inp["quantity"] / output_qty
+            inp_tier = inp.get("tier", "P3")
+            base = PI_TAX_BASE.get(inp_tier, PI_TAX_BASE["P3"])
+            total_tax += per_unit * base * default_rate        # export
+            total_tax += per_unit * base * 0.5 * default_rate  # import
+        total_tax += PI_TAX_BASE["P4"] * default_rate  # P4 export
         return total_tax
 
     return 0
@@ -3453,6 +3489,7 @@ def self_test():
     print("\nPer-planet tax:")
     test_vc = {
         "chain": {"base_price": 1000, "inputs": [], "p0_inputs": [],
+                  "tier": "P1",
                   "schematic": {"output": {"quantity": 1}}},
         "layout_type": "p1_extractor",
         "planets_used": [{"system": "Jufvitte", "type": "Gas A",
@@ -3461,10 +3498,22 @@ def self_test():
     test_taxes = {"Jufvitte.Gas.A": 0.05}
     tax_with = _compute_chain_tax(test_vc, {}, {"tax_rate": 0.15}, test_taxes)
     tax_without = _compute_chain_tax(test_vc, {}, {"tax_rate": 0.15}, {})
+    # P1 export: PI_TAX_BASE["P1"] × rate = 500 × rate
     check("Per-planet tax uses specific rate",
-          abs(tax_with - 1000 * 0.5 * 0.05) < 0.01, f"got {tax_with}")
+          abs(tax_with - 500 * 0.05) < 0.01, f"got {tax_with}")
     check("Per-planet tax falls back to default",
-          abs(tax_without - 1000 * 0.5 * 0.15) < 0.01, f"got {tax_without}")
+          abs(tax_without - 500 * 0.15) < 0.01, f"got {tax_without}")
+
+    # P2 self-contained: export only, 9000 × rate
+    test_vc_p2 = {
+        "chain": {"tier": "P2", "inputs": [], "p0_inputs": [],
+                  "schematic": {"output": {"quantity": 1}}},
+        "layout_type": "p2_selfcontained",
+        "planets_used": [{"system": "Jufvitte", "type": "Barren A", "layout": {}}],
+    }
+    tax_p2 = _compute_chain_tax(test_vc_p2, {}, {"tax_rate": 0.10}, {})
+    check("P2 self-contained export tax = 9000 * 0.10",
+          abs(tax_p2 - 900) < 0.01, f"got {tax_p2}")
 
     # ── Estimate chain haul test ──
     print("\nChain haul estimate:")
