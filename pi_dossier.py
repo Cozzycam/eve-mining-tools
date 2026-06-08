@@ -2561,6 +2561,7 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
 
     # Determine which systems are in top layout route for highlighting
     route_systems = set()
+    sell_systems = set()
     if layouts:
         for a in layouts[0].get("allocated", []):
             for p in a.get("planets_used", []):
@@ -2568,16 +2569,36 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
                     route_systems.add(p["system"])
         ri = layouts[0].get("route", {})
         if ri.get("sell_system"):
+            sell_systems.add(ri["sell_system"])
             route_systems.add(ri["sell_system"])
 
     for name, (x, z) in positions.items():
         px, py = proj(x, z)
         sid = system_ids.get(name, 0)
         count = planet_counts.get(name, 0)
-        r = 8 + min(count, 10) * 1.5
         is_home = sid == home_id
+        is_sell = name in sell_systems
         in_route = name in route_systems or is_home
 
+        if is_sell and not is_home:
+            # Sell hub — diamond shape, distinct color
+            r = 10
+            svg.append(f'<rect x="{px - r:.1f}" y="{py - r:.1f}" '
+                       f'width="{2*r}" height="{2*r}" rx="3" '
+                       f'fill="#e94" opacity="0.85" '
+                       f'transform="rotate(45 {px:.1f} {py:.1f})" '
+                       f'class="sys-node" data-system="{name}"/>')
+            text_fill = "#fb6"
+            svg.append(f'<text x="{px:.1f}" y="{py + r + 14:.1f}" '
+                       f'fill="{text_fill}" font-size="12" '
+                       f'text-anchor="middle" '
+                       f'font-family="monospace">{name}</text>')
+            svg.append(f'<text x="{px:.1f}" y="{py + r + 26:.1f}" '
+                       f'fill="#a74" font-size="9" text-anchor="middle" '
+                       f'font-family="monospace">(sell)</text>')
+            continue
+
+        r = 8 + min(count, 10) * 1.5
         if is_home:
             fill = "#4af"
         elif in_route:
@@ -2973,6 +2994,23 @@ def generate_pi_dossier_data(overrides=None):
     ranked = rank_chains(viable)
     layouts = allocate_system_first(ranked, planet_inv, matrix, home_id,
                                     system_ids, cfg, market_prices)
+
+    # Add sell systems to map so route is fully visible
+    for layout in layouts:
+        sell_name = layout.get("route", {}).get("sell_system", "")
+        if sell_name and sell_name not in system_ids:
+            sell_id = esi.search_system_id(sell_name)
+            if sell_id:
+                system_ids[sell_name] = sell_id
+                # Add to matrix — distances to existing systems
+                for other_id in list({v for v in system_ids.values()
+                                      if v != sell_id}):
+                    if (sell_id, other_id) not in matrix:
+                        j = esi.get_jump_count(sell_id, other_id)
+                        matrix[(sell_id, other_id)] = j
+                        matrix[(other_id, sell_id)] = j
+                matrix[(sell_id, sell_id)] = 0
+    system_positions = esi.get_system_positions(system_ids)
 
     # Generate system map SVG
     map_svg = _generate_system_map_svg(planet_inv, matrix, system_ids,
