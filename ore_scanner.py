@@ -1598,6 +1598,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div id="pi-extraction-editor" style="font-size:0.82em;"></div>
       <button onclick="savePiExtraction()" style="margin-top:6px;font-size:0.8em;">Save Rates</button>
     </div>
+    <div style="margin-top:16px;padding-top:10px;border-top:1px solid var(--border);">
+      <button onclick="exportPiData()" style="font-size:0.8em;">Export All Planet Data (backup)</button>
+      <label style="font-size:0.8em;margin-left:8px;cursor:pointer;"><input type="file" id="pi-import-file" accept=".json" style="display:none;" onchange="importPiData(this)">Import Backup</label>
+    </div>
   </div>
 </details>
 
@@ -2736,6 +2740,44 @@ async function savePiExtraction() {
     if (d1.ok && d2.ok && d3.ok) piStatus('Resource data saved.');
     else piStatus((d1.error||'') + ' ' + (d2.error||'') + ' ' + (d3.error||'Save failed'), true);
   } catch(e) { piStatus('Save failed: '+e.message,true); }
+}
+
+function exportPiData() {
+  const inv = collectPiInventory();
+  const {rates, density, taxes} = collectPiResourceData();
+  const backup = {
+    exported: new Date().toISOString(),
+    planet_inventory: inv,
+    extraction_rates: rates,
+    density_data: density,
+    planet_taxes: taxes,
+  };
+  const blob = new Blob([JSON.stringify(backup, null, 2)], {type: 'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'pi-planet-data-' + new Date().toISOString().slice(0,10) + '.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  piStatus('Backup exported.');
+}
+
+async function importPiData(input) {
+  const file = input.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const backup = JSON.parse(text);
+    if (!backup.planet_inventory) { piStatus('Invalid backup file.', true); return; }
+    const saves = [];
+    saves.push(fetch('/api/pi/save-inventory', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(backup.planet_inventory)}));
+    if (backup.extraction_rates) saves.push(fetch('/api/pi/save-extraction', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(backup.extraction_rates)}));
+    if (backup.density_data) saves.push(fetch('/api/pi/save-density', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(backup.density_data)}));
+    if (backup.planet_taxes) saves.push(fetch('/api/pi/save-taxes', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(backup.planet_taxes)}));
+    await Promise.all(saves);
+    piStatus('Backup imported. Reloading...');
+    setTimeout(() => location.reload(), 500);
+  } catch(e) { piStatus('Import failed: ' + e.message, true); }
+  input.value = '';
 }
 
 async function doPi() {
