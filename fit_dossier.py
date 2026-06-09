@@ -131,6 +131,16 @@ A = {
 
     # Propulsion module attributes
     "massAddition": 796,
+
+    # Combat module attributes
+    "damageMultiplier": 64,
+    "speed": 51,                   # rate of fire / cycle time (ms)
+    "maxRange": 54,                # optimal range (m)
+    "falloff": 158,                # falloff range (m)
+    "trackingSpeed": 160,          # tracking speed (rad/s)
+    "armorDamageAmount": 84,       # armor repairer HP/cycle
+    "speedFactor": 20,             # web strength / AB speed bonus (%)
+    "warpScrambleStrength": 105,
 }
 
 # Reverse lookup: attribute_id → name
@@ -271,6 +281,11 @@ MODULE_SEEDS = [
     ("high", "Remote Shield Boosters", "Small Remote Shield Booster I"),
     ("high", "Compressors", "Medium Asteroid Ore Compressor I"),
     ("high", "Cloaking Devices", "Prototype Cloaking Device I"),
+    ("high", "Hybrid Turrets", "Light Neutron Blaster I"),
+    ("high", "Energy Nosferatu", "Small Energy Nosferatu I"),
+    ("high", "Energy Neutralizers", "Small Energy Neutralizer I"),
+    ("high", "Probe Launchers", "Core Probe Launcher I"),
+    ("high", "Gas Cloud Harvesters", "Gas Cloud Harvester I"),
 
     # Mid slots
     ("mid", "Shield Extenders", "Medium Shield Extender I"),
@@ -282,6 +297,9 @@ MODULE_SEEDS = [
     ("mid", "Shield Boosters", "Medium Shield Booster I"),
     ("mid", "Cap Batteries", "Medium Cap Battery I"),
     ("mid", "Propulsion Modules", "10MN Afterburner I"),
+    ("mid", "Stasis Webifiers", "Stasis Webifier I"),
+    ("mid", "Warp Scramblers & Disruptors", "Warp Scrambler I"),
+    ("mid", "Analyzers", "Data Analyzer I"),
 
     # Low slots
     ("low", "Mining Laser Upgrades", "Mining Laser Upgrade I"),
@@ -294,6 +312,10 @@ MODULE_SEEDS = [
     ("low", "Reinforced Bulkheads", "Reinforced Bulkheads I"),
     ("low", "Expanded Cargoholds", "Expanded Cargohold I"),
     ("low", "Warp Core Stabilizers", "Warp Core Stabilizer I"),
+    ("low", "Armor Repairers", "Small Armor Repairer I"),
+    ("low", "Energized Membranes", "Multispectrum Energized Membrane I"),
+    ("low", "Armor Plates", "200mm Steel Plates I"),
+    ("low", "Magnetic Field Stabilizers", "Magnetic Field Stabilizer I"),
 
     # Rigs
     ("rig", "Shield Rigs", "Medium Core Defense Field Extender I"),
@@ -304,6 +326,12 @@ MODULE_SEEDS = [
     ("rig", "Navigation Rigs", "Medium Hyperspatial Velocity Optimizer I"),
     ("rig", "Navigation Rigs (agility)", "Medium Polycarbon Engine Housing I"),
     ("rig", "Cargo Rigs", "Medium Cargohold Optimization I"),
+    ("rig", "Armor Rigs", "Medium Trimark Armor Pump I"),
+    ("rig", "Small Shield Rigs", "Small Core Defense Field Extender I"),
+    ("rig", "Small Engineering Rigs", "Small Ancillary Current Router I"),
+    ("rig", "Small Navigation Rigs", "Small Polycarbon Engine Housing I"),
+    ("rig", "Small Armor Rigs", "Small Trimark Armor Pump I"),
+    ("rig", "Small Weapon Rigs (hybrid)", "Small Hybrid Burst Aerator I"),
 ]
 
 # Per-category effect columns: (display_name, attribute_id, format_type)
@@ -369,6 +397,21 @@ CATEGORY_COLUMNS = {
         ("Cargo bonus", 149, "mul"),          # cargoCapacityMultiplier
         ("Structure HP", 150, "mul"),         # structureHPMultiplier
     ],
+    "Hybrid Turrets": [
+        ("Damage", 64, "flat"),               # damageMultiplier
+        ("ROF", 51, "flat"),                  # speed (ms)
+        ("Optimal", 54, "flat"),              # maxRange (m)
+        ("Tracking", 160, "flat"),            # trackingSpeed (rad/s)
+    ],
+    "Armor Repairers": [
+        ("HP/cycle", 84, "flat"),             # armorDamageAmount
+    ],
+    "Stasis Webifiers": [
+        ("Web %", 20, "pctval"),              # speedFactor
+    ],
+    "Warp Scramblers & Disruptors": [
+        ("Strength", 105, "flat"),            # warpScrambleStrength
+    ],
 }
 
 DRONE_SEEDS = [
@@ -406,14 +449,26 @@ ROLE_HIDDEN_CATEGORIES = {
     "hauler": {
         "high": {"Strip Miners", "Modulated Strip Miners", "Mining Lasers",
                  "Industrial Cores", "Compressors", "Mining Foreman Bursts",
-                 "Remote Shield Boosters"},
-        "mid": {"Shield Boosters"},
-        "low": {"Mining Laser Upgrades", "Drone Damage Amplifiers"},
-        "rig": {"Mining Drone Rigs"},
+                 "Remote Shield Boosters", "Gas Cloud Harvesters",
+                 "Hybrid Turrets", "Energy Nosferatu", "Energy Neutralizers"},
+        "mid": {"Shield Boosters", "Stasis Webifiers",
+                "Warp Scramblers & Disruptors"},
+        "low": {"Mining Laser Upgrades", "Drone Damage Amplifiers",
+                "Magnetic Field Stabilizers"},
+        "rig": {"Mining Drone Rigs", "Small Weapon Rigs (hybrid)"},
+    },
+    "combat": {
+        "high": {"Strip Miners", "Modulated Strip Miners", "Mining Lasers",
+                 "Industrial Cores", "Compressors", "Mining Foreman Bursts",
+                 "Remote Shield Boosters", "Gas Cloud Harvesters",
+                 "Tractor Beams", "Cargo Scanners"},
+        "mid": set(),
+        "low": {"Mining Laser Upgrades", "Expanded Cargoholds"},
+        "rig": {"Mining Drone Rigs", "Cargo Rigs"},
     },
 }
 
-VALID_ROLES = {"unset", "hauler", "mining", "auto"}
+VALID_ROLES = {"unset", "hauler", "mining", "combat", "auto"}
 
 
 def _detect_ship_role(ship):
@@ -422,7 +477,7 @@ def _detect_ship_role(ship):
         return "hauler"
     if ship["ship_class"] in MINING_SHIP_CLASSES:
         return "mining"
-    return "unset"
+    return "combat"
 
 
 MAX_WORKERS = 8
@@ -1673,6 +1728,9 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
         w("- Drone Damage Amplifiers: stack with each other (drone damage/yield bonus)")
     w("- Shield Hardeners: same damage type stacks (EM+EM stack, EM+Therm don't)")
     w("- Shield Extenders: **do NOT stack-pen** (flat HP)")
+    w("- Armor Plates: **do NOT stack-pen** (flat HP)")
+    w("- Magnetic Field Stabilizers: stack with each other (damage + ROF bonuses)")
+    w("- Stasis Webifiers: stack with each other (speed reduction)")
     w("- Inertial Stabilizers: stack with each other (agility bonus)")
     w("- Expanded Cargoholds: stack with each other (cargo multiplier)")
     w("- Nanofiber Internal Structures: stack with each other (agility bonus)")
@@ -1757,6 +1815,26 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
         w("- **Show the tradeoff explicitly**: for each proposed fit, show effective "
           "cargo, EHP, align time, and cargo:EHP ratio side by side so the pilot can "
           "pick the right point on the curve.")
+
+    is_combat = role == "combat"
+    if is_combat:
+        w("- **This is a combat/general ship.** Key trade-offs: DPS vs tank vs "
+          "speed/agility. Consider the engagement profile (solo, fleet, PvE, PvP).")
+        w("- **Turret selection**: Blasters are short-range/high-DPS, railguns are "
+          "long-range/lower-DPS. Match weapon system to hull bonuses.")
+        w("- **Armor vs shield tank**: Gallente/Amarr typically armor tank (low slots), "
+          "Caldari/Minmatar typically shield tank (mid slots). Check hull resist "
+          "profile and bonus text.")
+        w("- **Active vs buffer tank**: Active repairers sustain through fights but "
+          "need cap. Plates/extenders give upfront EHP but no sustain. "
+          "Solo PvP favours active; fleet PvP favours buffer.")
+        w("- **Tackle modules** (scram/web/disruptor) control the engagement. "
+          "Scramblers shut off MWD + MJD. Webs reduce target speed for better "
+          "tracking. Disruptors prevent warp at longer range.")
+        w("- **Damage mods** (Magnetic Field Stabilizer for hybrids) are subject to "
+          "stacking penalty. 2-3 is typical; 4th gives diminishing returns.")
+        w("- **Cap stability** matters for active tanks and long PvE. Show cap "
+          "impact of active modules in proposed fits.")
 
     w("")
 
