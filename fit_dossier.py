@@ -480,7 +480,7 @@ def _detect_ship_role(ship):
     return "combat"
 
 
-MAX_WORKERS = 8
+MAX_WORKERS = 16
 
 
 # ── Utilities ─────────────────────────────────────────────────
@@ -1017,15 +1017,19 @@ def check_skill_reqs(mod_attrs, skills, skill_ids):
 # ── Module candidate enumeration ──────────────────────────────
 
 def enumerate_slot_candidates(slot_type, module_groups, ship, skills, skill_ids,
-                              regions, use_cache, progress=True):
+                              regions, use_cache, progress=True,
+                              skip_categories=None):
     """Enumerate all module candidates for a given slot type.
 
     Returns list of category dicts: {name, group_id, candidates: [...]}.
+    skip_categories: optional set of category names to skip entirely (role filtering).
     """
     categories = []
 
     for (st, cat_name), group_id in module_groups.items():
         if st != slot_type:
+            continue
+        if skip_categories and cat_name in skip_categories:
             continue
 
         if progress:
@@ -1088,11 +1092,18 @@ def enumerate_slot_candidates(slot_type, module_groups, ship, skills, skill_ids,
 
             filtered.append((tid, info, da))
 
-        # Fetch prices in parallel (both buy and sell per region)
+        # Check skill reqs early so we can skip price fetches for unmet modules
+        reqs_map = {}  # tid -> (reqs_met, missing)
+        for tid, info, da in filtered:
+            reqs_map[tid] = check_skill_reqs(da, skills, skill_ids)
+
+        # Fetch prices in parallel — only for modules with met skill reqs
         price_data = {}
+        priceable = [(tid, info, da) for tid, info, da in filtered
+                     if reqs_map[tid][0]]
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             futures = {}
-            for tid, info, da in filtered:
+            for tid, info, da in priceable:
                 for region_id, region_label in regions:
                     futures[pool.submit(esi.fetch_best_sell, region_id, tid, use_cache)] = (tid, region_label, "sell")
                     futures[pool.submit(esi.fetch_best_buy, region_id, tid, use_cache)] = (tid, region_label, "buy")
@@ -1107,7 +1118,7 @@ def enumerate_slot_candidates(slot_type, module_groups, ship, skills, skill_ids,
         # Build candidate entries
         candidates = []
         for tid, info, da in filtered:
-            reqs_met, missing = check_skill_reqs(da, skills, skill_ids)
+            reqs_met, missing = reqs_map[tid]
 
             entry = {
                 "type_id": tid,
@@ -1208,11 +1219,18 @@ def enumerate_drones(drone_groups, ship, skills, skill_ids, regions, use_cache,
                 continue
             filtered.append((tid, info, da))
 
-        # Prices (buy + sell per region)
+        # Check skill reqs early to skip price fetches for unmet drones
+        reqs_map = {}
+        for tid, info, da in filtered:
+            reqs_map[tid] = check_skill_reqs(da, skills, skill_ids)
+
+        # Prices — only for drones with met skill reqs
         price_data = {}
+        priceable = [(tid, info, da) for tid, info, da in filtered
+                     if reqs_map[tid][0]]
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             futures = {}
-            for tid, info, da in filtered:
+            for tid, info, da in priceable:
                 for region_id, label in regions:
                     futures[pool.submit(esi.fetch_best_sell, region_id, tid, use_cache)] = (tid, label, "sell")
                     futures[pool.submit(esi.fetch_best_buy, region_id, tid, use_cache)] = (tid, label, "buy")
@@ -1225,7 +1243,7 @@ def enumerate_drones(drone_groups, ship, skills, skill_ids, regions, use_cache,
 
         candidates = []
         for tid, info, da in filtered:
-            reqs_met, missing = check_skill_reqs(da, skills, skill_ids)
+            reqs_met, missing = reqs_map[tid]
             volume = info.get("volume", 0)
             bw = da.get(A["droneBandwidth"], 0)
 
@@ -1881,23 +1899,25 @@ def generate_dossier_data(ship_name, goal="", region_key="verge",
     # Hull prices
     hull_prices = fetch_hull_prices(ship_type_id, regions, use_cache)
 
+    # Resolve role early so we can skip irrelevant categories during enumeration
+    effective_role = _detect_ship_role(ship) if role == "auto" else role
+    role_hidden = ROLE_HIDDEN_CATEGORIES.get(effective_role, {})
+
     # Discover module groups
     module_groups, drone_groups = discover_module_groups(progress=False)
 
-    # Enumerate candidates per slot
+    # Enumerate candidates per slot — skip role-hidden categories
     candidates = {}
     for slot_type in ("high", "mid", "low", "rig"):
         candidates[slot_type] = enumerate_slot_candidates(
             slot_type, module_groups, ship, skills, skill_ids,
             regions, use_cache, progress=False,
+            skip_categories=role_hidden.get(slot_type),
         )
 
     # Drones
     drones = enumerate_drones(drone_groups, ship, skills, skill_ids,
                               regions, use_cache, progress=False)
-
-    # Resolve role
-    effective_role = _detect_ship_role(ship) if role == "auto" else role
 
     # Format markdown dossier (before modifying dicts for JSON)
     region_labels = [label for _, label in regions]
@@ -2202,12 +2222,18 @@ def main():
     hull_prices = fetch_hull_prices(ship_type_id, regions, use_cache)
     print()
 
-    # 6. Discover module groups
+    # 6. Resolve role early to skip irrelevant categories
+    effective_role = _detect_ship_role(ship) if args.role == "auto" else args.role
+    role_skip = ROLE_HIDDEN_CATEGORIES.get(effective_role, {})
+    print(f"Role: {effective_role}")
+    print()
+
+    # 7. Discover module groups
     print("Discovering module groups...")
     module_groups, drone_groups = discover_module_groups()
     print()
 
-    # 7. Enumerate candidates per slot
+    # 8. Enumerate candidates per slot
     candidates = {}
     for slot_type in ("high", "mid", "low", "rig"):
         slot_label = {"high": "High", "mid": "Mid", "low": "Low", "rig": "Rig"}[slot_type]
@@ -2215,15 +2241,16 @@ def main():
         candidates[slot_type] = enumerate_slot_candidates(
             slot_type, module_groups, ship, skills, skill_ids,
             regions, use_cache,
+            skip_categories=role_skip.get(slot_type),
         )
         print()
 
-    # 8. Enumerate drones
+    # 9. Enumerate drones
     print("Enumerating drones...")
     drones = enumerate_drones(drone_groups, ship, skills, skill_ids, regions, use_cache)
     print()
 
-    # 9. Ore market context (top 10 ores in region) — mining ships only
+    # 10. Ore market context (top 10 ores in region) — mining ships only
     ore_context = None
     if ship["ship_class"] in MINING_SHIP_CLASSES:
         try:
@@ -2240,8 +2267,7 @@ def main():
             print(f"  WARNING: Could not fetch ore context: {e}")
             print()
 
-    # 10. Resolve role and format dossier
-    effective_role = _detect_ship_role(ship) if args.role == "auto" else args.role
+    # 11. Format dossier
     print(f"Formatting dossier (role: {effective_role})...")
     dossier = format_dossier(
         ship, candidates, drones, hull_prices, args.goal,
