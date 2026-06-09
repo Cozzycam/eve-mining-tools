@@ -1361,7 +1361,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .bonus-list li { color: var(--dim); margin: 2px 0; list-style: none; padding-left: 16px; }
   .bonus-list li::before { content: '\2022'; color: var(--accent); margin-left: -12px; margin-right: 6px; }
 
-  .unmet { opacity: 0.5; }
+  .unmet { display: none; opacity: 0.45; }
+  .show-unusable .unmet { display: table-row; }
   .reqs-ok { color: var(--green); }
   .reqs-fail { color: var(--red); font-size: 0.8em; }
 
@@ -2405,8 +2406,11 @@ function renderFitter(data) {
     if (!cats.length) return;
     h += '<h3>' + slotLabels[slotType] + '</h3>';
     cats.forEach(cat => {
-      h += '<h4>' + cat.name + ' <span class="dim">(' + cat.candidates.length + ')</span></h4>';
-      if (!cat.candidates.length) { h += '<p class="dim">No candidates.</p>'; return; }
+      const usable = cat.candidates.filter(c => c.reqs_met).length;
+      const total = cat.candidates.length;
+      const countLabel = usable < total ? usable + '/' + total : '' + total;
+      h += '<h4>' + cat.name + ' <span class="dim">(' + countLabel + ')</span></h4>';
+      if (!total) { h += '<p class="dim">No candidates.</p>'; return; }
       h += renderModTable(cat, slotType, catCols, regionLabels);
     });
   });
@@ -2417,15 +2421,21 @@ function renderFitter(data) {
   h += '<div class="fitter-section"><h2>Drones</h2>';
   h += '<div class="stat-line">Bay: <span class="val">' + s.drone_bay.toFixed(0) + '</span> m\u00b3 &bull; BW: <span class="val">' + s.drone_bw.toFixed(0) + '</span> Mbit/s</div>';
   (data.drones || []).forEach(cat => {
-    h += '<h4>' + cat.name + ' <span class="dim">(' + cat.candidates.length + ')</span></h4>';
-    if (!cat.candidates.length) { h += '<p class="dim">No candidates.</p>'; return; }
+    const usable = cat.candidates.filter(c => c.reqs_met).length;
+    const total = cat.candidates.length;
+    const countLabel = usable < total ? usable + '/' + total : '' + total;
+    h += '<h4>' + cat.name + ' <span class="dim">(' + countLabel + ')</span></h4>';
+    if (!total) { h += '<p class="dim">No candidates.</p>'; return; }
     h += renderDroneTable(cat, regionLabels);
   });
   h += '</div>';
   } // end drone bay check
 
-  // Copy markdown button
+  // Toggle unusable + Copy markdown buttons
+  h += '<div style="margin-top:12px;display:flex;gap:10px;align-items:center">';
+  h += '<button id="toggle-unusable-btn" onclick="toggleUnusable()">Show Unusable</button>';
   h += '<button id="copy-md-btn" onclick="copyDossier()">Copy Markdown to Clipboard</button>';
+  h += '</div>';
 
   el.innerHTML = h;
   el.classList.remove('hidden');
@@ -2509,6 +2519,14 @@ function renderDroneTable(cat, regionLabels) {
   });
   t += '</tbody></table></div>';
   return t;
+}
+
+function toggleUnusable() {
+  const el = document.getElementById('fitter-results');
+  const btn = document.getElementById('toggle-unusable-btn');
+  el.classList.toggle('show-unusable');
+  const showing = el.classList.contains('show-unusable');
+  btn.textContent = showing ? 'Hide Unusable' : 'Show Unusable';
 }
 
 function copyDossier() {
