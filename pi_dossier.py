@@ -26,6 +26,11 @@ import eve_common as esi
 
 # ── Constants ─────────────────────────────────────────────────
 
+# System IDs that routes must not pass through (pirate-infested etc.).
+# Populated per-run by generate_pi_dossier_data from ignored inventory
+# systems + cfg avoid_systems; every route/jump lookup passes it to ESI.
+_AVOID_IDS = set()
+
 EVEREF_BASE = "https://ref-data.everef.net"
 CACHE_TTL_PI = 30 * 86400  # 30 days — PI schematics are very stable
 
@@ -169,6 +174,9 @@ def load_pi_config():
         "pg_budget": cp.getfloat("pi", "power_per_planet", fallback=17000),
         "cpu_budget": cp.getfloat("pi", "cpu_per_planet", fallback=21315),
         "max_planets": cp.getint("pi", "max_planets", fallback=5),
+        "avoid_systems": [s.strip() for s in
+                          cp.get("pi", "avoid_systems", fallback="").split(",")
+                          if s.strip()],
     }
 
     cfg["haul"] = {
@@ -715,7 +723,8 @@ def _fetch_buy_orders_in_range(region_id, type_id, home_system_id, max_jumps):
         if sys_id == home_system_id:
             jumps = 0
         else:
-            jumps = esi.get_jump_count(home_system_id, sys_id)
+            jumps = esi.get_jump_count(home_system_id, sys_id,
+                                       avoid=_AVOID_IDS)
             if jumps < 0 or jumps > max_jumps:
                 continue
         in_range.append((o["price"], o.get("volume_remain", 0),
@@ -815,7 +824,8 @@ def fetch_pi_market(pi_types, local_region_id, home_system_id, max_jumps,
         if local_data["best_order"]:
             sys_id = local_data["best_order"].get("system_id", 0)
             local_buyer_system = esi.resolve_system_name(sys_id)
-            local_buyer_jumps = esi.get_jump_count(home_system_id, sys_id)
+            local_buyer_jumps = esi.get_jump_count(home_system_id, sys_id,
+                                                   avoid=_AVOID_IDS)
             if local_buyer_jumps < 0:
                 local_buyer_jumps = 0
 
@@ -1633,7 +1643,8 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types,
     jita_system_id = esi.search_system_id("Jita")
     jita_jumps = 0
     if home_system_id and jita_system_id:
-        jita_jumps = esi.get_jump_count(home_system_id, jita_system_id)
+        jita_jumps = esi.get_jump_count(home_system_id, jita_system_id,
+                                        avoid=_AVOID_IDS)
         if jita_jumps < 0:
             jita_jumps = 15  # fallback
 
@@ -2247,7 +2258,8 @@ def _compute_route_cost(system_set, home_id, sell_system_id, system_ids,
         all_nodes = [home_id] + list(waypoint_ids)
         for nid in all_nodes:
             if (sell_system_id, nid) not in matrix and nid != sell_system_id:
-                jumps = esi.get_jump_count(sell_system_id, nid)
+                jumps = esi.get_jump_count(sell_system_id, nid,
+                                           avoid=_AVOID_IDS)
                 matrix[(sell_system_id, nid)] = jumps
                 matrix[(nid, sell_system_id)] = jumps
 
@@ -2882,8 +2894,12 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
                  f"**Max haul:** {cfg['max_haul_minutes']:.0f} min/day")
     if ignored_systems:
         lines.append("")
-        lines.append(f"**Ignored systems** (excluded from calculations): "
+        lines.append(f"**Ignored systems** (no PI there, routes avoid them): "
                      f"{', '.join(sorted(ignored_systems))}")
+    if cfg.get("avoid_systems"):
+        lines.append("")
+        lines.append(f"**Avoided systems** (routes go around): "
+                     f"{', '.join(sorted(cfg['avoid_systems']))}")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -3045,6 +3061,19 @@ def generate_pi_dossier_data(overrides=None):
     if not home_system_id:
         return {"error": f"Home system '{cfg['home_system']}' not found in ESI."}
 
+    # Systems to route around: ignored inventory systems + cfg avoid list.
+    # Affects every jump/route lookup (market range, jita haul, layout TSP).
+    avoid_names = {s for s, p in planet_inv.items() if p.get("_ignored")}
+    avoid_names.update(cfg["avoid_systems"])
+    avoid_names.discard(cfg["home_system"])
+    _AVOID_IDS.clear()
+    for name in avoid_names:
+        sid = esi.search_system_id(name)
+        if sid and sid != home_system_id:
+            _AVOID_IDS.add(sid)
+    if avoid_names:
+        print(f"  PI Dossier: routing around {', '.join(sorted(avoid_names))}")
+
     local_region_key = None
     local_region_id = None
     for rk, r in esi.REGIONS.items():
@@ -3076,7 +3105,7 @@ def generate_pi_dossier_data(overrides=None):
     # Build jump matrix and system positions
     print("  PI Dossier: building jump matrix...")
     all_systems = list(set(list(planet_inv.keys()) + [cfg["home_system"]]))
-    system_ids, matrix = esi.build_jump_matrix(all_systems)
+    system_ids, matrix = esi.build_jump_matrix(all_systems, avoid=_AVOID_IDS)
     system_positions = esi.get_system_positions(system_ids)
     home_id = system_ids.get(cfg["home_system"])
     planet_taxes = load_planet_taxes()
@@ -3103,7 +3132,8 @@ def generate_pi_dossier_data(overrides=None):
                 for other_id in list({v for v in system_ids.values()
                                       if v != sell_id}):
                     if (sell_id, other_id) not in matrix:
-                        j = esi.get_jump_count(sell_id, other_id)
+                        j = esi.get_jump_count(sell_id, other_id,
+                                               avoid=_AVOID_IDS)
                         matrix[(sell_id, other_id)] = j
                         matrix[(other_id, sell_id)] = j
                 matrix[(sell_id, sell_id)] = 0
@@ -3541,6 +3571,21 @@ def self_test():
     check("Ignored system excluded", "SysB" not in act, f"got {list(act)}")
     check("Active system kept intact", act.get("SysA") == {"Gas": 2, "Barren": 1},
           f"got {act.get('SysA')}")
+
+    # ── Route avoidance (live ESI) ──
+    print("\nRoute avoidance:")
+    juf_id = esi.search_system_id("Jufvitte")
+    cos_id = esi.search_system_id("Costolle")
+    oue_id = esi.search_system_id("Ouelletta")
+    if juf_id and cos_id and oue_id:
+        direct = esi.get_jump_count(juf_id, cos_id)
+        detour = esi.get_jump_count(juf_id, cos_id, avoid={oue_id})
+        check("Direct route found", direct > 0, f"got {direct}")
+        check("Avoid forces longer route", detour > direct,
+              f"direct={direct}, avoiding Ouelletta={detour}")
+    else:
+        check("Route avoidance systems resolve", False,
+              f"juf={juf_id}, cos={cos_id}, oue={oue_id}")
 
     # ── Route cost test ──
     print("\nRoute cost:")

@@ -169,14 +169,23 @@ def search_system_id(name):
 
 # ── Routes ────────────────────────────────────────────────────
 
-def get_jump_count(origin_id, dest_id):
-    """Get shortest jump count between two solar systems."""
+def get_jump_count(origin_id, dest_id, avoid=None):
+    """Get shortest jump count between two solar systems.
+
+    avoid: optional iterable of system IDs the route must not pass
+    through (ESI route `avoid` param). Origin/destination are dropped
+    from the avoid list automatically.
+    """
     if origin_id == dest_id:
         return 0
-    key = (origin_id, dest_id)
+    avoid_ids = tuple(sorted(set(avoid or ()) - {origin_id, dest_id}))
+    key = (origin_id, dest_id, avoid_ids)
     if key in _route_cache:
         return _route_cache[key]
-    data = esi_get(f"{ESI_BASE}/route/{origin_id}/{dest_id}/?datasource=tranquility&flag=shortest")
+    url = f"{ESI_BASE}/route/{origin_id}/{dest_id}/?datasource=tranquility&flag=shortest"
+    if avoid_ids:
+        url += "&avoid=" + ",".join(str(i) for i in avoid_ids)
+    data = esi_get(url)
     if data and isinstance(data, list):
         jumps = len(data) - 1
     else:
@@ -190,17 +199,23 @@ def get_jump_count(origin_id, dest_id):
 CACHE_TTL_ROUTE = 30 * 86400  # 30 days — routes rarely change
 
 
-def build_jump_matrix(system_names):
+def build_jump_matrix(system_names, avoid=None):
     """Build a pairwise jump matrix for a set of system names.
 
     Resolves names to IDs, fetches all pairwise shortest routes with
     file-caching (30-day TTL) and parallel ESI calls.
+
+    avoid: optional iterable of system IDs that routes must not pass
+    through. A pair's own endpoints are dropped from the avoid list so
+    distances to/from an avoided system itself stay computable.
 
     Returns: (system_ids: dict[str,int], matrix: dict[tuple[int,int], int])
     Matrix keyed both directions: matrix[(a,b)] == matrix[(b,a)].
     Unreachable pairs stored as -1.
     """
     import concurrent.futures
+
+    avoid = set(avoid or ())
 
     # Resolve names to IDs
     system_ids = {}
@@ -221,11 +236,17 @@ def build_jump_matrix(system_names):
         matrix[(sid, sid)] = 0
 
     def _fetch_pair(a, b):
+        eff_avoid = sorted(avoid - {a, b})
         cache_key = f"route:{min(a, b)}:{max(a, b)}"
+        if eff_avoid:
+            cache_key += ":avoid:" + "-".join(str(i) for i in eff_avoid)
         cached = cache_get(cache_key, CACHE_TTL_ROUTE)
         if cached is not None:
             return a, b, cached
-        data = esi_get(f"{ESI_BASE}/route/{a}/{b}/?datasource=tranquility&flag=shortest")
+        url = f"{ESI_BASE}/route/{a}/{b}/?datasource=tranquility&flag=shortest"
+        if eff_avoid:
+            url += "&avoid=" + ",".join(str(i) for i in eff_avoid)
+        data = esi_get(url)
         if data and isinstance(data, list):
             jumps = len(data) - 1
         else:
