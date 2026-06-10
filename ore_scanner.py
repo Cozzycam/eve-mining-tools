@@ -2587,13 +2587,16 @@ function renderPiInventoryEditor(inv) {
   const el = document.getElementById('pi-inventory-editor');
   let h = '<table style="border-collapse:collapse;"><thead><tr><th style="padding:2px 6px;">System</th>';
   PI_PLANET_TYPES.forEach(t => { h += '<th style="padding:2px 4px;font-size:0.8em;">' + t + '</th>'; });
+  h += '<th style="padding:2px 4px;font-size:0.8em;" title="Keep the data but exclude this system from all calculations">Ignore</th>';
   h += '<th></th></tr></thead><tbody>';
   for (const [sys, planets] of Object.entries(inv)) {
-    h += '<tr><td style="padding:2px 6px;"><input type="text" class="pi-inv-sys" value="' + sys + '" style="width:80px;font-size:0.8em;"></td>';
+    const ignored = !!planets._ignored;
+    h += '<tr style="' + (ignored ? 'opacity:0.45;' : '') + '"><td style="padding:2px 6px;"><input type="text" class="pi-inv-sys" value="' + sys + '" style="width:80px;font-size:0.8em;"></td>';
     PI_PLANET_TYPES.forEach(t => {
       const v = planets[t] || 0;
       h += '<td style="padding:2px 2px;"><input type="number" class="pi-inv-val" data-type="' + t + '" value="' + v + '" min="0" max="20" style="width:32px;font-size:0.8em;text-align:center;"></td>';
     });
+    h += '<td style="text-align:center;"><input type="checkbox" class="pi-inv-ignore"' + (ignored ? ' checked' : '') + ' title="Exclude from calculations" onchange="this.closest(\'tr\').style.opacity = this.checked ? 0.45 : 1;"></td>';
     h += '<td><button onclick="this.closest(\'tr\').remove()" style="font-size:0.7em;">X</button></td></tr>';
   }
   h += '</tbody></table>';
@@ -2607,6 +2610,7 @@ function addPiInvRow() {
   PI_PLANET_TYPES.forEach(t => {
     h += '<td style="padding:2px 2px;"><input type="number" class="pi-inv-val" data-type="' + t + '" value="0" min="0" max="20" style="width:32px;font-size:0.8em;text-align:center;"></td>';
   });
+  h += '<td style="text-align:center;"><input type="checkbox" class="pi-inv-ignore" title="Exclude from calculations" onchange="this.closest(\'tr\').style.opacity = this.checked ? 0.45 : 1;"></td>';
   h += '<td><button onclick="this.closest(\'tr\').remove()" style="font-size:0.7em;">X</button></td></tr>';
   tbody.insertAdjacentHTML('beforeend', h);
 }
@@ -2695,6 +2699,8 @@ function collectPiInventory() {
       const v = parseInt(inp.value) || 0;
       if (v > 0) inv[sys][inp.dataset.type] = v;
     });
+    const ign = row.querySelector('.pi-inv-ignore');
+    if (ign && ign.checked) inv[sys]._ignored = true;
   });
   return inv;
 }

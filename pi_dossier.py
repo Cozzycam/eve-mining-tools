@@ -190,7 +190,12 @@ def load_pi_config():
 
 
 def load_planet_inventory():
-    """Load planet_inventory.ini → {system: {planet_type: count}}."""
+    """Load planet_inventory.ini → {system: {planet_type: count}}.
+
+    A system section may carry `_ignored = 1` — its data is kept (and
+    round-trips through the web editor) but active_inventory() excludes
+    it from all calculations.
+    """
     cp = configparser.ConfigParser()
     cp.optionxform = str
     cp.read(_ini_path("planet_inventory.ini"), encoding="utf-8")
@@ -198,11 +203,26 @@ def load_planet_inventory():
     for section in cp.sections():
         inv[section] = {}
         for ptype, count in cp.items(section):
+            if ptype == "_ignored":
+                if count.strip().lower() in ("1", "true", "yes"):
+                    inv[section]["_ignored"] = True
+                continue
             try:
                 inv[section][ptype] = int(count)
             except ValueError:
                 pass
     return inv
+
+
+def active_inventory(planet_inv):
+    """Inventory usable for calculations: drops ignored systems and meta keys."""
+    out = {}
+    for system, planets in planet_inv.items():
+        if planets.get("_ignored"):
+            continue
+        out[system] = {pt: c for pt, c in planets.items()
+                       if not pt.startswith("_")}
+    return out
 
 
 def _underscore_to_name(s):
@@ -2158,53 +2178,49 @@ def allocate_5_planets(ranked_chains, planet_inv, max_planets=5, max_haul_minute
 
 # ── TSP solver + route cost ───────────────────────────────────
 
-def _solve_tsp(waypoints, home_id, matrix):
+def _solve_tsp(waypoints, home_id, matrix, end_id=None):
     """Brute-force TSP for small waypoint sets (max ~6 = 720 perms).
 
-    Computes home -> w1 -> w2 -> ... -> wN -> home, returns shortest.
+    Computes home -> w1 -> ... -> wN [-> end_id] -> home, returns shortest.
+    end_id (the sell hub) is pinned as the final stop before home, since
+    goods must be collected before they can be sold.
     Returns: (ordered_route: list[int], total_jumps: int)
     """
-    if not waypoints:
+    def leg(a, b):
+        return 0 if a == b else matrix.get((a, b), -1)
+
+    pinned = [end_id] if end_id is not None and end_id != home_id else []
+    waypoints = [w for w in waypoints if w not in pinned]
+
+    if not waypoints and not pinned:
         return [], 0
 
-    reachable = [w for w in waypoints
-                 if matrix.get((home_id, w), -1) >= 0]
-    if not reachable:
+    reachable = [w for w in waypoints if leg(home_id, w) >= 0]
+    if not reachable and not pinned:
         return [], -1
-
-    if len(reachable) == 1:
-        d = matrix.get((home_id, reachable[0]), -1)
-        if d < 0:
-            return [], -1
-        return list(reachable), d * 2
 
     best_route = None
     best_dist = float('inf')
 
-    for perm in itertools.permutations(reachable):
-        dist = matrix.get((home_id, perm[0]), -1)
-        if dist < 0:
-            continue
-        total = dist
+    perms = itertools.permutations(reachable) if reachable else iter([()])
+    for perm in perms:
+        nodes = [home_id] + list(perm) + pinned + [home_id]
+        total = 0
         valid = True
-        for i in range(len(perm) - 1):
-            d = matrix.get((perm[i], perm[i + 1]), -1)
+        for a, b in zip(nodes, nodes[1:]):
+            d = leg(a, b)
             if d < 0:
                 valid = False
                 break
             total += d
         if not valid:
             continue
-        d = matrix.get((perm[-1], home_id), -1)
-        if d < 0:
-            continue
-        total += d
         if total < best_dist:
             best_dist = total
-            best_route = list(perm)
+            best_route = list(perm) + pinned
 
     if best_route is None:
-        return list(reachable), -1
+        return list(reachable) + pinned, -1
     return best_route, best_dist
 
 
@@ -2213,7 +2229,8 @@ def _compute_route_cost(system_set, home_id, sell_system_id, system_ids,
     """Compute route cost for a layout's daily circuit.
 
     Route: home -> extraction/factory systems (TSP) -> sell hub -> home.
-    Sell system is included as a TSP waypoint.
+    Sell system is pinned as the last stop before returning home (goods
+    must be collected before they can be sold).
     """
     id_to_name = {v: k for k, v in system_ids.items()}
 
@@ -2223,8 +2240,9 @@ def _compute_route_cost(system_set, home_id, sell_system_id, system_ids,
         if sid and sid != home_id:
             waypoint_ids.add(sid)
 
+    end_id = None
     if sell_system_id and sell_system_id != home_id:
-        waypoint_ids.add(sell_system_id)
+        end_id = sell_system_id
         # Ensure matrix has entries for sell system
         all_nodes = [home_id] + list(waypoint_ids)
         for nid in all_nodes:
@@ -2234,10 +2252,12 @@ def _compute_route_cost(system_set, home_id, sell_system_id, system_ids,
                 matrix[(nid, sell_system_id)] = jumps
 
     waypoints = list(waypoint_ids)
-    route, total_jumps = _solve_tsp(waypoints, home_id, matrix)
+    route, total_jumps = _solve_tsp(waypoints, home_id, matrix, end_id=end_id)
 
     if total_jumps < 0:
-        total_jumps = sum(max(0, matrix.get((home_id, w), 5)) for w in waypoints) * 2
+        fallback_nodes = set(waypoints) | ({end_id} if end_id else set())
+        total_jumps = sum(max(0, matrix.get((home_id, w), 5))
+                          for w in fallback_nodes) * 2
 
     route_seconds = (total_jumps * haul_cfg["sec_per_jump"]
                      + planet_stops * haul_cfg["sec_per_planet"]
@@ -2608,8 +2628,12 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
 
     # Nodes
     planet_counts = {}
+    ignored_systems = set()
     for sys_name, planets in planet_inv.items():
-        planet_counts[sys_name] = sum(planets.values())
+        planet_counts[sys_name] = sum(c for pt, c in planets.items()
+                                      if not pt.startswith("_"))
+        if planets.get("_ignored"):
+            ignored_systems.add(sys_name)
 
     # Determine which systems are in top layout route for highlighting
     route_systems = set()
@@ -2650,14 +2674,20 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
                        f'font-family="monospace">(sell)</text>')
             continue
 
+        is_ignored = name in ignored_systems
         r = 8 + min(count, 10) * 1.5
         if is_home:
             fill = "#4af"
+            opacity = "0.9"
+        elif is_ignored:
+            fill = "#855"
+            opacity = "0.35"
         elif in_route:
             fill = "#5bc"
+            opacity = "0.9"
         else:
             fill = "#556"
-        opacity = "0.9" if in_route else "0.5"
+            opacity = "0.5"
 
         svg.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{r:.1f}" '
                    f'fill="{fill}" opacity="{opacity}" class="sys-node" '
@@ -2667,11 +2697,20 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
                        f'r="{r + 4:.1f}" fill="none" stroke="#4af" '
                        f'stroke-width="2" opacity="0.6"/>')
 
-        text_fill = "#ccd" if in_route else "#778"
+        if is_ignored:
+            text_fill = "#866"
+        elif in_route:
+            text_fill = "#ccd"
+        else:
+            text_fill = "#778"
         svg.append(f'<text x="{px:.1f}" y="{py + r + 14:.1f}" '
                    f'fill="{text_fill}" font-size="12" '
                    f'text-anchor="middle" '
                    f'font-family="monospace">{name}</text>')
+        if is_ignored:
+            svg.append(f'<text x="{px:.1f}" y="{py + r + 26:.1f}" '
+                       f'fill="#744" font-size="9" text-anchor="middle" '
+                       f'font-family="monospace">(ignored)</text>')
         if count > 0:
             svg.append(f'<text x="{px:.1f}" y="{py + 4:.1f}" fill="#fff" '
                        f'font-size="10" text-anchor="middle" '
@@ -2827,7 +2866,8 @@ def _render_layout_table(layout, cfg, lines):
 
 
 def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
-                    projections, market_prices, pi_types):
+                    projections, market_prices, pi_types,
+                    ignored_systems=None):
     """Generate the full dossier markdown."""
     lines = []
     now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -2840,6 +2880,10 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
     lines.append(f"**Tax:** {cfg['tax_rate']*100:.0f}% (default)  |  "
                  f"**Hauler:** {_fmt_num(cfg['hauler_m3'])} m3  |  "
                  f"**Max haul:** {cfg['max_haul_minutes']:.0f} min/day")
+    if ignored_systems:
+        lines.append("")
+        lines.append(f"**Ignored systems** (excluded from calculations): "
+                     f"{', '.join(sorted(ignored_systems))}")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -3038,13 +3082,14 @@ def generate_pi_dossier_data(overrides=None):
     planet_taxes = load_planet_taxes()
 
     print("  PI Dossier: computing layouts and economics...")
+    calc_inv = active_inventory(planet_inv)
     viable = find_viable_chains(chains, pi_types, schematics,
-                                planet_inv, extraction_rates, density_data, cfg)
+                                calc_inv, extraction_rates, density_data, cfg)
     compute_economics(viable, market_prices, cfg, pi_types,
                       matrix, home_id, system_ids, planet_taxes)
 
     ranked = rank_chains(viable)
-    layouts = allocate_system_first(ranked, planet_inv, matrix, home_id,
+    layouts = allocate_system_first(ranked, calc_inv, matrix, home_id,
                                     system_ids, cfg, market_prices)
 
     # Add sell systems to map so route is fully visible
@@ -3071,7 +3116,8 @@ def generate_pi_dossier_data(overrides=None):
     projections = compute_projections(ranked, pi_skills, cfg)
 
     markdown = render_markdown(layouts, ranked, cfg, char_info, pi_skills,
-                               projections, market_prices, pi_types)
+                               projections, market_prices, pi_types,
+                               ignored_systems=sorted(set(planet_inv) - set(calc_inv)))
 
     # Build JSON response
     chains_json = []
@@ -3220,6 +3266,10 @@ def save_planet_inventory(data):
     for system, planets in sorted(data.items()):
         cp.add_section(system)
         for ptype, count in sorted(planets.items()):
+            if ptype == "_ignored":
+                if count:
+                    cp.set(system, "_ignored", "1")
+                continue
             if count > 0:
                 cp.set(system, ptype, str(count))
     with open(_ini_path("planet_inventory.ini"), "w", encoding="utf-8") as f:
@@ -3469,6 +3519,28 @@ def self_test():
 
     tsp_one, tsp_one_d = _solve_tsp([2], 1, mock_matrix)
     check("TSP single waypoint = round trip", tsp_one_d == 6, f"got {tsp_one_d}")
+
+    # Sell hub pinned as last stop before home
+    tsp_sell, tsp_sell_d = _solve_tsp([2, 3], 1, mock_matrix, end_id=4)
+    check("TSP sell pinned last", tsp_sell and tsp_sell[-1] == 4,
+          f"route={tsp_sell}")
+    # Best: 1->2->3->4->1 = 3+2+1+7 = 13
+    check("TSP sell-last distance", tsp_sell_d == 13, f"got {tsp_sell_d}")
+
+    # Sell system that is also an extraction system stays last, not duplicated
+    tsp_dup, tsp_dup_d = _solve_tsp([2, 3], 1, mock_matrix, end_id=3)
+    check("TSP sell==waypoint dedup", tsp_dup == [2, 3],
+          f"route={tsp_dup}")
+    check("TSP sell==waypoint distance", tsp_dup_d == 10, f"got {tsp_dup_d}")
+
+    # ── Ignored systems ──
+    print("\nIgnored systems:")
+    test_inv = {"SysA": {"Gas": 2, "Barren": 1},
+                "SysB": {"Gas": 1, "_ignored": True}}
+    act = active_inventory(test_inv)
+    check("Ignored system excluded", "SysB" not in act, f"got {list(act)}")
+    check("Active system kept intact", act.get("SysA") == {"Gas": 2, "Barren": 1},
+          f"got {act.get('SysA')}")
 
     # ── Route cost test ──
     print("\nRoute cost:")
