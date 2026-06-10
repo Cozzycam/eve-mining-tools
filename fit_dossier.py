@@ -282,6 +282,8 @@ MODULE_SEEDS = [
     ("high", "Compressors", "Medium Asteroid Ore Compressor I"),
     ("high", "Cloaking Devices", "Prototype Cloaking Device I"),
     ("high", "Hybrid Turrets", "Light Neutron Blaster I"),
+    ("high", "Missile Launchers", "Light Missile Launcher I"),
+    ("high", "Rocket Launchers", "Rocket Launcher I"),
     ("high", "Energy Nosferatu", "Small Energy Nosferatu I"),
     ("high", "Energy Neutralizers", "Small Energy Neutralizer I"),
     ("high", "Probe Launchers", "Core Probe Launcher I"),
@@ -403,6 +405,14 @@ CATEGORY_COLUMNS = {
         ("Optimal", 54, "flat"),              # maxRange (m)
         ("Tracking", 160, "flat"),            # trackingSpeed (rad/s)
     ],
+    "Missile Launchers": [
+        ("ROF", 51, "flat"),                  # speed (ms) — damage comes from the missile
+        ("Reload", 1795, "flat"),             # reloadTime (ms)
+    ],
+    "Rocket Launchers": [
+        ("ROF", 51, "flat"),
+        ("Reload", 1795, "flat"),
+    ],
     "Armor Repairers": [
         ("HP/cycle", 84, "flat"),             # armorDamageAmount
     ],
@@ -450,7 +460,8 @@ ROLE_HIDDEN_CATEGORIES = {
         "high": {"Strip Miners", "Modulated Strip Miners", "Mining Lasers",
                  "Industrial Cores", "Compressors", "Mining Foreman Bursts",
                  "Remote Shield Boosters", "Gas Cloud Harvesters",
-                 "Hybrid Turrets", "Energy Nosferatu", "Energy Neutralizers"},
+                 "Hybrid Turrets", "Missile Launchers", "Rocket Launchers",
+                 "Energy Nosferatu", "Energy Neutralizers"},
         "mid": {"Shield Boosters", "Stasis Webifiers",
                 "Warp Scramblers & Disruptors"},
         "low": {"Mining Laser Upgrades", "Drone Damage Amplifiers",
@@ -469,6 +480,26 @@ ROLE_HIDDEN_CATEGORIES = {
 }
 
 VALID_ROLES = {"unset", "hauler", "mining", "combat", "auto"}
+
+# Weapon categories that need hardpoints — unhidden when the hull has them
+TURRET_WEAPON_CATEGORIES = {"Hybrid Turrets"}
+LAUNCHER_WEAPON_CATEGORIES = {"Missile Launchers", "Rocket Launchers"}
+
+
+def role_hidden_categories(role, ship=None):
+    """Hidden module categories for a role, adjusted for the hull.
+
+    Haulers with weapon hardpoints keep the matching weapon categories
+    visible (e.g. Tayra: 1 turret + 1 launcher hardpoint).
+    """
+    hidden = {st: set(cats) for st, cats in
+              ROLE_HIDDEN_CATEGORIES.get(role, {}).items()}
+    if ship and hidden.get("high"):
+        if ship.get("turret_hardpoints", 0) > 0:
+            hidden["high"] -= TURRET_WEAPON_CATEGORIES
+        if ship.get("launcher_hardpoints", 0) > 0:
+            hidden["high"] -= LAUNCHER_WEAPON_CATEGORIES
+    return hidden
 
 
 def _detect_ship_role(ship):
@@ -1519,7 +1550,7 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
 
     region_labels = [label for _, label in regions]
 
-    hidden_cats = ROLE_HIDDEN_CATEGORIES.get(role, {})
+    hidden_cats = role_hidden_categories(role, ship)
 
     for slot_type in ("high", "mid", "low", "rig"):
         cats = candidates.get(slot_type, [])
@@ -1833,6 +1864,14 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
         w("- **Show the tradeoff explicitly**: for each proposed fit, show effective "
           "cargo, EHP, align time, and cargo:EHP ratio side by side so the pilot can "
           "pick the right point on the curve.")
+        if ship.get("turret_hardpoints", 0) or ship.get("launcher_hardpoints", 0):
+            w(f"- **Utility high slots**: this hull has "
+              f"{ship.get('turret_hardpoints', 0)} turret / "
+              f"{ship.get('launcher_hardpoints', 0)} launcher hardpoint(s). "
+              "Token weapons add no real defence (a hauler never wins a fight) "
+              "but can shoot back for killmail presence. Usually better uses: "
+              "cloak (MWD+cloak trick), core probe launcher, or leave empty "
+              "to save CPU/PG for tank.")
 
     is_combat = role == "combat"
     if is_combat:
@@ -1901,7 +1940,7 @@ def generate_dossier_data(ship_name, goal="", region_key="verge",
 
     # Resolve role early so we can skip irrelevant categories during enumeration
     effective_role = _detect_ship_role(ship) if role == "auto" else role
-    role_hidden = ROLE_HIDDEN_CATEGORIES.get(effective_role, {})
+    role_hidden = role_hidden_categories(effective_role, ship)
 
     # Discover module groups
     module_groups, drone_groups = discover_module_groups(progress=False)
@@ -1939,11 +1978,9 @@ def generate_dossier_data(ship_name, goal="", region_key="verge",
             for c in cat.get("candidates", []):
                 c["dogma"] = _strkeys(c.get("dogma", {}))
 
-    # Build role hidden set for frontend filtering
-    role_hidden = {}
-    rh = ROLE_HIDDEN_CATEGORIES.get(effective_role, {})
-    for st, cats_set in rh.items():
-        role_hidden[st] = list(cats_set)
+    # Build role hidden set for frontend filtering (hardpoint-adjusted)
+    role_hidden = {st: sorted(cats) for st, cats in
+                   role_hidden_categories(effective_role, ship).items()}
 
     return {
         "ship": ship_out,
@@ -2224,7 +2261,7 @@ def main():
 
     # 6. Resolve role early to skip irrelevant categories
     effective_role = _detect_ship_role(ship) if args.role == "auto" else args.role
-    role_skip = ROLE_HIDDEN_CATEGORIES.get(effective_role, {})
+    role_skip = role_hidden_categories(effective_role, ship)
     print(f"Role: {effective_role}")
     print()
 
