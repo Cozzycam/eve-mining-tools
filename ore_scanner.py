@@ -2476,8 +2476,9 @@ function renderModTable(cat, slotType, catCols, regionLabels) {
       const dbs = c.drawbacks || [];
       t += '<td>' + (dbs.length ? dbs.join('; ') : '\u2014') + '</td>';
     }
-    t += '<td class="num">' + c.cpu.toFixed(0) + '</td>';
-    t += '<td class="num">' + c.pg.toFixed(0) + '</td>';
+    const oc = c.over_capacity || [];
+    t += '<td class="num">' + c.cpu.toFixed(0) + (oc.includes('CPU') ? ' <span title="Needs more CPU than the hull provides — Processor Overclocking rigs, compact variant, or implants">⚠</span>' : '') + '</td>';
+    t += '<td class="num">' + c.pg.toFixed(0) + (oc.includes('PG') ? ' <span title="Needs more powergrid than the hull provides — Ancillary Current Router rigs, compact variant, or implants">⚠</span>' : '') + '</td>';
     if (isRig) t += '<td class="num">' + (c.calibration||0).toFixed(0) + '</td>';
     t += '<td>' + (c.reqs_met ? '<span class="reqs-ok">\u2713</span>' : '<span class="reqs-fail">\u2717 ' + (c.missing_skills||[]).join(', ') + '</span>') + '</td>';
     regionLabels.forEach(l => {

@@ -449,6 +449,12 @@ HAULER_SHIP_CLASSES = {
     "Freighter", "Jump Freighter",
 }
 
+# Modules needing more CPU/PG than the hull has are kept (and flagged) if
+# within this factor — engineering rigs (+10/15% each), skills and implants
+# stretch the grid. 1.6 keeps a 50MN MWD I (150 PG) visible on a Tayra
+# (~96 PG): with PG Management V + Ancillary Current Routers it's reachable.
+FIT_HEADROOM = 1.6
+
 # Gank threshold constant: gank_threshold_ISK ≈ EHP_kin_therm × GANK_COST_PER_EHP
 # Calibrated to current Catalyst ganker economics (antimatter, ~4500 ISK damage per EHP
 # of gank cost including ship + fittings / CONCORD loss).  Tune as meta shifts.
@@ -1097,9 +1103,12 @@ def enumerate_slot_candidates(slot_type, module_groups, ship, skills, skill_ids,
         for tid, info in type_data.items():
             da = attrs_dict(info.get("dogma_attributes"))
 
-            # Skip officer (5) and deadspace (6) modules
+            # Skip officer (5), deadspace (6) and Abyssal (15) modules —
+            # Abyssal types are mutated-module placeholders with zeroed
+            # stats, not buyable items (they often lack metaGroupID in
+            # dogma, so also match by name)
             mg = da.get(A["metaGroupID"], 0)
-            if mg in (5, 6):
+            if mg in (5, 6, 15) or "Abyssal" in info.get("name", ""):
                 continue
 
             # Size filter: for categories sharing groups with other ship classes,
@@ -1109,10 +1118,13 @@ def enumerate_slot_candidates(slot_type, module_groups, ship, skills, skill_ids,
                 if not mod_name.startswith(hull_size):
                     continue
 
-            # Skip if single module exceeds ship's total CPU or PG
+            # Skip modules beyond the hull's fitting reach. Within
+            # FIT_HEADROOM they're kept and flagged (rigs/implants/compact
+            # variants can stretch the grid); beyond it they can't fit.
             cpu = da.get(A["cpu"], 0)
             pg = da.get(A["power"], 0)
-            if cpu > ship["cpu_adj"] or pg > ship["pg_adj"]:
+            if (cpu > ship["cpu_adj"] * FIT_HEADROOM
+                    or pg > ship["pg_adj"] * FIT_HEADROOM):
                 continue
 
             # For rigs, check calibration
@@ -1161,6 +1173,15 @@ def enumerate_slot_candidates(slot_type, module_groups, ship, skills, skill_ids,
                 "missing_skills": missing,
                 "prices": price_data.get(tid, {}),
             }
+
+            # Flag modules that need more CPU/PG than the hull provides
+            over = []
+            if entry["cpu"] > ship["cpu_adj"]:
+                over.append("CPU")
+            if entry["pg"] > ship["pg_adj"]:
+                over.append("PG")
+            if over:
+                entry["over_capacity"] = over
 
             # Slot-type-specific stats
             if slot_type == "rig":
@@ -1635,8 +1656,9 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
                 if has_drawback:
                     dbs = c.get("drawbacks", [])
                     row.append("; ".join(dbs) if dbs else "\u2014")
-                row.append(f"{c['cpu']:.0f}")
-                row.append(f"{c['pg']:.0f}")
+                over = c.get("over_capacity", [])
+                row.append(f"{c['cpu']:.0f}" + (" ⚠" if "CPU" in over else ""))
+                row.append(f"{c['pg']:.0f}" + (" ⚠" if "PG" in over else ""))
                 if has_cal:
                     row.append(f"{c.get('calibration', 0):.0f}")
                 if c["reqs_met"]:
@@ -1649,6 +1671,13 @@ def format_dossier(ship, candidates, drones, hull_prices, goal, region_key,
 
                 w("| " + " | ".join(row) + " |")
 
+            if any(c.get("over_capacity") for c in cat["candidates"]):
+                w("")
+                w("\u26a0 = needs more CPU/PG than this hull provides "
+                  f"({ship['cpu_adj']:.0f} CPU / {ship['pg_adj']:.0f} PG "
+                  "skill-adjusted). Fit via Ancillary Current Router rigs "
+                  "(+10% PG each), Processor Overclocking rigs (+10% CPU), "
+                  "a compact/restrained variant, or implants.")
             w("")
 
     w("---")
