@@ -2840,6 +2840,18 @@ function renderPi(data) {
   // Character info
   h += '<div class="fitter-char"><strong>' + data.char_info.name + '</strong> &mdash; CCU ' + data.pi_skills.ccu + ', IC ' + data.pi_skills.ic + ', Planetology ' + data.pi_skills.planetology + '</div>';
 
+  // Density model calibration status
+  const cal = data.calibration;
+  if (cal) {
+    let calStr;
+    if (cal.points) {
+      calStr = 'Rate model: calibrated from ' + cal.points + ' observed rate' + (cal.points > 1 ? 's' : '') + ' (&times;' + cal.scale.toFixed(2) + ' vs base table' + (cal.fit ? ', power fit at ' + Math.round(cal.fit.weight * 100) + '% weight' : '') + ')';
+    } else {
+      calStr = 'Rate model: static density bands &mdash; no observed rates yet; enter OBS values in the editor and every estimate calibrates from them';
+    }
+    h += '<div style="color:var(--dim);font-size:0.85em;margin:2px 0 6px 0;">' + calStr + '</div>';
+  }
+
   // System map SVG
   if (data.system_map_svg) {
     h += '<div style="margin:12px 0;text-align:center;">' + data.system_map_svg + '</div>';

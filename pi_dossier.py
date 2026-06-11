@@ -346,7 +346,7 @@ def load_planet_taxes():
 
 
 def _estimate_from_density(density_pct, heads=DEFAULT_ECU_HEADS):
-    """Estimate P0/hr from density % using the calibrated lookup table.
+    """Estimate P0/hr from density % using the static band table.
     Returns 0 for 0% density — resource cannot be extracted.
     """
     if density_pct <= 0:
@@ -357,7 +357,82 @@ def _estimate_from_density(density_pct, heads=DEFAULT_ECU_HEADS):
     return 2200 * heads
 
 
-def _build_instance_rates(inv, extraction_rates, density_data):
+# Auto-calibration of the density→yield model from observed rates.
+CALIBRATION_MIN_POINTS_FIT = 4    # power-law fit needs at least this many points
+CALIBRATION_FULL_WEIGHT_POINTS = 8  # fit reaches full weight here
+CALIBRATION_SCALE_CLAMP = (0.3, 3.0)  # sanity bounds on the table scale factor
+
+
+def build_density_estimator(extraction_rates, density_data,
+                            heads=DEFAULT_ECU_HEADS):
+    """Self-calibrating P0/hr estimator from density %.
+
+    Every observed rate whose planet also has a density scan is a
+    calibration point (density_pct, observed_rate). With 1-3 points the
+    static band table is scaled by the median observed/predicted ratio —
+    even a couple of observations firm up every estimate. From
+    CALIBRATION_MIN_POINTS_FIT points spanning a 2x density spread, a
+    log-log power fit (rate = a * density^b) blends in, reaching full
+    weight at CALIBRATION_FULL_WEIGHT_POINTS. OBS entries always override
+    estimates on their own planet regardless.
+
+    Returns (estimate_fn, info): estimate_fn(density_pct) -> P0/hr at
+    `heads` extractor heads; info = {points, scale, fit} for display.
+    """
+    points = []
+    for key, obs_map in extraction_rates.items():
+        dens_map = density_data.get(key, {})
+        for p0, rate in obs_map.items():
+            d = dens_map.get(p0)
+            if d and d > 0 and rate > 0:
+                points.append((d, rate))
+
+    info = {"points": len(points), "scale": 1.0, "fit": None}
+    if not points:
+        return (lambda d: _estimate_from_density(d, heads)), info
+
+    ratios = sorted(rate / max(1.0, _estimate_from_density(d, heads))
+                    for d, rate in points)
+    n = len(ratios)
+    scale = (ratios[n // 2] if n % 2
+             else (ratios[n // 2 - 1] + ratios[n // 2]) / 2)
+    scale = min(max(scale, CALIBRATION_SCALE_CLAMP[0]),
+                CALIBRATION_SCALE_CLAMP[1])
+    info["scale"] = scale
+
+    a = b = None
+    fit_weight = 0.0
+    densities = [d for d, _ in points]
+    if (len(points) >= CALIBRATION_MIN_POINTS_FIT
+            and max(densities) / min(densities) >= 2):
+        lx = [math.log(d) for d, _ in points]
+        ly = [math.log(rate) for _, rate in points]
+        mean_x = sum(lx) / len(lx)
+        mean_y = sum(ly) / len(ly)
+        sxx = sum((x - mean_x) ** 2 for x in lx)
+        if sxx > 0:
+            b = sum((x - mean_x) * (y - mean_y) for x, y in zip(lx, ly)) / sxx
+            b = min(max(b, 0.2), 1.5)  # yield grows monotonically, sub-quadratic
+            a = math.exp(mean_y - b * mean_x)
+            fit_weight = min(1.0,
+                             (len(points) - (CALIBRATION_MIN_POINTS_FIT - 1))
+                             / (CALIBRATION_FULL_WEIGHT_POINTS
+                                - (CALIBRATION_MIN_POINTS_FIT - 1)))
+            info["fit"] = {"a": a, "b": b, "weight": fit_weight}
+
+    def estimate(density_pct):
+        if density_pct <= 0:
+            return 0
+        scaled = _estimate_from_density(density_pct, heads) * scale
+        if a is not None and fit_weight > 0:
+            return fit_weight * (a * density_pct ** b) + (1 - fit_weight) * scaled
+        return scaled
+
+    return estimate, info
+
+
+def _build_instance_rates(inv, extraction_rates, density_data,
+                          estimator=None):
     """Per-instance P0 rate table for every planet in the active inventory.
 
     Returns {(system, ptype, instance): {p0_name: (rate, tag)}}.
@@ -366,7 +441,12 @@ def _build_instance_rates(inv, extraction_rates, density_data):
     (the resource cannot be extracted there). A system+ptype with no scan
     data at all gets a synthetic 'A' instance at the conservative default
     rate (DFL) — same semantics the old get_p0_rate() had.
+
+    estimator: optional density->rate function (e.g. from
+    build_density_estimator); defaults to the static band table.
     """
+    if estimator is None:
+        estimator = _estimate_from_density
     table = {}
     for system, planets in inv.items():
         for ptype, count in planets.items():
@@ -397,7 +477,7 @@ def _build_instance_rates(inv, extraction_rates, density_data):
                     if dens_map:
                         d = dens_map.get(p0)
                         if d is not None and d > 0:
-                            rates[p0] = (_estimate_from_density(d), "EST")
+                            rates[p0] = (estimator(d), "EST")
                             covered.add(p0)
                 table[(system, ptype, inst)] = rates
             if not density_scanned:
@@ -1069,9 +1149,13 @@ def _build_analysis_ctx(chains, pi_types, schematics, planet_inv,
     (combo-local selection) or with instances excluded (deconfliction).
     """
     inv = active_inventory(planet_inv)
-    instance_rates = _build_instance_rates(inv, extraction_rates, density_data)
+    estimator, calibration = build_density_estimator(extraction_rates,
+                                                     density_data)
+    instance_rates = _build_instance_rates(inv, extraction_rates,
+                                           density_data, estimator)
     p0_candidates, p0_by_system = _build_p0_candidates(instance_rates)
     return {
+        "calibration": calibration,
         "chains": chains,
         "pi_types": pi_types,
         "schematics": schematics,
@@ -3190,7 +3274,7 @@ def _render_layout_table(layout, cfg, lines):
 
 def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
                     projections, market_prices, pi_types,
-                    ignored_systems=None):
+                    ignored_systems=None, calibration=None):
     """Generate the full dossier markdown."""
     lines = []
     now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -3203,6 +3287,18 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
     lines.append(f"**Tax:** {cfg['tax_rate']*100:.0f}% (default)  |  "
                  f"**Hauler:** {_fmt_num(cfg['hauler_m3'])} m3  |  "
                  f"**Max haul:** {cfg['max_haul_minutes']:.0f} min/day")
+    if calibration:
+        if calibration.get("points"):
+            fit = calibration.get("fit")
+            fit_note = (f", power fit b={fit['b']:.2f} at {fit['weight']:.0%}"
+                        if fit else "")
+            lines.append(f"**Rate model:** calibrated from "
+                         f"{calibration['points']} observed rate(s) "
+                         f"(x{calibration['scale']:.2f} vs base table{fit_note})")
+        else:
+            lines.append("**Rate model:** static density bands -- no observed "
+                         "rates yet; enter OBS values in the editor to "
+                         "calibrate all estimates")
     if ignored_systems:
         lines.append("")
         lines.append(f"**Ignored systems** (no PI there, routes avoid them): "
@@ -3426,6 +3522,13 @@ def generate_pi_dossier_data(overrides=None):
     ctx = _build_analysis_ctx(chains, pi_types, schematics, calc_inv,
                               extraction_rates, density_data, cfg,
                               planet_taxes)
+    calibration = ctx["calibration"]
+    if calibration["points"]:
+        fit_note = (f", power fit at {calibration['fit']['weight']:.0%} weight"
+                    if calibration["fit"] else "")
+        print(f"  PI Dossier: density model calibrated from "
+              f"{calibration['points']} observed rate(s) "
+              f"(x{calibration['scale']:.2f} vs base table{fit_note})")
     ectx = _build_econ_ctx(market_prices, cfg, pi_types, matrix, home_id,
                            system_ids, planet_taxes)
     viable = find_viable_chains(chains, pi_types, schematics,
@@ -3464,7 +3567,8 @@ def generate_pi_dossier_data(overrides=None):
 
     markdown = render_markdown(layouts, ranked, cfg, char_info, pi_skills,
                                projections, market_prices, pi_types,
-                               ignored_systems=sorted(set(planet_inv) - set(calc_inv)))
+                               ignored_systems=sorted(set(planet_inv) - set(calc_inv)),
+                               calibration=calibration)
 
     # Build JSON response
     chains_json = []
@@ -3596,6 +3700,7 @@ def generate_pi_dossier_data(overrides=None):
         "planet_inventory": planet_inv,
         "extraction_rates": extraction_rates,
         "density_data": density_data,
+        "calibration": calibration,
         "chains": chains_json,
         "layouts": layouts_json,
         "system_map_svg": map_svg,
@@ -4054,6 +4159,45 @@ def self_test():
                                 t_ctx)
     check("Factory falls back to other systems",
           fac3 is not None and fac3[0] == "Sys2", f"got {fac3}")
+
+    # ── Density model auto-calibration ──
+    print("\nDensity model calibration:")
+    est0, info0 = build_density_estimator({}, {})
+    check("No observations -> static table",
+          info0["points"] == 0 and est0(30) == 19000, f"got {est0(30)}")
+    # Single point: obs 9000 at 22% density (static says 17000)
+    est1, info1 = build_density_estimator(
+        {"S.Gas.A": {"Aqueous Liquids": 9000}},
+        {"S.Gas.A": {"Aqueous Liquids": 22}})
+    check("Single point scales the table",
+          info1["points"] == 1 and abs(est1(22) - 9000) < 1
+          and info1["fit"] is None,
+          f"est(22)={est1(22):.0f}, info={info1}")
+    check("Scale applies across all densities",
+          abs(est1(30) - 19000 * info1["scale"]) < 1, f"got {est1(30):.0f}")
+    # Six points on a clean rate = 1000 * density line -> power fit b ~ 1
+    cal_ext = {}
+    cal_dens = {}
+    for i, d in enumerate([5, 10, 20, 30, 40, 50]):
+        key = f"S{i}.Gas.A"
+        cal_ext[key] = {"Base Metals": 1000 * d}
+        cal_dens[key] = {"Base Metals": d}
+    est6, info6 = build_density_estimator(cal_ext, cal_dens)
+    check("Power fit engages at 6 points",
+          info6["fit"] is not None and info6["fit"]["weight"] > 0,
+          f"got {info6}")
+    if info6["fit"]:
+        check("Power fit recovers linear trend",
+              abs(info6["fit"]["b"] - 1.0) < 0.05,
+              f"b={info6['fit']['b']:.3f}")
+        check("Calibrated estimate tracks observations",
+              20000 < est6(25) < 30000, f"est(25)={est6(25):.0f}")
+    check("Zero density still yields zero", est6(0) == 0 and est1(0) == 0)
+    # Obs without density scan contributes no calibration point
+    _est, info_nd = build_density_estimator(
+        {"S.Gas.A": {"Aqueous Liquids": 9000}}, {})
+    check("Obs without density scan is not a calibration point",
+          info_nd["points"] == 0, f"got {info_nd}")
 
     # ── Allocator helpers ──
     print("\nAllocator helpers:")

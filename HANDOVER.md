@@ -1,5 +1,28 @@
 # EVE Mining Tools — Handover Notes
 
+## PI Dossier (v3.1) — 2026-06-11 — Self-calibrating density model
+
+`build_density_estimator(extraction_rates, density_data)`: every observed
+rate whose planet also has a density scan becomes a calibration point
+(density %, observed P0/hr).
+
+- 1–3 points: static band table scaled by the median observed/predicted
+  ratio (clamped 0.3–3.0×) — a couple of observations firm up ALL estimates.
+- ≥4 points spanning a ≥2× density spread: log-log power fit
+  (rate = a·density^b, b clamped 0.2–1.5) blends with the scaled table,
+  linearly reaching full weight at 8 points.
+- OBS entries still override estimates on their own planet regardless;
+  DFL (unscanned) planets unaffected.
+- Surfaced in: console log, markdown header (**Rate model:** line), JSON
+  `calibration` field, web PI tab status line under character info.
+- Constants: CALIBRATION_MIN_POINTS_FIT=4, CALIBRATION_FULL_WEIGHT_POINTS=8,
+  CALIBRATION_SCALE_CLAMP=(0.3, 3.0).
+- Self-test: static fallback, single-point scaling, 6-point linear-trend
+  recovery (b≈1), zero-density, obs-without-density excluded.
+
+Caveat: observations bake in current Planetology skills + head count
+(model assumes 10 heads) — re-observe after training those skills.
+
 ## PI Dossier (v3.0) — 2026-06-11 — Combo-local allocator rework
 
 Planet selection moved inside the allocator. Previously each chain picked its
