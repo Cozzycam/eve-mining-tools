@@ -9,3 +9,5 @@ planet_extraction.ini
 planet_density.ini
 planet_taxes.ini
 pi_config.ini
+backups/
+pi_dossier_*.md

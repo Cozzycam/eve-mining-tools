@@ -2857,6 +2857,7 @@ function renderPi(data) {
       if (rt.daily_haul_minutes != null) {
         const trips = rt.trips_per_day || 1;
         haulStr = rt.daily_haul_minutes.toFixed(0) + ' min/day (' + trips + ' trip' + (trips > 1 ? 's' : '') + ')';
+        if (rt.isk_per_haul_min) haulStr += ' &bull; ' + fmtIsk(rt.isk_per_haul_min) + '/haul-min';
       }
       h += '<p><strong>' + fmtIsk(layout.total_net) + '/hr net</strong> &mdash; <span style="color:var(--dim)">' + layout.strategy + '</span>';
       if (haulStr) h += ' &nbsp;|&nbsp; Haul: ' + haulStr;

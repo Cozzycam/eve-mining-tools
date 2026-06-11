@@ -357,64 +357,78 @@ def _estimate_from_density(density_pct, heads=DEFAULT_ECU_HEADS):
     return 2200 * heads
 
 
-def get_p0_rate(system, ptype, p0_name, extraction_rates, density_data,
-                heads=DEFAULT_ECU_HEADS):
-    """Get best P0 extraction rate across all planet instances, with source tag.
+def _build_instance_rates(inv, extraction_rates, density_data):
+    """Per-instance P0 rate table for every planet in the active inventory.
 
-    Searches all instances (A, B, C...) for system+ptype and returns the
-    best rate found. Priority: observed (OBS) > density estimate (EST) > default (DFL).
-    Returns: (rate_p0_per_hr, source_tag, instance)
+    Returns {(system, ptype, instance): {p0_name: (rate, tag)}}.
+    Priority per instance: observed (OBS) > density estimate (EST).
+    A density-scanned planet that lacks a resource gets no entry for it
+    (the resource cannot be extracted there). A system+ptype with no scan
+    data at all gets a synthetic 'A' instance at the conservative default
+    rate (DFL) — same semantics the old get_p0_rate() had.
     """
-    best_rate = 0
-    best_tag = "DFL"
-    best_instance = "A"
+    table = {}
+    for system, planets in inv.items():
+        for ptype, count in planets.items():
+            if count <= 0 or ptype not in PLANET_P0_MAP:
+                continue
+            prefix = f"{system}.{ptype}."
+            keys = [k for k in extraction_rates if k.startswith(prefix)]
+            keys += [k for k in density_data
+                     if k.startswith(prefix) and k not in keys]
+            if not keys:
+                table[(system, ptype, "A")] = {
+                    p0: (DEFAULT_EXTRACTION_RATE, "DFL")
+                    for p0 in PLANET_P0_MAP[ptype]}
+                continue
+            density_scanned = any(density_data.get(k) for k in keys)
+            covered = set()
+            for key in keys:
+                inst = key.split(".")[-1]
+                obs_map = extraction_rates.get(key, {})
+                dens_map = density_data.get(key, {})
+                rates = {}
+                for p0 in PLANET_P0_MAP[ptype]:
+                    obs = obs_map.get(p0)
+                    if obs is not None and obs > 0:
+                        rates[p0] = (obs, "OBS")
+                        covered.add(p0)
+                        continue
+                    if dens_map:
+                        d = dens_map.get(p0)
+                        if d is not None and d > 0:
+                            rates[p0] = (_estimate_from_density(d), "EST")
+                            covered.add(p0)
+                table[(system, ptype, inst)] = rates
+            if not density_scanned:
+                # Only observed data, no density scan: resources without an
+                # observation are unknown, not absent — default them.
+                first = table[(system, ptype, keys[0].split(".")[-1])]
+                for p0 in PLANET_P0_MAP[ptype]:
+                    if p0 not in covered:
+                        first.setdefault(p0, (DEFAULT_EXTRACTION_RATE, "DFL"))
+    return table
 
-    # Find all instances for this system.ptype
-    prefix = f"{system}.{ptype}."
-    instance_keys = [k for k in extraction_rates if k.startswith(prefix)]
-    instance_keys += [k for k in density_data if k.startswith(prefix) and k not in instance_keys]
 
-    # If no specific instance data, check legacy key without instance
-    if not instance_keys:
-        instance_keys = [f"{system}.{ptype}.A"]
+def _build_p0_candidates(instance_rates):
+    """Ranked extraction candidates per P0 resource.
 
-    has_any_scan_data = False
-
-    for key in instance_keys:
-        instance = key.split(".")[-1]
-
-        # Check observed
-        obs = extraction_rates.get(key, {}).get(p0_name)
-        if obs is not None and obs > 0:
-            if obs > best_rate:
-                best_rate = obs
-                best_tag = "OBS"
-                best_instance = instance
-            has_any_scan_data = True
-            continue
-
-        # Check density estimate
-        dens_for_planet = density_data.get(key, {})
-        if dens_for_planet:
-            # This planet has been scanned
-            has_any_scan_data = True
-            density = dens_for_planet.get(p0_name)
-            if density is not None and density > 0:
-                est = _estimate_from_density(density, heads)
-                if est > best_rate:
-                    best_rate = est
-                    best_tag = "EST"
-                    best_instance = instance
-            # else: resource is 0% or absent on a scanned planet → yields 0
-
-    if best_rate == 0:
-        if has_any_scan_data:
-            # Scanned planet(s) exist but this resource isn't available → 0
-            return 0, "EST:0%", "?"
-        # No data at all — use conservative default
-        return DEFAULT_EXTRACTION_RATE, "DFL", "?"
-
-    return best_rate, best_tag, best_instance
+    Returns ({p0: [(rate, tag, system, ptype, instance), ...] desc},
+             {p0: {system: [same tuples, desc]}}).
+    """
+    cands = {}
+    for (system, ptype, inst), rates in instance_rates.items():
+        for p0, (rate, tag) in rates.items():
+            if rate > 0:
+                cands.setdefault(p0, []).append((rate, tag, system, ptype, inst))
+    by_system = {}
+    for p0, lst in cands.items():
+        lst.sort(key=lambda c: (-c[0], c[2], c[4]))
+        sysmap = {}
+        for c in lst:
+            sysmap.setdefault(c[2], []).append(c)
+        by_system[p0] = sysmap
+    return cands, by_system
 
 
 # ── EVE Ref data fetching ─────────────────────────────────────
@@ -1027,131 +1041,233 @@ def compute_factory_layout(chain, pg_budget, cpu_budget):
 
 # ── Chain analysis ────────────────────────────────────────────
 
-def find_viable_chains(chains, pi_types, schematics, planet_inv,
-                       extraction_rates, density_data, cfg):
-    """For each producible chain, compute layout options and economics.
+def _build_p0_to_p1(pi_types, schematics):
+    """Map P0 name -> its P1 product {name, volume, type_id}."""
+    p0_to_p1 = {}
+    for _sid, sch in schematics.items():
+        s_inputs = sch.get("inputs", [])
+        s_output = sch.get("output", {})
+        if len(s_inputs) != 1:
+            continue
+        inp_t = pi_types.get(s_inputs[0]["type_id"])
+        out_t = pi_types.get(s_output.get("type_id"))
+        if (inp_t and out_t and inp_t.get("tier") == "P0"
+                and out_t.get("tier") == "P1"):
+            p0_to_p1[inp_t["name"]] = {
+                "name": out_t["name"], "volume": out_t["volume"],
+                "type_id": s_output["type_id"]}
+    return p0_to_p1
 
-    extraction_rates: {(system, ptype): {p0_name: rate}} — observed
-    density_data: {(system, ptype): {p0_name: density_pct}} — scanned
-    Returns list of analysed chain dicts, sorted by viability (not yet ranked by ISK).
+
+def _build_analysis_ctx(chains, pi_types, schematics, planet_inv,
+                        extraction_rates, density_data, cfg,
+                        planet_taxes=None):
+    """Shared context for chain analysis.
+
+    Precomputes per-instance rate tables and ranked candidate lists so a
+    chain's planets can be re-resolved cheaply for any subset of systems
+    (combo-local selection) or with instances excluded (deconfliction).
     """
-    pg_budget = cfg["pg_budget"]
-    cpu_budget = cfg["cpu_budget"]
-
-    # Flatten inventory: {planet_type: [(system, count), ...]}
-    flat_inv = {}
-    for system, planets in planet_inv.items():
-        for ptype, count in planets.items():
-            flat_inv.setdefault(ptype, []).append((system, count))
-
-    # Total count per planet type
-    total_by_type = {}
-    for ptype, entries in flat_inv.items():
-        total_by_type[ptype] = sum(c for _, c in entries)
-
-    rate_ctx = {
-        "extraction_rates": extraction_rates,
-        "density_data": density_data,
+    inv = active_inventory(planet_inv)
+    instance_rates = _build_instance_rates(inv, extraction_rates, density_data)
+    p0_candidates, p0_by_system = _build_p0_candidates(instance_rates)
+    return {
+        "chains": chains,
+        "pi_types": pi_types,
+        "schematics": schematics,
+        "inv": inv,
+        "instance_rates": instance_rates,
+        "p0_candidates": p0_candidates,
+        "p0_by_system": p0_by_system,
+        "planet_taxes": planet_taxes or {},
+        "cfg": cfg,
+        "pg_budget": cfg["pg_budget"],
+        "cpu_budget": cfg["cpu_budget"],
+        "p0_to_p1": _build_p0_to_p1(pi_types, schematics),
+        "sc_cache": {},   # tid -> self-contained candidate list
+        "vc_memo": {},    # (tid, selection) -> built vc dict
     }
 
-    results = []
 
-    for tid, chain in chains.items():
-        tier = chain["tier"]
+def _best_candidate(p0_name, ctx, combo_set=None, exclude=frozenset()):
+    """Best (rate, tag, system, ptype, instance) for extracting a P0.
 
-        if tier == "P1":
-            result = _analyse_p1_chain(chain, pi_types, flat_inv, total_by_type,
-                                       rate_ctx, pg_budget, cpu_budget)
-        elif tier == "P2":
-            result = _analyse_p2_chain(chain, pi_types, schematics, flat_inv,
-                                       total_by_type, rate_ctx,
-                                       pg_budget, cpu_budget)
-        elif tier == "P3":
-            result = _analyse_p3_chain(chain, pi_types, schematics, flat_inv,
-                                       total_by_type, rate_ctx,
-                                       pg_budget, cpu_budget)
-        elif tier == "P4":
-            result = _analyse_p4_chain(chain, pi_types, schematics, flat_inv,
-                                       total_by_type, rate_ctx,
-                                       pg_budget, cpu_budget,
-                                       cfg["max_planets"])
-        else:
-            continue
-
-        if result:
-            results.append(result)
-
-    return results
-
-
-def _get_p0_rate_for_planet(system, ptype, p0_name, rate_ctx):
-    """Get P0 rate for a specific resource on a specific planet type in a system.
-    Returns: (rate, tag, instance)
+    combo_set restricts to those systems; exclude skips claimed instances.
     """
-    return get_p0_rate(system, ptype, p0_name,
-                       rate_ctx["extraction_rates"],
-                       rate_ctx["density_data"])
-
-
-def _best_system_for_p0(p0_name, compatible_ptypes, flat_inv, rate_ctx):
-    """Find best system+planet type+instance for extracting a specific P0.
-
-    Returns: (system, ptype, instance, rate, source_tag) or (None, None, "", 0, "")
-    """
-    best_sys = None
-    best_ptype = None
-    best_instance = ""
-    best_rate = 0
-    best_tag = ""
-    for ptype in compatible_ptypes:
-        entries = flat_inv.get(ptype, [])
-        for system, count in entries:
-            if count <= 0:
-                continue
-            rate, tag, instance = _get_p0_rate_for_planet(
-                system, ptype, p0_name, rate_ctx)
-            if rate > best_rate:
-                best_rate = rate
-                best_sys = system
-                best_ptype = ptype
-                best_instance = instance
-                best_tag = tag
-    return best_sys, best_ptype, best_instance, best_rate, best_tag
-
-
-def _analyse_p1_chain(chain, pi_types, flat_inv, total_by_type,
-                      rate_ctx, pg_budget, cpu_budget):
-    """Analyse a P1 chain (single extraction planet)."""
-    if not chain["p0_inputs"]:
+    if combo_set is None:
+        for cand in ctx["p0_candidates"].get(p0_name, []):
+            if (cand[2], cand[3], cand[4]) not in exclude:
+                return cand
         return None
+    by_sys = ctx["p0_by_system"].get(p0_name, {})
+    best = None
+    for system in combo_set:
+        for cand in by_sys.get(system, []):
+            if (cand[2], cand[3], cand[4]) in exclude:
+                continue
+            if best is None or cand[0] > best[0]:
+                best = cand
+            break  # per-system lists are sorted desc
+    return best
 
+
+def _sc_candidates_for_chain(chain, ctx):
+    """Self-contained P2 candidates — both P0s extracted on ONE physical
+    planet instance, using that instance's own rates. Best-first, cached.
+    """
+    tid = chain["output_type_id"]
+    cached = ctx["sc_cache"].get(tid)
+    if cached is not None:
+        return cached
+    p0_names = [p["name"] for p in chain["p0_inputs"]]
+    ptype_sets = [P0_PLANET_MAP.get(n, set()) for n in p0_names]
+    common = set.intersection(*ptype_sets) if ptype_sets else set()
+    cands = []
+    for (system, ptype, inst), rates in ctx["instance_rates"].items():
+        if ptype not in common:
+            continue
+        pair = [rates.get(n) for n in p0_names]
+        if any(r is None or r[0] <= 0 for r in pair):
+            continue
+        layout = compute_p2_selfcontained_layout(
+            chain, [r[0] for r in pair], ctx["pg_budget"], ctx["cpu_budget"])
+        if not layout:
+            continue
+        cands.append({"units_hr": layout["units_hr"], "system": system,
+                      "ptype": ptype, "instance": inst})
+    cands.sort(key=lambda c: (-c["units_hr"], c["system"], c["instance"]))
+    ctx["sc_cache"][tid] = cands
+    return cands
+
+
+def _pick_factory_planet(primary_systems, fallback_systems, exclude, ctx):
+    """Pick the cheapest-tax spare planet to host a factory.
+
+    Factories have no extraction needs, so POCO tax is the economic
+    criterion. Planets in primary_systems (the chain's extraction systems)
+    are preferred — a co-located factory adds no route cost; fallback
+    systems are only considered when no primary spare exists.
+    Returns (system, ptype, instance, tax_rate) or None.
+    """
+    taxes = ctx["planet_taxes"]
+    default_rate = ctx["cfg"]["tax_rate"]
+
+    def _best_in(systems):
+        best = None
+        for system in systems:
+            for ptype, count in ctx["inv"].get(system, {}).items():
+                for i in range(count):
+                    inst = chr(ord("A") + i)
+                    if (system, ptype, inst) in exclude:
+                        continue
+                    rate = taxes.get(f"{system}.{ptype}.{inst}", default_rate)
+                    if best is None or rate < best[3]:
+                        best = (system, ptype, inst, rate)
+        return best
+
+    primary = list(dict.fromkeys(primary_systems))
+    pick = _best_in(primary)
+    if pick:
+        return pick
+    return _best_in([s for s in fallback_systems if s not in set(primary)])
+
+
+def _resolve_chain_selection(chain, ctx, combo_set=None, exclude=frozenset()):
+    """Resolve which planet instances a chain would use.
+
+    combo_set restricts selection to those systems (None = all systems).
+    exclude is a set of (system, ptype, instance) already claimed — used
+    both within a chain (two P0s never share one planet) and across
+    chains (deconfliction).
+    Returns (selection, fail_flags); selection is None when the chain
+    cannot be placed, with fail_flags explaining why (for global tables).
+    """
+    tier = chain["tier"]
+
+    if tier == "P1":
+        if not chain["p0_inputs"]:
+            return None, []
+        p0 = chain["p0_inputs"][0]["name"]
+        cand = _best_candidate(p0, ctx, combo_set, exclude)
+        if not cand:
+            return None, [f"NO {', '.join(sorted(P0_PLANET_MAP.get(p0, set())))}"]
+        return ("p1", cand), []
+
+    if tier == "P2":
+        if len(chain["p0_inputs"]) < 2:
+            return None, []
+        # Self-contained preferred (1 planet vs 3)
+        for c in _sc_candidates_for_chain(chain, ctx):
+            if combo_set is not None and c["system"] not in combo_set:
+                continue
+            if (c["system"], c["ptype"], c["instance"]) in exclude:
+                continue
+            return ("p2sc", (c["system"], c["ptype"], c["instance"])), []
+        # Factory setup: one extractor per P0 + factory planet
+        p0_names = [p["name"] for p in chain["p0_inputs"]]
+        exts = []
+        used = set(exclude)
+        for name in p0_names:
+            cand = _best_candidate(name, ctx, combo_set, used)
+            if not cand:
+                return None, [f"NO {', '.join(sorted(P0_PLANET_MAP.get(name, set())))}"]
+            exts.append((name, cand))
+            used.add((cand[2], cand[3], cand[4]))
+        fac = _pick_factory_planet(
+            [c[1][2] for c in exts],
+            sorted(combo_set) if combo_set is not None else sorted(ctx["inv"]),
+            used, ctx)
+        if not fac:
+            return None, ["NO SPARE PLANET (factory)"]
+        return ("p2f", tuple(exts), fac), []
+
+    if tier == "P3":
+        p0_names = list(chain["all_p0_names"])
+        exts = []
+        missing = []
+        used = set(exclude)
+        for name in p0_names:
+            cand = _best_candidate(name, ctx, combo_set, used)
+            if not cand:
+                missing.append(name)
+                continue
+            exts.append((name, cand))
+            used.add((cand[2], cand[3], cand[4]))
+        if combo_set is not None and (missing or not exts):
+            return None, []  # incomplete chains don't enter layouts
+        fac = _pick_factory_planet(
+            [c[1][2] for c in exts],
+            sorted(combo_set) if combo_set is not None else sorted(ctx["inv"]),
+            used, ctx)
+        return ("p3", tuple(exts), fac, tuple(missing)), []
+
+    return None, []
+
+
+def _factory_planet_entry(fac, chain, factory_layout):
+    system, ptype, inst, _tax = fac
+    return {"system": system, "type": f"{ptype} {inst}",
+            "role": f"Factory -> {chain['output_name']}",
+            "layout": factory_layout, "is_factory": True}
+
+
+def _not_viable(chain, flags):
+    return {"chain": chain, "viable": False, "flags": flags,
+            "planets_used": [], "units_hr": 0, "volume_hr": 0}
+
+
+def _build_p1_vc(chain, sel, ctx):
+    rate, tag, system, ptype, inst = sel[1]
     p0_name = chain["p0_inputs"][0]["name"]
-    compatible_ptypes = P0_PLANET_MAP.get(p0_name, set())
-
-    best_sys, best_ptype, best_inst, best_rate, tag = _best_system_for_p0(
-        p0_name, compatible_ptypes, flat_inv, rate_ctx)
-
-    if not best_sys:
-        return {
-            "chain": chain, "viable": False,
-            "flags": [f"NO {', '.join(compatible_ptypes)}"],
-            "planets_used": [], "units_hr": 0, "volume_hr": 0,
-        }
-
-    layout = compute_p1_layout(chain, best_rate, pg_budget, cpu_budget)
+    layout = compute_p1_layout(chain, rate, ctx["pg_budget"], ctx["cpu_budget"])
     if not layout:
-        return {
-            "chain": chain, "viable": False, "flags": ["POWER LIMIT"],
-            "planets_used": [], "units_hr": 0, "volume_hr": 0,
-        }
-
-    inst_label = best_inst if best_inst and best_inst != "?" else "A"
-    rate_detail = f"{p0_name}: {best_rate:.0f}/hr [{tag}]"
+        return _not_viable(chain, ["POWER LIMIT"])
     return {
         "chain": chain, "viable": True, "layout_type": "p1_extractor",
-        "planets_used": [{"system": best_sys, "type": f"{best_ptype} {inst_label}",
+        "planets_used": [{"system": system, "type": f"{ptype} {inst}",
                           "role": f"Extract {p0_name} -> {chain['output_name']}",
-                          "layout": layout, "rate_detail": rate_detail}],
+                          "layout": layout,
+                          "rate_detail": f"{p0_name}: {rate:.0f}/hr [{tag}]"}],
         "planet_count": 1,
         "units_hr": layout["units_hr"],
         "volume_hr": layout["volume_hr"],
@@ -1160,119 +1276,70 @@ def _analyse_p1_chain(chain, pi_types, flat_inv, total_by_type,
     }
 
 
-def _analyse_p2_chain(chain, pi_types, schematics, flat_inv, total_by_type,
-                      rate_ctx, pg_budget, cpu_budget):
-    """Analyse a P2 chain. Try self-contained first, then factory+extractors."""
-    if len(chain["p0_inputs"]) < 2:
-        return None
-
+def _build_p2sc_vc(chain, sel, ctx):
+    system, ptype, inst = sel[1]
     p0_names = [p["name"] for p in chain["p0_inputs"]]
-    p0_ptypes = [P0_PLANET_MAP.get(n, set()) for n in p0_names]
+    inst_rates = ctx["instance_rates"].get((system, ptype, inst), {})
+    pair = [inst_rates.get(n, (0, "?")) for n in p0_names]
+    rates = [p[0] for p in pair]
+    tags = [p[1] for p in pair]
+    layout = compute_p2_selfcontained_layout(chain, rates, ctx["pg_budget"],
+                                             ctx["cpu_budget"])
+    if not layout:
+        return _not_viable(chain, ["POWER LIMIT"])
+    rate_details = []
+    bottleneck_idx = rates.index(min(rates))
+    for i, (p0_name, rate, tag) in enumerate(zip(p0_names, rates, tags)):
+        bif_input = 6000
+        headroom = (rate - bif_input) / bif_input * 100 if rate > 0 else 0
+        marker = " <- BOTTLENECK" if i == bottleneck_idx and len(p0_names) > 1 else ""
+        rate_details.append(f"{p0_name}: {rate:.0f}/hr [{tag}] "
+                            f"({headroom:+.0f}% headroom){marker}")
+    return {
+        "chain": chain, "viable": True, "layout_type": "p2_selfcontained",
+        "planets_used": [{"system": system, "type": f"{ptype} {inst}",
+                          "role": f"Extract+Process -> {chain['output_name']}",
+                          "layout": layout, "rate_details": rate_details}],
+        "planet_count": 1,
+        "units_hr": layout["units_hr"],
+        "volume_hr": layout["volume_hr"],
+        "rate_sources": tags,
+        "flags": [],
+    }
 
-    # Try self-contained: find a planet type that has BOTH P0s
-    common_ptypes = set.intersection(*p0_ptypes) if p0_ptypes else set()
-    best_selfcontained = None
 
-    for ptype in common_ptypes:
-        entries = flat_inv.get(ptype, [])
-        for system, count in entries:
-            if count <= 0:
-                continue
-            # Get per-resource rates for both P0s on this planet
-            rates = []
-            tags = []
-            instances = []
-            for p0_name in p0_names:
-                rate, tag, inst = _get_p0_rate_for_planet(system, ptype, p0_name, rate_ctx)
-                rates.append(rate)
-                tags.append(tag)
-                instances.append(inst)
+def _build_p2f_vc(chain, sel, ctx):
+    exts, fac = sel[1], sel[2]
+    pi_types = ctx["pi_types"]
+    pg_budget, cpu_budget = ctx["pg_budget"], ctx["cpu_budget"]
 
-            layout = compute_p2_selfcontained_layout(
-                chain, rates, pg_budget, cpu_budget)
-            if layout:
-                if not best_selfcontained or layout["units_hr"] > best_selfcontained["layout"]["units_hr"]:
-                    # Use the first instance that had data (both P0s on same planet)
-                    best_inst = instances[0] if instances[0] != "?" else (instances[1] if len(instances) > 1 else "A")
-                    best_selfcontained = {
-                        "system": system, "type": ptype, "instance": best_inst,
-                        "layout": layout, "rates": rates, "tags": tags,
-                    }
-
-    if best_selfcontained:
-        layout = best_selfcontained["layout"]
-        rate_details = []
-        bottleneck_idx = best_selfcontained["rates"].index(min(best_selfcontained["rates"]))
-        for i, (p0_name, rate, tag) in enumerate(
-                zip(p0_names, best_selfcontained["rates"], best_selfcontained["tags"])):
-            bif_input = 6000
-            headroom = (rate - bif_input) / bif_input * 100 if rate > 0 else 0
-            marker = " <- BOTTLENECK" if i == bottleneck_idx and len(p0_names) > 1 else ""
-            rate_details.append(f"{p0_name}: {rate:.0f}/hr [{tag}] "
-                                f"({headroom:+.0f}% headroom){marker}")
-
-        sc_inst = best_selfcontained.get("instance", "A")
-        if not sc_inst or sc_inst == "?":
-            sc_inst = "A"
-        sc_label = f"{best_selfcontained['type']} {sc_inst}"
-        return {
-            "chain": chain, "viable": True, "layout_type": "p2_selfcontained",
-            "planets_used": [{
-                "system": best_selfcontained["system"],
-                "type": sc_label,
-                "role": f"Extract+Process -> {chain['output_name']}",
-                "layout": layout,
-                "rate_details": rate_details,
-            }],
-            "planet_count": 1,
-            "units_hr": layout["units_hr"],
-            "volume_hr": layout["volume_hr"],
-            "rate_sources": best_selfcontained["tags"],
-            "flags": [],
-        }
-
-    # Try factory setup: separate extraction planets + factory planet
     extraction_planets = []
     all_tags = []
-    for i, p0_name in enumerate(p0_names):
-        best_sys, best_ptype, best_inst, best_rate, tag = _best_system_for_p0(
-            p0_name, p0_ptypes[i], flat_inv, rate_ctx)
-        if not best_sys:
-            return {
-                "chain": chain, "viable": False,
-                "flags": [f"NO {', '.join(p0_ptypes[i])}"],
-                "planets_used": [], "units_hr": 0, "volume_hr": 0,
-            }
-
+    for i, (p0_name, cand) in enumerate(exts):
+        rate, tag, system, ptype, inst = cand
         p1_input = chain["inputs"][i]
         p1_type = pi_types.get(p1_input["type_id"])
         if not p1_type:
             continue
-
         p1_chain = {"volume": p1_type["volume"], "tier": "P1"}
-        p1_layout = compute_p1_layout(p1_chain, best_rate, pg_budget, cpu_budget)
+        p1_layout = compute_p1_layout(p1_chain, rate, pg_budget, cpu_budget)
         if not p1_layout:
-            return {
-                "chain": chain, "viable": False, "flags": ["POWER LIMIT"],
-                "planets_used": [], "units_hr": 0, "volume_hr": 0,
-            }
-
-        inst_label = best_inst if best_inst and best_inst != "?" else "A"
+            return _not_viable(chain, ["POWER LIMIT"])
         extraction_planets.append({
-            "system": best_sys, "type": f"{best_ptype} {inst_label}",
+            "system": system, "type": f"{ptype} {inst}",
             "role": f"Extract {p0_name} -> {p1_type['name']}",
             "layout": p1_layout,
             "p1_output_hr": p1_layout["units_hr"],
-            "rate_detail": f"{p0_name}: {best_rate:.0f}/hr [{tag}]",
+            "rate_detail": f"{p0_name}: {rate:.0f}/hr [{tag}]",
         })
         all_tags.append(tag)
 
+    if not extraction_planets:
+        return _not_viable(chain, ["NO P1 SUPPLY"])
+
     factory_layout = compute_factory_layout(chain, pg_budget, cpu_budget)
     if not factory_layout:
-        return {
-            "chain": chain, "viable": False, "flags": ["POWER LIMIT"],
-            "planets_used": [], "units_hr": 0, "volume_hr": 0,
-        }
+        return _not_viable(chain, ["POWER LIMIT"])
 
     aif_p1_need = 40
     min_p1_supply = min(ep["p1_output_hr"] for ep in extraction_planets)
@@ -1283,12 +1350,7 @@ def _analyse_p2_chain(chain, pi_types, schematics, flat_inv, total_by_type,
     volume_hr = units_hr * chain["volume"]
 
     planets = list(extraction_planets)
-    planets.append({
-        "system": extraction_planets[0]["system"],
-        "type": "Any",
-        "role": f"Factory -> {chain['output_name']}",
-        "layout": factory_layout,
-    })
+    planets.append(_factory_planet_entry(fac, chain, factory_layout))
 
     return {
         "chain": chain, "viable": True, "layout_type": "p2_factory",
@@ -1298,60 +1360,45 @@ def _analyse_p2_chain(chain, pi_types, schematics, flat_inv, total_by_type,
     }
 
 
-def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
-                      rate_ctx, pg_budget, cpu_budget):
-    """Analyse a P3 chain. These need multiple planets."""
-    # P3 needs 2-3 P2 inputs, each of which needs its own P1+P0 chain
+def _build_p3_vc(chain, sel, ctx):
+    """Build a P3 chain vc from its selection (extractors + factory)."""
+    exts, fac, missing = sel[1], sel[2], sel[3]
+    pi_types = ctx["pi_types"]
+    schematics = ctx["schematics"]
+    pg_budget, cpu_budget = ctx["pg_budget"], ctx["cpu_budget"]
     p0_names = list(chain["all_p0_names"])
+    p0_to_p1 = ctx["p0_to_p1"]
 
     flags = []
+    for p0_name in missing:
+        compatible_ptypes = P0_PLANET_MAP.get(p0_name, set())
+        flags.append(f"NO {', '.join(sorted(compatible_ptypes))} (for {p0_name})")
 
-    # Build P0 -> P1 lookup from schematics (including type_id for supply mapping)
-    p0_to_p1 = {}
-    for _sid, _sch in schematics.items():
-        _s_inputs = _sch.get("inputs", [])
-        _s_output = _sch.get("output", {})
-        if len(_s_inputs) == 1:
-            _inp_t = pi_types.get(_s_inputs[0]["type_id"])
-            _out_t = pi_types.get(_s_output["type_id"])
-            if (_inp_t and _out_t
-                    and _inp_t.get("tier") == "P0"
-                    and _out_t.get("tier") == "P1"):
-                p0_to_p1[_inp_t["name"]] = {
-                    "name": _out_t["name"], "volume": _out_t["volume"],
-                    "type_id": _s_output["type_id"]}
-
-    # Find best extraction planet for each unique P0
     extraction_planets = []
     all_tags = []
-    for p0_name in p0_names:
-        compatible_ptypes = P0_PLANET_MAP.get(p0_name, set())
-        best_sys, best_ptype, best_inst, best_rate, tag = _best_system_for_p0(
-            p0_name, compatible_ptypes, flat_inv, rate_ctx)
-        if not best_sys:
-            flags.append(f"NO {', '.join(compatible_ptypes)} (for {p0_name})")
-            continue
-
-        # Compute real P1 layout for this extraction planet
+    for p0_name, cand in exts:
+        rate, tag, system, ptype, inst = cand
         p1_info = p0_to_p1.get(p0_name, {"name": "P1", "volume": 0.38,
                                           "type_id": 0})
         p1_chain = {"volume": p1_info["volume"], "tier": "P1"}
-        p1_layout = compute_p1_layout(p1_chain, best_rate, pg_budget, cpu_budget)
+        p1_layout = compute_p1_layout(p1_chain, rate, pg_budget, cpu_budget)
         if not p1_layout:
             flags.append(f"POWER LIMIT (for {p0_name})")
             continue
-
-        inst_label = best_inst if best_inst and best_inst != "?" else "A"
         extraction_planets.append({
-            "system": best_sys, "type": f"{best_ptype} {inst_label}",
+            "system": system, "type": f"{ptype} {inst}",
             "role": f"Extract {p0_name} -> {p1_info['name']}",
             "layout": p1_layout,
             "p1_output_hr": p1_layout["units_hr"],
             "p1_name": p1_info["name"],
             "p1_type_id": p1_info["type_id"],
-            "rate_detail": f"{p0_name}: {best_rate:.0f}/hr [{tag}]",
+            "rate_detail": f"{p0_name}: {rate:.0f}/hr [{tag}]",
         })
         all_tags.append(tag)
+
+    if fac is None:
+        flags.append("NO SPARE PLANET (factory)")
+        return _not_viable(chain, flags)
 
     total_needed = len(extraction_planets) + 1  # extractors + 1 combined factory
 
@@ -1485,13 +1532,7 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
 
     # Build planets_used: extraction planets + factory planet
     planets = list(extraction_planets)
-    factory_system = extraction_planets[0]["system"] if extraction_planets else ""
-    planets.append({
-        "system": factory_system,
-        "type": "Any",
-        "role": f"Factory -> {chain['output_name']}",
-        "layout": factory_layout,
-    })
+    planets.append(_factory_planet_entry(fac, chain, factory_layout))
 
     viable = ("EXCEEDS 5 PLANETS" not in flags
               and not any("NO " in f for f in flags)
@@ -1508,6 +1549,131 @@ def _analyse_p3_chain(chain, pi_types, schematics, flat_inv, total_by_type,
         "rate_sources": all_tags,
         "flags": flags,
     }
+
+
+_VC_BUILDERS = {
+    "p1": _build_p1_vc,
+    "p2sc": _build_p2sc_vc,
+    "p2f": _build_p2f_vc,
+    "p3": _build_p3_vc,
+}
+
+
+def _attach_alloc_fields(vc):
+    """Planet-type demand counts for the allocation knapsack.
+
+    Factory planets count as 'Any' — any spare planet can host a factory,
+    so allocation stays flexible even though a concrete cheap-tax planet
+    is already pencilled in for the tax estimate.
+    """
+    types_needed = {}
+    pc = 0
+    for p in vc.get("planets_used", []):
+        if p.get("is_factory"):
+            base = "Any"
+        else:
+            t = p.get("type", "")
+            parts = t.rsplit(" ", 1)
+            if len(parts) == 2 and len(parts[1]) <= 2:
+                base = parts[0]
+            else:
+                base = t or "Any"
+        types_needed[base] = types_needed.get(base, 0) + 1
+        pc += 1
+    if pc == 0:
+        pc = vc.get("planet_count", 1) or 1
+        types_needed = {"Any": pc}
+    vc["_alloc_types"] = types_needed
+    vc["_alloc_pc"] = pc
+
+
+def _types_fit(types_needed, pool, total_pool):
+    """Check a chain's planet-type demands against a pooled inventory."""
+    any_needed = types_needed.get("Any", 0)
+    specific = 0
+    for t, c in types_needed.items():
+        if t == "Any":
+            continue
+        if pool.get(t, 0) < c:
+            return False
+        specific += c
+    return any_needed <= total_pool - specific
+
+
+def _planet_instance_key(p):
+    """(system, ptype, instance) for a planets_used entry, or None."""
+    t = p.get("type", "")
+    system = p.get("system", "")
+    if not system or not t or t == "Any":
+        return None
+    parts = t.rsplit(" ", 1)
+    if len(parts) == 2 and len(parts[1]) <= 2:
+        return (system, parts[0], parts[1])
+    return (system, t, "A")
+
+
+def _analyse_chain(chain, ctx, combo_set=None, exclude=frozenset()):
+    """Resolve a P1/P2/P3 chain's planets and build its analysis dict.
+
+    Memoized on (chain, selection) so re-analysis across system combos is
+    cheap. Returns None when the chain can't be placed in combo mode; in
+    global mode (combo_set=None) returns a non-viable stub with flags so
+    the per-tier tables can show why.
+    """
+    sel, fail_flags = _resolve_chain_selection(chain, ctx, combo_set, exclude)
+    if sel is None:
+        if fail_flags and combo_set is None:
+            return _not_viable(chain, fail_flags)
+        return None
+    key = (chain["output_type_id"], sel)
+    vc = ctx["vc_memo"].get(key)
+    if vc is None:
+        vc = _VC_BUILDERS[sel[0]](chain, sel, ctx)
+        if vc is not None:
+            vc["_sel_sig"] = sel
+            _attach_alloc_fields(vc)
+            ctx["vc_memo"][key] = vc
+    return vc
+
+
+def find_viable_chains(chains, pi_types, schematics, planet_inv,
+                       extraction_rates, density_data, cfg,
+                       planet_taxes=None, ctx=None):
+    """For each producible chain, compute layout options.
+
+    extraction_rates / density_data use 'System.Type.Instance' keys as
+    returned by load_extraction_rates() / load_planet_density().
+    Returns list of analysed chain dicts (viable and non-viable, with
+    flags); economics are computed separately by compute_economics().
+    """
+    if ctx is None:
+        ctx = _build_analysis_ctx(chains, pi_types, schematics, planet_inv,
+                                  extraction_rates, density_data, cfg,
+                                  planet_taxes)
+
+    # Flattened inventory for the P4 estimator
+    flat_inv = {}
+    total_by_type = {}
+    for system, planets in ctx["inv"].items():
+        for ptype, count in planets.items():
+            flat_inv.setdefault(ptype, []).append((system, count))
+            total_by_type[ptype] = total_by_type.get(ptype, 0) + count
+
+    results = []
+    for tid, chain in chains.items():
+        tier = chain["tier"]
+        if tier in ("P1", "P2", "P3"):
+            result = _analyse_chain(chain, ctx)
+        elif tier == "P4":
+            result = _analyse_p4_chain(chain, pi_types, schematics, flat_inv,
+                                       total_by_type, None,
+                                       cfg["pg_budget"], cfg["cpu_budget"],
+                                       cfg["max_planets"])
+        else:
+            continue
+        if result:
+            results.append(result)
+    return results
 
 
 def _min_extraction_planets(p0_names, flat_inv):
@@ -1629,16 +1795,9 @@ def _analyse_p4_chain(chain, pi_types, schematics, flat_inv, total_by_type,
 
 # ── Economics ─────────────────────────────────────────────────
 
-def compute_economics(viable_chains, market_prices, cfg, pi_types,
-                      matrix=None, home_id=None, system_ids=None,
-                      planet_taxes=None):
-    """Compute ISK/hr, tax, haul time for each viable chain.
-
-    Primary price: sustained realised price — walks the buy order book within
-    max_market_jumps and blends with VWAP for production beyond order depth.
-    This models what you'd actually earn over 30 days, not just the instant
-    top-of-book price.
-    """
+def _build_econ_ctx(market_prices, cfg, pi_types, matrix=None, home_id=None,
+                    system_ids=None, planet_taxes=None):
+    """Precompute shared inputs for per-chain economics."""
     home_system_id = esi.search_system_id(cfg["home_system"])
     jita_system_id = esi.search_system_id("Jita")
     jita_jumps = 0
@@ -1647,122 +1806,159 @@ def compute_economics(viable_chains, market_prices, cfg, pi_types,
                                         avoid=_AVOID_IDS)
         if jita_jumps < 0:
             jita_jumps = 15  # fallback
+    return {"market_prices": market_prices, "cfg": cfg, "pi_types": pi_types,
+            "matrix": matrix, "home_id": home_id, "system_ids": system_ids,
+            "planet_taxes": planet_taxes, "jita_jumps": jita_jumps}
 
+
+def compute_economics(viable_chains, market_prices, cfg, pi_types,
+                      matrix=None, home_id=None, system_ids=None,
+                      planet_taxes=None, ectx=None):
+    """Compute ISK/hr, tax, haul time for each viable chain.
+
+    Primary price: sustained realised price — walks the buy order book within
+    max_market_jumps and blends with VWAP for production beyond order depth.
+    This models what you'd actually earn over 30 days, not just the instant
+    top-of-book price.
+    """
+    if ectx is None:
+        ectx = _build_econ_ctx(market_prices, cfg, pi_types, matrix, home_id,
+                               system_ids, planet_taxes)
     for vc in viable_chains:
-        chain = vc["chain"]
-        tid = chain["output_type_id"]
-        prices = market_prices.get(tid, {})
+        _compute_economics_single(vc, ectx)
 
-        local_buy = prices.get("local_buy", 0)
-        local_book = prices.get("local_book", [])
-        local_real_depth = prices.get("local_real_depth", 0)
-        local_buyer_system = prices.get("local_buyer_system", "")
-        local_buyer_jumps = prices.get("local_buyer_jumps", 0)
-        local_vwap = prices.get("local_vwap", 0)
-        local_avg_daily_vol = prices.get("local_avg_daily_vol", 0)
-        local_active_days = prices.get("local_active_days", 0)
-        local_order_count = prices.get("local_order_count", 0)
-        jita_vwap = prices.get("jita_vwap", 0)
-        jita_avg_daily_vol = prices.get("jita_avg_daily_vol", 0)
-        jita_active_days = prices.get("jita_active_days", 0)
-        jita_buy = prices.get("jita_buy", 0)
 
-        units_hr = vc.get("units_hr", 0)
-        units_per_day = units_hr * 24
+def _compute_economics_single(vc, ectx):
+    """Economics for one chain. Idempotent (guarded by _econ_done) so a
+    chain shared between the global ranking and several layout candidates
+    is priced once and never gets duplicate flags."""
+    if vc.get("_econ_done"):
+        return
+    vc["_econ_done"] = True
 
-        # Compute sustained realised price: walk the order book, blend with VWAP
-        sustained_price, real_buy_days = _compute_sustained_price(
-            local_book, units_per_day, local_vwap)
+    market_prices = ectx["market_prices"]
+    cfg = ectx["cfg"]
+    pi_types = ectx["pi_types"]
+    matrix = ectx["matrix"]
+    home_id = ectx["home_id"]
+    system_ids = ectx["system_ids"]
+    planet_taxes = ectx["planet_taxes"]
+    jita_jumps = ectx["jita_jumps"]
 
-        # Store all price signals
-        vc["local_buy_price"] = local_buy  # top of book (snapshot)
-        vc["local_sustained"] = sustained_price  # blended over 30d
-        vc["local_real_depth"] = local_real_depth
-        vc["local_real_buy_days"] = real_buy_days
-        vc["local_buyer_system"] = local_buyer_system
-        vc["local_buyer_jumps"] = local_buyer_jumps
-        vc["local_vwap"] = local_vwap
-        vc["local_avg_daily_vol"] = local_avg_daily_vol
-        vc["local_active_days"] = local_active_days
-        vc["local_order_count"] = local_order_count
-        vc["jita_vwap"] = jita_vwap
-        vc["jita_buy_price"] = jita_buy
-        vc["jita_avg_daily_vol"] = jita_avg_daily_vol
-        vc["jita_active_days"] = jita_active_days
+    chain = vc["chain"]
+    tid = chain["output_type_id"]
+    prices = market_prices.get(tid, {})
 
-        # Gross ISK/hr uses sustained price (realistic over 30 days)
-        vc["gross_isk_hr"] = units_hr * sustained_price
+    local_buy = prices.get("local_buy", 0)
+    local_book = prices.get("local_book", [])
+    local_real_depth = prices.get("local_real_depth", 0)
+    local_buyer_system = prices.get("local_buyer_system", "")
+    local_buyer_jumps = prices.get("local_buyer_jumps", 0)
+    local_vwap = prices.get("local_vwap", 0)
+    local_avg_daily_vol = prices.get("local_avg_daily_vol", 0)
+    local_active_days = prices.get("local_active_days", 0)
+    local_order_count = prices.get("local_order_count", 0)
+    jita_vwap = prices.get("jita_vwap", 0)
+    jita_avg_daily_vol = prices.get("jita_avg_daily_vol", 0)
+    jita_active_days = prices.get("jita_active_days", 0)
+    jita_buy = prices.get("jita_buy", 0)
 
-        # Tax
-        tax_per_unit = _compute_chain_tax(vc, pi_types, cfg, planet_taxes)
-        vc["tax_per_hr"] = tax_per_unit * units_hr
+    units_hr = vc.get("units_hr", 0)
+    units_per_day = units_hr * 24
 
-        # Net ISK/hr = gross - tax
-        vc["net_isk_hr"] = vc["gross_isk_hr"] - vc["tax_per_hr"]
+    # Compute sustained realised price: walk the order book, blend with VWAP
+    sustained_price, real_buy_days = _compute_sustained_price(
+        local_book, units_per_day, local_vwap)
 
-        # Activity-adjusted ISK/hr — penalises products that rarely trade.
-        # Uses sum(order_count) over the last 30 calendar days as the signal.
-        # Products need ~20 trades/month for full activity score.
-        # Below that, production may sit unsold waiting for a buyer.
-        activity_factor = min(local_order_count / ORDERS_FOR_FULL_ACTIVITY,
-                              1.0)
-        vc["activity_factor"] = activity_factor
-        vc["adjusted_net_isk_hr"] = vc["net_isk_hr"] * activity_factor
+    # Store all price signals
+    vc["local_buy_price"] = local_buy  # top of book (snapshot)
+    vc["local_sustained"] = sustained_price  # blended over 30d
+    vc["local_real_depth"] = local_real_depth
+    vc["local_real_buy_days"] = real_buy_days
+    vc["local_buyer_system"] = local_buyer_system
+    vc["local_buyer_jumps"] = local_buyer_jumps
+    vc["local_vwap"] = local_vwap
+    vc["local_avg_daily_vol"] = local_avg_daily_vol
+    vc["local_active_days"] = local_active_days
+    vc["local_order_count"] = local_order_count
+    vc["jita_vwap"] = jita_vwap
+    vc["jita_buy_price"] = jita_buy
+    vc["jita_avg_daily_vol"] = jita_avg_daily_vol
+    vc["jita_active_days"] = jita_active_days
 
-        # Jita ISK/hr (using Jita VWAP — you'd sell over time there)
-        haul_model = cfg["haul"]
-        jita_round_trip_sec = (jita_jumps * 2 * haul_model["sec_per_jump"]
-                               + 2 * haul_model["sec_per_station"])
-        jita_round_trip_min = jita_round_trip_sec / 60
-        vc["jita_gross_isk_hr"] = units_hr * jita_vwap
-        vc["jita_haul_min"] = jita_round_trip_min
+    # Gross ISK/hr uses sustained price (realistic over 30 days)
+    vc["gross_isk_hr"] = units_hr * sustained_price
 
-        # Haul time estimate for per-chain display (est.)
-        if matrix and home_id and system_ids:
-            vc["haul_minutes_per_day"] = _estimate_chain_haul_minutes(
-                vc, matrix, home_id, system_ids, cfg["haul"])
-        else:
-            vc["haul_minutes_per_day"] = _compute_haul_time(vc, cfg)
+    # Tax
+    tax_per_unit = _compute_chain_tax(vc, pi_types, cfg, planet_taxes)
+    vc["tax_per_hr"] = tax_per_unit * units_hr
 
-        # ── Flags ──
+    # Net ISK/hr = gross - tax
+    vc["net_isk_hr"] = vc["gross_isk_hr"] - vc["tax_per_hr"]
 
-        # NO LOCAL BUYER: no buy orders within jump range
-        if local_buy == 0:
-            if local_vwap > 100:
-                vc["flags"].append("NO LOCAL BUYER")
-            elif jita_vwap > 100:
-                vc["flags"].append("NO LOCAL MARKET")
+    # Activity-adjusted ISK/hr — penalises products that rarely trade.
+    # Uses sum(order_count) over the last 30 calendar days as the signal.
+    # Products need ~20 trades/month for full activity score.
+    # Below that, production may sit unsold waiting for a buyer.
+    activity_factor = min(local_order_count / ORDERS_FOR_FULL_ACTIVITY,
+                          1.0)
+    vc["activity_factor"] = activity_factor
+    vc["adjusted_net_isk_hr"] = vc["net_isk_hr"] * activity_factor
 
-        # SHALLOW BUY: real buy order depth covers less than 7 days of production
-        if real_buy_days < SHALLOW_BUY_THRESHOLD_DAYS and units_per_day > 0:
-            if real_buy_days > 0:
-                vc["flags"].append(f"SHALLOW BUY ({real_buy_days:.0f}d depth)")
-            elif local_buy > MIN_REAL_ORDER_PRICE:
-                vc["flags"].append("SHALLOW BUY (<1d depth)")
+    # Jita ISK/hr (using Jita VWAP — you'd sell over time there)
+    haul_model = cfg["haul"]
+    jita_round_trip_sec = (jita_jumps * 2 * haul_model["sec_per_jump"]
+                           + 2 * haul_model["sec_per_station"])
+    jita_round_trip_min = jita_round_trip_sec / 60
+    vc["jita_gross_isk_hr"] = units_hr * jita_vwap
+    vc["jita_haul_min"] = jita_round_trip_min
 
-        # Liquidity from trade frequency
-        if local_order_count < LOW_ACTIVITY_ORDER_THRESHOLD:
-            vc["flags"].append(f"LOW ACTIVITY ({local_order_count} trades/30d)")
+    # Haul time estimate for per-chain display (est.)
+    if matrix and home_id and system_ids:
+        vc["haul_minutes_per_day"] = _estimate_chain_haul_minutes(
+            vc, matrix, home_id, system_ids, cfg["haul"])
+    else:
+        vc["haul_minutes_per_day"] = _compute_haul_time(vc, cfg)
 
-        if vc["haul_minutes_per_day"] > cfg["max_haul_minutes"]:
-            vc["flags"].append("HAUL OVER BUDGET")
+    # ── Flags ──
 
-        # Launchpad fill time check
-        if units_hr > 0 and chain["volume"] > 0:
-            lp_capacity = 10000  # m³
-            fill_hours = lp_capacity / (units_hr * chain["volume"])
-            if fill_hours < 24:
-                vc["flags"].append(f"MUST HAUL EVERY {fill_hours:.0f}H")
+    # NO LOCAL BUYER: no buy orders within jump range
+    if local_buy == 0:
+        if local_vwap > 100:
+            vc["flags"].append("NO LOCAL BUYER")
+        elif jita_vwap > 100:
+            vc["flags"].append("NO LOCAL MARKET")
 
-        # Jita spread: compare in-range buy vs Jita VWAP
-        if local_buy > 10 and jita_vwap > local_buy:
-            spread_pct = (jita_vwap - local_buy) / local_buy * 100
-            if spread_pct > 30:
-                vc["flags"].append(f"JITA +{spread_pct:.0f}%")
+    # SHALLOW BUY: real buy order depth covers less than 7 days of production
+    if real_buy_days < SHALLOW_BUY_THRESHOLD_DAYS and units_per_day > 0:
+        if real_buy_days > 0:
+            vc["flags"].append(f"SHALLOW BUY ({real_buy_days:.0f}d depth)")
+        elif local_buy > MIN_REAL_ORDER_PRICE:
+            vc["flags"].append("SHALLOW BUY (<1d depth)")
 
-        # ── Build sheet helpers ──
-        vc["bottleneck"] = _identify_bottleneck(vc)
-        vc["sell_recommendation"] = _sell_recommendation(vc)
+    # Liquidity from trade frequency
+    if local_order_count < LOW_ACTIVITY_ORDER_THRESHOLD:
+        vc["flags"].append(f"LOW ACTIVITY ({local_order_count} trades/30d)")
+
+    if vc["haul_minutes_per_day"] > cfg["max_haul_minutes"]:
+        vc["flags"].append("HAUL OVER BUDGET")
+
+    # Launchpad fill time check
+    if units_hr > 0 and chain["volume"] > 0:
+        lp_capacity = 10000  # m³
+        fill_hours = lp_capacity / (units_hr * chain["volume"])
+        if fill_hours < 24:
+            vc["flags"].append(f"MUST HAUL EVERY {fill_hours:.0f}H")
+
+    # Jita spread: compare in-range buy vs Jita VWAP
+    if local_buy > 10 and jita_vwap > local_buy:
+        spread_pct = (jita_vwap - local_buy) / local_buy * 100
+        if spread_pct > 30:
+            vc["flags"].append(f"JITA +{spread_pct:.0f}%")
+
+    # ── Build sheet helpers ──
+    vc["bottleneck"] = _identify_bottleneck(vc)
+    vc["sell_recommendation"] = _sell_recommendation(vc)
 
 
 def _compute_chain_tax(vc, pi_types, cfg, planet_taxes=None):
@@ -2387,157 +2583,270 @@ def _compute_trips_per_day(allocated, hauler_m3):
     return max(1, math.ceil(peak_daily_m3 / hauler_m3))
 
 
+TOP_SYSTEMS_PER_P0 = 8     # allocator considers systems in the top-K of any resource
+LOW_TAX_FACTORY_SYSTEMS = 5  # plus the N cheapest-POCO systems (factory hosts)
+FINALIST_LAYOUTS = 10      # candidates that get instance deconfliction
+
+
+def _interesting_systems(ctx, home_name):
+    """Systems worth enumerating in the allocator.
+
+    A system matters if it is in the top-K extraction candidates for any
+    P0 resource, is among the cheapest-POCO systems (factory hosting), or
+    is home. Everything else only adds pool filler and combinatorial cost.
+    """
+    inv = ctx["inv"]
+    keep = set()
+    if home_name in inv:
+        keep.add(home_name)
+    for cands in ctx["p0_candidates"].values():
+        seen = []
+        for _rate, _tag, system, _ptype, _inst in cands:
+            if system not in seen:
+                seen.append(system)
+                if len(seen) >= TOP_SYSTEMS_PER_P0:
+                    break
+        keep.update(seen)
+    taxes = ctx["planet_taxes"]
+    default_rate = ctx["cfg"]["tax_rate"]
+    min_tax = {}
+    for system in inv:
+        prefix = system + "."
+        rates = [v for k, v in taxes.items() if k.startswith(prefix)]
+        min_tax[system] = min(rates) if rates else default_rate
+    for system in sorted(min_tax, key=lambda s: min_tax[s])[:LOW_TAX_FACTORY_SYSTEMS]:
+        keep.add(system)
+    return sorted(s for s in keep if s in inv)
+
+
+def _cached_route(actual_systems, sell_id, planet_stops, home_id, system_ids,
+                  matrix, haul_cfg, cache):
+    """Route cost with TSP results cached by (system set, sell hub)."""
+    rkey = (frozenset(actual_systems), sell_id)
+    base = cache.get(rkey)
+    if base is None:
+        base = _compute_route_cost(actual_systems, home_id, sell_id,
+                                   system_ids, matrix, haul_cfg, 0)
+        cache[rkey] = base
+    route = dict(base)
+    route_seconds = (route["tour_jumps"] * haul_cfg["sec_per_jump"]
+                     + planet_stops * haul_cfg["sec_per_planet"]
+                     + haul_cfg["sec_per_station"]
+                     + haul_cfg["daily_overhead"])
+    route["planet_stops"] = planet_stops
+    route["route_seconds"] = route_seconds
+    route["route_minutes"] = route_seconds / 60
+    return route
+
+
+def _layout_systems_and_stops(allocated):
+    """Unique systems visited and total planet stops for a chain set."""
+    actual_systems = set()
+    planet_stops = 0
+    for vc in allocated:
+        planets = vc.get("planets_used", [])
+        planet_stops += len(planets) or vc.get("planet_count", 1) or 1
+        for p in planets:
+            s = p.get("system", "")
+            if s:
+                actual_systems.add(s)
+    return actual_systems, planet_stops
+
+
+def _finalize_layout(cand, ctx, ectx, matrix, home_id, system_ids, cfg,
+                     market_prices, route_cache):
+    """Deconflict planet instances across a layout's chains and build the
+    final layout dict.
+
+    Chains are re-resolved best-first with already-claimed instances
+    excluded, so no two colonies land on the same physical planet; yields
+    are recomputed with the planets each chain actually gets.
+    """
+    combo_set = cand["combo"]
+    used = set()
+    allocated = []
+    for vc in sorted(cand["allocated"],
+                     key=lambda v: -v.get("adjusted_net_isk_hr", 0)):
+        if vc["chain"]["tier"] == "P4" or not vc.get("planets_used"):
+            allocated.append(copy.deepcopy(vc))
+            continue
+        new_vc = _analyse_chain(vc["chain"], ctx, combo_set,
+                                exclude=frozenset(used))
+        if not new_vc or not new_vc.get("viable"):
+            continue  # no conflict-free planets left for this chain
+        _compute_economics_single(new_vc, ectx)
+        new_vc = copy.deepcopy(new_vc)
+        for p in new_vc.get("planets_used", []):
+            key = _planet_instance_key(p)
+            if key:
+                used.add(key)
+        allocated.append(new_vc)
+    if not allocated:
+        return None
+
+    total_net = sum(vc.get("adjusted_net_isk_hr", 0) for vc in allocated)
+    sell_id = _determine_sell_system(allocated, market_prices, system_ids)
+    actual_systems, planet_stops = _layout_systems_and_stops(allocated)
+    route = _cached_route(actual_systems, sell_id, planet_stops, home_id,
+                          system_ids, matrix, cfg["haul"], route_cache)
+    trips = _compute_trips_per_day(allocated, cfg["hauler_m3"])
+    daily_haul = route["route_minutes"] * trips
+    route["trips_per_day"] = trips
+    route["daily_haul_minutes"] = daily_haul
+    route["isk_per_haul_min"] = (total_net * 24 / daily_haul
+                                 if daily_haul > 0 else 0)
+
+    label = " + ".join(sorted(actual_systems))
+    if len(actual_systems) > 1:
+        label += f" ({len(actual_systems)} systems)"
+    return {"strategy": label, "total_net": total_net,
+            "allocated": allocated, "route": route}
+
+
 def allocate_system_first(ranked_chains, planet_inv, matrix, home_id,
-                          system_ids, cfg, market_prices):
-    """System-first allocator: finds best chain combinations per system subset.
+                          system_ids, cfg, market_prices, ctx, ectx):
+    """System-first allocator with combo-local planet selection.
 
-    Replaces allocate_5_planets(). Evaluates every combination of 1..4 systems
-    from the planet inventory, pools their planet types, then finds the
-    best chain combination that fits within max_planets using exact
-    brute-force knapsack. Route cost (TSP including sell system) determines
-    daily haul minutes.
-
-    Returns: list of top 3 layouts with route info, sorted by total_net.
+    Enumerates subsets of 1..4 interesting systems. Within each subset,
+    chains are re-analysed using only that subset's planets — so a nearby
+    almost-as-good planet competes against the global best instead of the
+    chain being pinned to one distant system. The best chain combination
+    per subset comes from a branch-and-bound knapsack; the TSP route
+    (sell hub pinned last) gives daily haul minutes; candidates within
+    the haul budget are ranked by total net ISK/hr. Top candidates then
+    get instance deconfliction (no two colonies on one physical planet)
+    before final ranking. Returns the top 3 layouts.
     """
     max_planets = cfg["max_planets"]
     max_haul_minutes = cfg["max_haul_minutes"]
     haul_cfg = cfg["haul"]
+    inv = ctx["inv"]
+    home_name = cfg["home_system"]
 
-    viable = [vc for vc in ranked_chains if vc.get("viable")]
-    if not viable:
-        return []
+    # P4 chains have no per-system planet assignments — pass through
+    passthrough = [vc for vc in ranked_chains
+                   if vc.get("viable") and vc["chain"]["tier"] == "P4"
+                   and (vc.get("planet_count") or 99) <= max_planets]
+    for vc in passthrough:
+        _attach_alloc_fields(vc)
 
-    # Pre-compute planet type requirements for each chain
-    for vc in viable:
-        types_needed = {}
-        pc = 0
-        for p in vc.get("planets_used", []):
-            ptype_full = p.get("type", "")
-            base_ptype = ptype_full.rsplit(" ", 1)[0] if " " in ptype_full else ptype_full
-            if not base_ptype:
-                base_ptype = "Any"
-            types_needed[base_ptype] = types_needed.get(base_ptype, 0) + 1
-            pc += 1
-        if pc == 0:
-            pc = vc.get("planet_count", 1) or 1
-        vc["_alloc_types"] = types_needed
-        vc["_alloc_pc"] = pc
+    p123 = [c for c in ctx["chains"].values()
+            if c["tier"] in ("P1", "P2", "P3")]
 
-    all_systems = list(planet_inv.keys())
+    interesting = _interesting_systems(ctx, home_name)
+    skipped = len(inv) - len(interesting)
+    if skipped > 0:
+        print(f"  PI Dossier: allocator over {len(interesting)} systems "
+              f"(top {TOP_SYSTEMS_PER_P0} per resource + "
+              f"{LOW_TAX_FACTORY_SYSTEMS} low-tax; {skipped} others add "
+              f"nothing a kept system doesn't)")
+
+    sec_per_jump = haul_cfg["sec_per_jump"]
     candidates = []
+    knap_cache = {}
+    route_cache = {}
+    combos_seen = 0
+    t0 = time.time()
 
-    for subset_size in range(1, min(len(all_systems), 4) + 1):
-        for combo in itertools.combinations(all_systems, subset_size):
-            # Build pooled planet-type inventory
+    for subset_size in range(1, min(len(interesting), 4) + 1):
+        for combo in itertools.combinations(interesting, subset_size):
+            # Route lower bound: the circuit must at least round-trip to
+            # the farthest member system — prune before any analysis.
+            dists = []
+            unreachable = False
+            for s in combo:
+                sid = system_ids.get(s)
+                d = 0
+                if sid and sid != home_id:
+                    d = matrix.get((home_id, sid), -1)
+                if d < 0:
+                    unreachable = True
+                    break
+                dists.append(d)
+            if unreachable:
+                continue
+            lb_minutes = (2 * max(dists) * sec_per_jump
+                          + haul_cfg["sec_per_station"]) / 60
+            if max_haul_minutes and lb_minutes > max_haul_minutes:
+                continue
+            combos_seen += 1
+
+            combo_set = frozenset(combo)
             pool = {}
-            for sys_name in combo:
-                for ptype, count in planet_inv.get(sys_name, {}).items():
+            for s in combo:
+                for ptype, count in inv.get(s, {}).items():
                     pool[ptype] = pool.get(ptype, 0) + count
-
             total_pool = sum(pool.values())
             if total_pool < 1:
                 continue
 
-            # Filter chains whose planets are IN this combo and types fit
-            combo_set = set(combo)
             eligible = []
-            for vc in viable:
-                types_needed = vc["_alloc_types"]
-                pc = vc["_alloc_pc"]
-                if pc > max_planets:
+            for chain in p123:
+                vc = _analyse_chain(chain, ctx, combo_set)
+                if not vc or not vc.get("viable"):
                     continue
-
-                # System membership: all planets_used systems must be in combo
-                chain_systems = {p.get("system", "")
-                                 for p in vc.get("planets_used", [])
-                                 if p.get("system", "")}
-                if chain_systems and not chain_systems.issubset(combo_set):
+                _compute_economics_single(vc, ectx)
+                if vc["_alloc_pc"] > max_planets:
                     continue
-
-                fits = True
-                any_needed = types_needed.get("Any", 0)
-                specific_needed = 0
-                for t, c in types_needed.items():
-                    if t == "Any":
-                        continue
-                    if pool.get(t, 0) < c:
-                        fits = False
-                        break
-                    specific_needed += c
-                if not fits:
+                if not _types_fit(vc["_alloc_types"], pool, total_pool):
                     continue
-                if any_needed > total_pool - specific_needed:
-                    continue
-
                 eligible.append(vc)
-
+            for vc in passthrough:
+                if _types_fit(vc["_alloc_types"], pool, total_pool):
+                    eligible.append(vc)
             if not eligible:
                 continue
 
-            best_net, best_combo = _best_chain_combo(
-                list(eligible), max_planets, pool)
+            ksig = (frozenset(id(vc) for vc in eligible),
+                    tuple(sorted(pool.items())))
+            cached = knap_cache.get(ksig)
+            if cached is None:
+                cached = _best_chain_combo(list(eligible), max_planets, pool)
+                knap_cache[ksig] = cached
+            best_net, best_combo = cached
             if not best_combo:
                 continue
 
-            sell_system_id = _determine_sell_system(
-                best_combo, market_prices, system_ids)
-
-            planet_stops = sum(vc["_alloc_pc"] for vc in best_combo)
-
-            # Route uses actual planet systems, not the combo
-            actual_systems = set()
-            for vc in best_combo:
-                for p in vc.get("planets_used", []):
-                    s = p.get("system", "")
-                    if s:
-                        actual_systems.add(s)
-
-            route = _compute_route_cost(
-                actual_systems, home_id, sell_system_id, system_ids,
-                matrix, haul_cfg, planet_stops)
-
-            trips_per_day = _compute_trips_per_day(best_combo, cfg["hauler_m3"])
-            daily_haul_minutes = route["route_minutes"] * trips_per_day
-
-            if max_haul_minutes and daily_haul_minutes > max_haul_minutes:
+            sell_id = _determine_sell_system(best_combo, market_prices,
+                                             system_ids)
+            actual_systems, planet_stops = _layout_systems_and_stops(best_combo)
+            route = _cached_route(actual_systems, sell_id, planet_stops,
+                                  home_id, system_ids, matrix, haul_cfg,
+                                  route_cache)
+            trips = _compute_trips_per_day(best_combo, cfg["hauler_m3"])
+            daily_haul = route["route_minutes"] * trips
+            if max_haul_minutes and daily_haul > max_haul_minutes:
                 continue
 
-            route["trips_per_day"] = trips_per_day
-            route["daily_haul_minutes"] = daily_haul_minutes
+            candidates.append({"combo": combo_set, "net": best_net,
+                               "allocated": best_combo,
+                               "daily_haul": daily_haul})
 
-            label = " + ".join(sorted(actual_systems))
-            if subset_size > 1:
-                label += f" ({subset_size} systems)"
-
-            candidates.append({
-                "strategy": label,
-                "total_net": best_net,
-                "allocated": best_combo,
-                "route": route,
-            })
-
-    # Sort by total_net desc, secondary by lower haul
-    candidates.sort(key=lambda c: (-c["total_net"],
-                                    c["route"]["daily_haul_minutes"]))
-
-    # Deduplicate by chain set
+    # Best-first by pre-deconflict net; finalize the top unique chain sets
+    candidates.sort(key=lambda c: (-c["net"], c["daily_haul"]))
+    finals = []
     seen = set()
-    results = []
-    for c in candidates:
-        sig = frozenset(vc["chain"]["output_name"] for vc in c["allocated"])
+    for cand in candidates:
+        sig = frozenset(vc["chain"]["output_name"] for vc in cand["allocated"])
         if sig in seen:
             continue
         seen.add(sig)
-        results.append(c)
-        if len(results) >= 3:
+        layout = _finalize_layout(cand, ctx, ectx, matrix, home_id,
+                                  system_ids, cfg, market_prices, route_cache)
+        if layout:
+            finals.append(layout)
+        if len(finals) >= FINALIST_LAYOUTS:
             break
 
-    # Clean up temp allocator fields
-    for vc in viable:
-        vc.pop("_alloc_types", None)
-        vc.pop("_alloc_pc", None)
-
-    return results
+    # Re-rank after deconfliction (yields may have dropped slightly)
+    if max_haul_minutes:
+        finals = [l for l in finals
+                  if l["route"]["daily_haul_minutes"] <= max_haul_minutes * 1.001]
+    finals.sort(key=lambda l: (-l["total_net"],
+                               l["route"]["daily_haul_minutes"]))
+    print(f"  PI Dossier: allocator evaluated {combos_seen} system subsets "
+          f"({len(candidates)} candidate layouts) in {time.time()-t0:.1f}s")
+    return finals[:3]
 
 
 # ── System map SVG ───────────────────────────────────────────
@@ -2833,9 +3142,11 @@ def _render_layout_table(layout, cfg, lines):
     if route and route.get("tour_jumps"):
         trips = route.get("trips_per_day", 1)
         haul_min = route.get("daily_haul_minutes", total_haul)
+        ipm = route.get("isk_per_haul_min", 0)
+        ipm_str = f"  |  {_fmt_isk(ipm)}/haul-min" if ipm else ""
         lines.append(f"**{_fmt_isk(total_net)}/hr net** -- {', '.join(products)}  |  "
-                     f"Haul: {haul_min:.0f} min/day ({trips} trip{'s' if trips > 1 else ''})  |  "
-                     f"*{layout['strategy']}*")
+                     f"Haul: {haul_min:.0f} min/day ({trips} trip{'s' if trips > 1 else ''})"
+                     f"{ipm_str}  |  *{layout['strategy']}*")
         route_parts = []
         id_to_name_local = {}  # not available here, use systems_ordered
         ordered = route.get("systems_ordered", [])
@@ -3112,14 +3423,20 @@ def generate_pi_dossier_data(overrides=None):
 
     print("  PI Dossier: computing layouts and economics...")
     calc_inv = active_inventory(planet_inv)
+    ctx = _build_analysis_ctx(chains, pi_types, schematics, calc_inv,
+                              extraction_rates, density_data, cfg,
+                              planet_taxes)
+    ectx = _build_econ_ctx(market_prices, cfg, pi_types, matrix, home_id,
+                           system_ids, planet_taxes)
     viable = find_viable_chains(chains, pi_types, schematics,
-                                calc_inv, extraction_rates, density_data, cfg)
+                                calc_inv, extraction_rates, density_data,
+                                cfg, planet_taxes, ctx=ctx)
     compute_economics(viable, market_prices, cfg, pi_types,
-                      matrix, home_id, system_ids, planet_taxes)
+                      matrix, home_id, system_ids, planet_taxes, ectx=ectx)
 
     ranked = rank_chains(viable)
     layouts = allocate_system_first(ranked, calc_inv, matrix, home_id,
-                                    system_ids, cfg, market_prices)
+                                    system_ids, cfg, market_prices, ctx, ectx)
 
     # Add sell systems to map so route is fully visible
     for layout in layouts:
@@ -3336,7 +3653,8 @@ def save_planet_density(data):
         cp.add_section(section_key)
         for resource, pct in sorted(resources.items()):
             if isinstance(pct, (int, float)) and pct > 0:
-                cp.set(section_key, _name_to_underscore(resource), str(int(pct)))
+                pct_str = str(int(pct)) if float(pct).is_integer() else str(pct)
+                cp.set(section_key, _name_to_underscore(resource), pct_str)
     path = _ini_path("planet_density.ini")
     with open(path, "w", encoding="utf-8") as f:
         f.write("# planet_density.ini\n")
@@ -3642,6 +3960,116 @@ def self_test():
     est = _estimate_chain_haul_minutes(test_haul_vc, mock_matrix, 1,
                                         mock_sids, mock_haul)
     check("Estimate haul > 0", est > 0, f"got {est:.1f} min")
+
+    # ── Instance rate table & candidates ──
+    print("\nInstance rates & candidates:")
+    t_inv = {"Sys1": {"Gas": 2}, "Sys2": {"Gas": 1}}
+    t_ext = {"Sys1.Gas.A": {"Aqueous Liquids": 9000}}
+    t_dens = {"Sys1.Gas.A": {"Aqueous Liquids": 22, "Ionic Solutions": 30},
+              "Sys1.Gas.B": {"Ionic Solutions": 40}}
+    ir = _build_instance_rates(t_inv, t_ext, t_dens)
+    check("OBS beats EST on same instance",
+          ir[("Sys1", "Gas", "A")]["Aqueous Liquids"] == (9000, "OBS"),
+          f"got {ir[('Sys1','Gas','A')].get('Aqueous Liquids')}")
+    check("EST from density band",
+          ir[("Sys1", "Gas", "A")]["Ionic Solutions"] == (19000, "EST"),
+          f"got {ir[('Sys1','Gas','A')].get('Ionic Solutions')}")
+    check("Scanned planet lacking a resource yields nothing",
+          "Aqueous Liquids" not in ir[("Sys1", "Gas", "B")],
+          f"got {ir[('Sys1','Gas','B')]}")
+    check("Unscanned planet gets DFL",
+          ir[("Sys2", "Gas", "A")]["Reactive Gas"] == (DEFAULT_EXTRACTION_RATE, "DFL"),
+          f"got {ir[('Sys2','Gas','A')].get('Reactive Gas')}")
+    t_cands, t_by_sys = _build_p0_candidates(ir)
+    top_is = t_cands["Ionic Solutions"][0]
+    check("Candidates ranked by rate",
+          top_is[0] == 22000 and top_is[2] == "Sys1" and top_is[4] == "B",
+          f"got {top_is}")
+
+    # ── Combo-local selection & deconfliction ──
+    print("\nCombo-local selection & deconfliction:")
+    t_chain = {"output_type_id": 90001, "output_name": "TestP1",
+               "tier": "P1", "volume": 0.38,
+               "p0_inputs": [{"name": "Ionic Solutions"}],
+               "inputs": [],
+               "schematic": {"output": {"quantity": 1}, "cycle_time": 1800}}
+    t_cfg = {"tax_rate": 0.15, "pg_budget": 17000, "cpu_budget": 21315,
+             "max_planets": 5}
+    t_ctx = _build_analysis_ctx({90001: t_chain}, {}, {}, t_inv, t_ext,
+                                t_dens, t_cfg, {"Sys1.Gas.B": 0.05})
+    sel_all, _f = _resolve_chain_selection(t_chain, t_ctx)
+    check("Global pick is best instance",
+          sel_all and sel_all[1][2:5] == ("Sys1", "Gas", "B"),
+          f"got {sel_all}")
+    sel_combo, _f = _resolve_chain_selection(t_chain, t_ctx,
+                                             combo_set=frozenset({"Sys2"}))
+    check("Combo-local pick stays in combo",
+          sel_combo and sel_combo[1][2] == "Sys2", f"got {sel_combo}")
+    sel_excl, _f = _resolve_chain_selection(
+        t_chain, t_ctx, exclude=frozenset({("Sys1", "Gas", "B")}))
+    check("Excluded instance falls to next best",
+          sel_excl and sel_excl[1][2:5] == ("Sys1", "Gas", "A"),
+          f"got {sel_excl}")
+    vc1 = _analyse_chain(t_chain, t_ctx)
+    k1 = _planet_instance_key(vc1["planets_used"][0])
+    vc2 = _analyse_chain(t_chain, t_ctx, exclude=frozenset({k1}))
+    check("Second colony lands on a different planet",
+          _planet_instance_key(vc2["planets_used"][0]) != k1,
+          f"both on {k1}")
+
+    # ── Self-contained P2 uses ONE physical planet ──
+    print("\nSelf-contained P2 instance integrity:")
+    t_p2 = {"output_type_id": 90002, "output_name": "TestP2", "tier": "P2",
+            "volume": 0.75,
+            "p0_inputs": [{"name": "Aqueous Liquids"},
+                          {"name": "Ionic Solutions"}],
+            "inputs": [],
+            "schematic": {"output": {"quantity": 5}, "cycle_time": 3600}}
+    scs = _sc_candidates_for_chain(t_p2, t_ctx)
+    check("SC candidates exist", len(scs) >= 1, f"got {len(scs)}")
+    if scs:
+        best_sc = scs[0]
+        # Sys1 Gas B lacks Aqueous Liquids, so it must NOT be combined with
+        # Gas A's rates; valid single planets: Sys1 Gas A, Sys2 Gas A (DFL)
+        check("SC best is a single valid planet",
+              (best_sc["system"], best_sc["instance"]) in
+              [("Sys1", "A"), ("Sys2", "A")], f"got {best_sc}")
+        sc_vc = _analyse_chain(t_p2, t_ctx)
+        check("SC vc viable from one instance", sc_vc.get("viable"),
+              f"got {sc_vc.get('flags')}")
+
+    # ── Factory placement & tax ──
+    print("\nFactory placement:")
+    fac = _pick_factory_planet(["Sys1"], ["Sys2"], set(), t_ctx)
+    check("Factory picks cheapest-tax spare planet",
+          fac is not None and fac[:3] == ("Sys1", "Gas", "B")
+          and abs(fac[3] - 0.05) < 1e-9, f"got {fac}")
+    fac2 = _pick_factory_planet(["Sys1"], ["Sys2"],
+                                {("Sys1", "Gas", "B")}, t_ctx)
+    check("Factory respects claimed instances",
+          fac2 is not None and fac2[:3] == ("Sys1", "Gas", "A"),
+          f"got {fac2}")
+    fac3 = _pick_factory_planet(["Sys1"], ["Sys2"],
+                                {("Sys1", "Gas", "A"), ("Sys1", "Gas", "B")},
+                                t_ctx)
+    check("Factory falls back to other systems",
+          fac3 is not None and fac3[0] == "Sys2", f"got {fac3}")
+
+    # ── Allocator helpers ──
+    print("\nAllocator helpers:")
+    check("_types_fit respects pool counts",
+          _types_fit({"Gas": 2, "Any": 1}, {"Gas": 2, "Barren": 1}, 3)
+          and not _types_fit({"Gas": 3}, {"Gas": 2}, 2))
+    t_vc = {"planets_used": [
+        {"system": "Sys1", "type": "Gas A"},
+        {"system": "Sys1", "type": "Gas B", "is_factory": True}]}
+    _attach_alloc_fields(t_vc)
+    check("Factory counts as Any in allocation",
+          t_vc["_alloc_types"] == {"Gas": 1, "Any": 1}
+          and t_vc["_alloc_pc"] == 2, f"got {t_vc['_alloc_types']}")
+    inter = _interesting_systems(t_ctx, "Sys1")
+    check("Interesting systems include extraction hosts",
+          set(inter) == {"Sys1", "Sys2"}, f"got {inter}")
 
     print(f"\n{'='*40}")
     if errors:

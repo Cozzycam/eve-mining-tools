@@ -1,5 +1,40 @@
 # EVE Mining Tools — Handover Notes
 
+## PI Dossier (v3.0) — 2026-06-11 — Combo-local allocator rework
+
+Planet selection moved inside the allocator. Previously each chain picked its
+planets once, globally (highest rate anywhere, distance-blind), and
+`allocate_system_first` could only accept/reject whole chains. Now:
+
+- **Analysis context** (`_build_analysis_ctx`): per-instance rate table
+  `{(system, ptype, letter): {p0: (rate, OBS|EST|DFL)}}` from
+  planet_density/planet_extraction, plus ranked candidate lists per P0.
+  OBS > EST > DFL semantics preserved per instance (old `get_p0_rate` removed).
+- **Combo-local selection** (`_resolve_chain_selection(chain, ctx, combo_set,
+  exclude)`): for each 1..4-system subset, chains re-resolve planets using only
+  that subset's planets. Memoized on (chain, selection) via `ctx["vc_memo"]`.
+- **Self-contained P2** now evaluates per planet *letter* — both P0 rates come
+  from the same physical planet's scan (no more cross-instance rate mixing).
+- **Factory planets** get a real (system, type, letter): cheapest-POCO spare
+  planet, extractor systems preferred (co-located = no extra route cost).
+  Counts as "Any" in the knapsack so allocation stays flexible.
+- **Instance deconfliction** (`_finalize_layout`): top-10 candidate layouts are
+  re-resolved chain-by-chain (best first) with claimed planets excluded — no
+  two colonies on one physical planet; yields recomputed with the planet each
+  chain actually gets; then re-ranked.
+- **Pruning**: only "interesting" systems enumerate (top-8 per P0 + 5
+  cheapest-tax + home, `TOP_SYSTEMS_PER_P0`/`LOW_TAX_FACTORY_SYSTEMS`); route
+  lower-bound prune; knapsack + TSP result caching. 24k subsets in ~20s local.
+- **ISK per haul-minute** added to layout routes (markdown + web).
+- `compute_economics` split into `_build_econ_ctx` + `_compute_economics_single`
+  (idempotent via `_econ_done` guard) so layout candidates price incrementally.
+- Self-test extended: instance rates, combo restriction, exclusion fallback,
+  SC instance integrity, factory placement, alloc helpers. All passing.
+
+Known kept behaviors: P2 prefers self-contained over factory when one exists in
+the combo (1 planet vs 3 — better per-slot); P4 chains pass through with
+planet-count estimates only; legacy `allocate_5_planets` remains unused.
+
 ## PI Dossier (v1.0) — 2026-05-22
 
 ### New module: `pi_dossier.py`
