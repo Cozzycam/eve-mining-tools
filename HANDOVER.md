@@ -1,5 +1,15 @@
 # EVE Mining Tools — Handover Notes
 
+## PI Dossier (v3.2) — 2026-06-11 — Switchable per-layout map routes
+
+`_generate_system_map_svg` draws every recommended layout's route in its
+own SVG layer (`g.pi-route-layer[data-layout=N]`, two groups per layout:
+lines below nodes, highlight rings + sell diamond above; layer 0 visible).
+Nodes render neutral; route membership comes from the active overlay.
+Web UI: `showPiRoute(i)` toggles layers via Route buttons under the map
+or by clicking a layout heading. Existing section-hover node highlighting
+unchanged.
+
 ## PI Dossier (v3.1) — 2026-06-11 — Self-calibrating density model
 
 `build_density_estimator(extraction_rates, density_data)`: every observed
