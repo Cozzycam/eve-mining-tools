@@ -2963,6 +2963,54 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
         py = PAD + (z - min_z) / range_z * (H - 2 * PAD)
         return px, py
 
+    planet_counts = {}
+    ignored_systems = set()
+    for sys_name, planets in planet_inv.items():
+        planet_counts[sys_name] = sum(c for pt, c in planets.items()
+                                      if not pt.startswith("_"))
+        if planets.get("_ignored"):
+            ignored_systems.add(sys_name)
+
+    def node_radius(name):
+        return 8 + min(planet_counts.get(name, 0), 10) * 1.5
+
+    # Projected positions, then collision relaxation: real star coordinates
+    # cluster, so push overlapping circles apart (each pair shares the
+    # correction) until every node has clear space, staying as close to the
+    # true position as the overlaps allow.
+    NODE_GAP = 12  # minimum clearance between circle edges
+    pts = {}
+    for name, (x, z) in positions.items():
+        px, py = proj(x, z)
+        pts[name] = [px, py]
+    names = list(pts)
+    for _ in range(200):
+        moved = False
+        for i, na in enumerate(names):
+            ra = node_radius(na)
+            for nb in names[i + 1:]:
+                min_d = ra + node_radius(nb) + NODE_GAP
+                dx = pts[nb][0] - pts[na][0]
+                dy = pts[nb][1] - pts[na][1]
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist >= min_d:
+                    continue
+                if dist < 1e-6:
+                    dx, dy, dist = 1.0, 0.5, 1.118
+                push = (min_d - dist) / 2
+                pts[na][0] -= dx / dist * push
+                pts[na][1] -= dy / dist * push
+                pts[nb][0] += dx / dist * push
+                pts[nb][1] += dy / dist * push
+                moved = True
+        # Keep nodes on the canvas (with room for the label underneath)
+        for name in names:
+            r = node_radius(name) + 6
+            pts[name][0] = min(max(pts[name][0], r), W - r)
+            pts[name][1] = min(max(pts[name][1], r), H - r - 18)
+        if not moved:
+            break
+
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" '
            f'style="width:100%;max-width:{W}px;background:#1a1a2e;'
            f'border-radius:8px;">']
@@ -2986,23 +3034,12 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
                 name_b = n
         if not name_a or not name_b:
             continue
-        if name_a not in positions or name_b not in positions:
+        if name_a not in pts or name_b not in pts:
             continue
-        x1, y1 = proj(*positions[name_a])
-        x2, y2 = proj(*positions[name_b])
+        x1, y1 = pts[name_a]
+        x2, y2 = pts[name_b]
         svg.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" '
                    f'y2="{y2:.1f}" stroke="#334" stroke-width="1"/>')
-
-    planet_counts = {}
-    ignored_systems = set()
-    for sys_name, planets in planet_inv.items():
-        planet_counts[sys_name] = sum(c for pt, c in planets.items()
-                                      if not pt.startswith("_"))
-        if planets.get("_ignored"):
-            ignored_systems.add(sys_name)
-
-    def node_radius(name):
-        return 8 + min(planet_counts.get(name, 0), 10) * 1.5
 
     id_to_name = {v: k for k, v in system_ids.items()}
     home_name = id_to_name.get(home_id, "")
@@ -3018,10 +3055,10 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
         route_names = [home_name] + ordered + [home_name] if ordered else []
         for i in range(len(route_names) - 1):
             na, nb = route_names[i], route_names[i + 1]
-            if na not in positions or nb not in positions:
+            if na not in pts or nb not in pts:
                 continue
-            x1, y1 = proj(*positions[na])
-            x2, y2 = proj(*positions[nb])
+            x1, y1 = pts[na]
+            x2, y2 = pts[nb]
             # Shorten line so arrow doesn't overlap node
             dx, dy = x2 - x1, y2 - y1
             length = (dx * dx + dy * dy) ** 0.5
@@ -3056,8 +3093,7 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
 
     # Nodes — neutral base state; route membership is shown by the
     # per-layout highlight layers drawn on top
-    for name, (x, z) in positions.items():
-        px, py = proj(x, z)
+    for name, (px, py) in pts.items():
         sid = system_ids.get(name, 0)
         count = planet_counts.get(name, 0)
         is_home = sid == home_id
@@ -3109,14 +3145,14 @@ def _generate_system_map_svg(planet_inv, matrix, system_ids, positions,
                     members.add(p["system"])
         sell = layout.get("route", {}).get("sell_system", "")
         for name in sorted(members):
-            if name not in positions:
+            if name not in pts:
                 continue
-            px, py = proj(*positions[name])
+            px, py = pts[name]
             svg.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" '
                        f'r="{node_radius(name) + 3:.1f}" fill="none" '
                        f'stroke="#5bc" stroke-width="2.5" opacity="0.9"/>')
-        if sell and sell != home_name and sell in positions:
-            px, py = proj(*positions[sell])
+        if sell and sell != home_name and sell in pts:
+            px, py = pts[sell]
             r = 10
             svg.append(f'<rect x="{px - r:.1f}" y="{py - r:.1f}" '
                        f'width="{2*r}" height="{2*r}" rx="3" '
