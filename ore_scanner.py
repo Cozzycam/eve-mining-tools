@@ -2852,9 +2852,19 @@ function renderPi(data) {
     h += '<div style="color:var(--dim);font-size:0.85em;margin:2px 0 6px 0;">' + calStr + '</div>';
   }
 
-  // System map SVG
+  // System map SVG — per-layout route layers, switchable
   if (data.system_map_svg) {
-    h += '<div style="margin:12px 0;text-align:center;">' + data.system_map_svg + '</div>';
+    h += '<div id="pi-map" style="margin:12px 0;text-align:center;">' + data.system_map_svg;
+    const mapLayouts = data.layouts || [];
+    if (mapLayouts.length > 1) {
+      const rlabels = ['Best', 'Second-best', 'Third-best'];
+      h += '<div style="margin-top:6px;color:var(--dim);font-size:0.85em;">Route: ';
+      mapLayouts.forEach((l, i) => {
+        h += '<button class="pi-route-btn" data-layout="' + i + '" onclick="showPiRoute(' + i + ')" style="font-size:0.85em;margin:0 3px;' + (i === 0 ? 'outline:2px solid #4af;' : '') + '" title="' + (l.strategy || '') + '">' + (rlabels[i] || ('#' + (i+1))) + '</button>';
+      });
+      h += '<span style="margin-left:8px;">(or click a layout heading below)</span></div>';
+    }
+    h += '</div>';
   }
 
   // Recommended layouts (top 3)
@@ -2863,7 +2873,7 @@ function renderPi(data) {
     const labels = ['Best', 'Second-best', 'Third-best'];
     layouts.forEach((layout, li) => {
       const label = labels[li] || '#' + (li+1);
-      h += '<div class="fitter-section"><h2>' + label + ' Layout</h2>';
+      h += '<div class="fitter-section"><h2 style="cursor:pointer;" title="Show this route on the map" onclick="showPiRoute(' + li + ')">' + label + ' Layout</h2>';
       const rt = layout.route || {};
       let haulStr = '';
       if (rt.daily_haul_minutes != null) {
@@ -3065,6 +3075,15 @@ function renderPi(data) {
       });
     });
   }
+}
+
+function showPiRoute(i) {
+  document.querySelectorAll('#pi-map .pi-route-layer').forEach(g => {
+    g.style.display = (g.getAttribute('data-layout') == i) ? '' : 'none';
+  });
+  document.querySelectorAll('.pi-route-btn').forEach(b => {
+    b.style.outline = (b.getAttribute('data-layout') == i) ? '2px solid #4af' : '';
+  });
 }
 
 function copyPiMarkdown() {
