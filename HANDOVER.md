@@ -1,5 +1,25 @@
 # EVE Mining Tools — Handover Notes
 
+## Web server — 2026-06-12 — PI generate: single-flight + heartbeat
+
+User's VPS generate timed out (~5 min browser idle limit) and retries
+stacked concurrent multi-GB allocator runs (a timed-out browser does NOT
+stop the server thread) until the 4GB box hit 97% kernel-time memory
+thrash. `/api/pi/generate` now:
+
+- **Single-flight**: identical-param requests join the in-flight run
+  (`_PI_RUNS` keyed by sorted overrides); different params queue behind
+  `_PI_COMPUTE_LOCK` so at most one allocator is resident at a time.
+- **Heartbeat**: response streams a 1-space byte every 10s while the
+  worker computes — browser idle timeout never fires; `resp.json()`
+  ignores leading whitespace. (HTTP/1.0 close-delimited body, no
+  Content-Length.)
+- systemd drop-in on VPS: `Environment=PYTHONUNBUFFERED=1`
+  (`/etc/systemd/system/eve-mining-tools.service.d/override.conf`) so
+  progress prints reach journalctl live.
+- Measured clean VPS run: HTTP 200 in 2m47s, ~1.1GB peak RSS; local
+  ~86s. Verified two concurrent local requests share one run.
+
 ## PI Dossier (v3.3) — 2026-06-12 — Route honours collect-before-drop order
 
 The TSP picked the shortest tour with only the sell hub pinned last, so a
