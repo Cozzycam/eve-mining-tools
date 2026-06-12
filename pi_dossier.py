@@ -2469,12 +2469,17 @@ def allocate_5_planets(ranked_chains, planet_inv, max_planets=5, max_haul_minute
 
 # ── TSP solver + route cost ───────────────────────────────────
 
-def _solve_tsp(waypoints, home_id, matrix, end_id=None):
+def _solve_tsp(waypoints, home_id, matrix, end_id=None, precedence=None):
     """Brute-force TSP for small waypoint sets (max ~6 = 720 perms).
 
     Computes home -> w1 -> ... -> wN [-> end_id] -> home, returns shortest.
     end_id (the sell hub) is pinned as the final stop before home, since
     goods must be collected before they can be sold.
+    precedence: set of (before_id, after_id) pairs — e.g. an extractor
+    system must be visited before the factory system its P1 feeds, since
+    the hauler carries the P1 with it. Pairs whose 'before' member is not
+    a free waypoint (home, or the pinned sell hub) are unenforceable and
+    skipped; pairs whose 'after' member is pinned last are trivially met.
     Returns: (ordered_route: list[int], total_jumps: int)
     """
     def leg(a, b):
@@ -2490,11 +2495,19 @@ def _solve_tsp(waypoints, home_id, matrix, end_id=None):
     if not reachable and not pinned:
         return [], -1
 
+    free = set(reachable)
+    order_pairs = [(a, b) for a, b in (precedence or set())
+                   if a in free and b in free and a != b]
+
     best_route = None
     best_dist = float('inf')
 
     perms = itertools.permutations(reachable) if reachable else iter([()])
     for perm in perms:
+        if order_pairs:
+            pos = {sid: i for i, sid in enumerate(perm)}
+            if any(pos[a] > pos[b] for a, b in order_pairs):
+                continue
         nodes = [home_id] + list(perm) + pinned + [home_id]
         total = 0
         valid = True
@@ -2511,17 +2524,24 @@ def _solve_tsp(waypoints, home_id, matrix, end_id=None):
             best_route = list(perm) + pinned
 
     if best_route is None:
+        if order_pairs:
+            # Contradictory precedence (e.g. two chains feeding factories
+            # in each other's systems) — fall back to pure shortest tour.
+            return _solve_tsp(waypoints, home_id, matrix, end_id=end_id)
         return list(reachable) + pinned, -1
     return best_route, best_dist
 
 
 def _compute_route_cost(system_set, home_id, sell_system_id, system_ids,
-                        matrix, haul_cfg, planet_stops):
+                        matrix, haul_cfg, planet_stops, precedence=None):
     """Compute route cost for a layout's daily circuit.
 
     Route: home -> extraction/factory systems (TSP) -> sell hub -> home.
     Sell system is pinned as the last stop before returning home (goods
     must be collected before they can be sold).
+    precedence: set of (extractor_system, factory_system) name pairs —
+    the factory stop must come after the extractors feeding it, since
+    the P1 is dropped off on the same circuit it is collected.
     """
     id_to_name = {v: k for k, v in system_ids.items()}
 
@@ -2543,8 +2563,15 @@ def _compute_route_cost(system_set, home_id, sell_system_id, system_ids,
                 matrix[(sell_system_id, nid)] = jumps
                 matrix[(nid, sell_system_id)] = jumps
 
+    prec_ids = set()
+    for before, after in (precedence or set()):
+        a, b = system_ids.get(before), system_ids.get(after)
+        if a and b and a != b:
+            prec_ids.add((a, b))
+
     waypoints = list(waypoint_ids)
-    route, total_jumps = _solve_tsp(waypoints, home_id, matrix, end_id=end_id)
+    route, total_jumps = _solve_tsp(waypoints, home_id, matrix,
+                                    end_id=end_id, precedence=prec_ids)
 
     if total_jumps < 0:
         fallback_nodes = set(waypoints) | ({end_id} if end_id else set())
@@ -2704,13 +2731,15 @@ def _interesting_systems(ctx, home_name):
 
 
 def _cached_route(actual_systems, sell_id, planet_stops, home_id, system_ids,
-                  matrix, haul_cfg, cache):
-    """Route cost with TSP results cached by (system set, sell hub)."""
-    rkey = (frozenset(actual_systems), sell_id)
+                  matrix, haul_cfg, cache, precedence=None):
+    """Route cost with TSP results cached by (system set, sell hub, precedence)."""
+    precedence = frozenset(precedence or set())
+    rkey = (frozenset(actual_systems), sell_id, precedence)
     base = cache.get(rkey)
     if base is None:
         base = _compute_route_cost(actual_systems, home_id, sell_id,
-                                   system_ids, matrix, haul_cfg, 0)
+                                   system_ids, matrix, haul_cfg, 0,
+                                   precedence=precedence)
         cache[rkey] = base
     route = dict(base)
     route_seconds = (route["tour_jumps"] * haul_cfg["sec_per_jump"]
@@ -2724,17 +2753,31 @@ def _cached_route(actual_systems, sell_id, planet_stops, home_id, system_ids,
 
 
 def _layout_systems_and_stops(allocated):
-    """Unique systems visited and total planet stops for a chain set."""
+    """Unique systems visited, total planet stops, and visit-order
+    precedence pairs for a chain set.
+
+    Precedence: for each chain, the factory planet's system must be
+    visited after every system hosting one of that chain's extractors —
+    the hauler collects P1 and drops it at the factory on the same
+    circuit (picking up the previous batch's output there).
+    """
     actual_systems = set()
     planet_stops = 0
+    precedence = set()
     for vc in allocated:
         planets = vc.get("planets_used", [])
         planet_stops += len(planets) or vc.get("planet_count", 1) or 1
+        extr_sys, fac_sys = set(), set()
         for p in planets:
             s = p.get("system", "")
             if s:
                 actual_systems.add(s)
-    return actual_systems, planet_stops
+                (fac_sys if p.get("is_factory") else extr_sys).add(s)
+        for f in fac_sys:
+            for e in extr_sys:
+                if e != f:
+                    precedence.add((e, f))
+    return actual_systems, planet_stops, precedence
 
 
 def _finalize_layout(cand, ctx, ectx, matrix, home_id, system_ids, cfg,
@@ -2770,9 +2813,10 @@ def _finalize_layout(cand, ctx, ectx, matrix, home_id, system_ids, cfg,
 
     total_net = sum(vc.get("adjusted_net_isk_hr", 0) for vc in allocated)
     sell_id = _determine_sell_system(allocated, market_prices, system_ids)
-    actual_systems, planet_stops = _layout_systems_and_stops(allocated)
+    actual_systems, planet_stops, precedence = _layout_systems_and_stops(allocated)
     route = _cached_route(actual_systems, sell_id, planet_stops, home_id,
-                          system_ids, matrix, cfg["haul"], route_cache)
+                          system_ids, matrix, cfg["haul"], route_cache,
+                          precedence=precedence)
     trips = _compute_trips_per_day(allocated, cfg["hauler_m3"])
     daily_haul = route["route_minutes"] * trips
     route["trips_per_day"] = trips
@@ -2893,10 +2937,11 @@ def allocate_system_first(ranked_chains, planet_inv, matrix, home_id,
 
             sell_id = _determine_sell_system(best_combo, market_prices,
                                              system_ids)
-            actual_systems, planet_stops = _layout_systems_and_stops(best_combo)
+            actual_systems, planet_stops, precedence = \
+                _layout_systems_and_stops(best_combo)
             route = _cached_route(actual_systems, sell_id, planet_stops,
                                   home_id, system_ids, matrix, haul_cfg,
-                                  route_cache)
+                                  route_cache, precedence=precedence)
             trips = _compute_trips_per_day(best_combo, cfg["hauler_m3"])
             daily_haul = route["route_minutes"] * trips
             if max_haul_minutes and daily_haul > max_haul_minutes:
@@ -4032,6 +4077,39 @@ def self_test():
     check("TSP sell==waypoint dedup", tsp_dup == [2, 3],
           f"route={tsp_dup}")
     check("TSP sell==waypoint distance", tsp_dup_d == 10, f"got {tsp_dup_d}")
+
+    # Factory system pinned after its extractor systems: without the
+    # constraint 1->4->3->2->1 (13) ties 1->2->3->4->1; require 4 (factory)
+    # after both 2 and 3 (extractors) — only ascending order is valid.
+    tsp_prec, tsp_prec_d = _solve_tsp([2, 3, 4], 1, mock_matrix,
+                                      precedence={(2, 4), (3, 4)})
+    check("TSP precedence: factory last", tsp_prec == [2, 3, 4],
+          f"route={tsp_prec}")
+    check("TSP precedence distance", tsp_prec_d == 13, f"got {tsp_prec_d}")
+
+    # A single pair flips which of two equal-length tours is chosen
+    tsp_rev, tsp_rev_d = _solve_tsp([2, 4], 1, mock_matrix,
+                                    precedence={(4, 2)})
+    check("TSP precedence: reversed order honoured", tsp_rev == [4, 2],
+          f"route={tsp_rev}")
+    check("TSP precedence reversed distance", tsp_rev_d == 14,
+          f"got {tsp_rev_d}")
+
+    # Contradictory precedence falls back to pure shortest tour
+    tsp_cyc, tsp_cyc_d = _solve_tsp([2, 3], 1, mock_matrix,
+                                    precedence={(2, 3), (3, 2)})
+    check("TSP precedence cycle falls back", tsp_cyc_d == 10,
+          f"route={tsp_cyc}, d={tsp_cyc_d}")
+
+    # _layout_systems_and_stops emits (extractor_sys, factory_sys) pairs
+    mock_alloc = [{"planets_used": [
+        {"system": "SysA", "type": "Oceanic 1", "role": "Extract"},
+        {"system": "SysB", "type": "Barren 1", "role": "Factory",
+         "is_factory": True}]}]
+    _sys, _stops, _prec = _layout_systems_and_stops(mock_alloc)
+    check("Layout precedence pairs", _prec == {("SysA", "SysB")},
+          f"got {_prec}")
+    check("Layout stops counted", _stops == 2, f"got {_stops}")
 
     # ── Ignored systems ──
     print("\nIgnored systems:")

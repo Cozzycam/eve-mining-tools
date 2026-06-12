@@ -1,5 +1,28 @@
 # EVE Mining Tools — Handover Notes
 
+## PI Dossier (v3.3) — 2026-06-12 — Route honours collect-before-drop order
+
+The TSP picked the shortest tour with only the sell hub pinned last, so a
+factory system could land *before* the extractor systems feeding it — the
+route told you to visit the factory empty-handed (reported on the live
+Guidance Systems layout: Home → Intaki(factory) → Ekuenbiron → Vaere →
+sell). Daily circuit is collect P1 → drop at factory + pick up output →
+sell, so order matters.
+
+- `_layout_systems_and_stops` now also returns precedence pairs
+  `(extractor_system, factory_system)` per chain (from `is_factory` on
+  `planets_used` entries; co-located extractor+factory adds no pair).
+- `_solve_tsp(..., precedence=)` filters permutations violating any pair.
+  Pairs involving home or the pinned sell hub are skipped (home is first,
+  sell is last — trivially fine). Contradictory pairs (two chains with
+  factories in each other's extractor systems) fall back to the
+  unconstrained shortest tour rather than the -1 estimate path.
+- `_cached_route` cache key now includes the precedence set (same system
+  set + sell hub can need different orders for different chain mixes).
+- Self-test: precedence ordering, equal-length tie flip, cycle fallback,
+  `_layout_systems_and_stops` pair extraction — all pass; verified on
+  live data (factory system now routed after its extractor systems).
+
 ## PI Dossier (v3.2) — 2026-06-11 — Switchable per-layout map routes
 
 `_generate_system_map_svg` draws every recommended layout's route in its
