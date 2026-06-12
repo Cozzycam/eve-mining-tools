@@ -2808,7 +2808,7 @@ async function importPiData(input) {
 async function doPi() {
   const btn = document.getElementById('pi-btn');
   btn.disabled = true;
-  piStatus('<span class="spinner"></span>Generating PI dossier&hellip; this takes 30-60s, first run slower');
+  piStatus('<span class="spinner"></span>Generating PI dossier&hellip; 1-2 min locally, can be several minutes on the server &mdash; leave this tab open');
   document.getElementById('pi-results').classList.add('hidden');
 
   const hauler = parseFloat(document.getElementById('pi-hauler').value);
@@ -3099,6 +3099,33 @@ function copyPiMarkdown() {
 </html>"""
 
 
+# ── PI generation single-flight ──────────────────────────────
+# PI generation takes minutes on a small VPS, and a browser that times
+# out does NOT stop the server-side thread — every retry would stack
+# another multi-GB computation. Identical requests share one run;
+# different-param runs queue behind _PI_COMPUTE_LOCK so at most one
+# allocator is resident at a time.
+_PI_RUNS = {}
+_PI_RUNS_LOCK = threading.Lock()
+_PI_COMPUTE_LOCK = threading.Lock()
+
+
+def _pi_generate_worker(key, overrides, run):
+    import pi_dossier
+    try:
+        with _PI_COMPUTE_LOCK:
+            run["result"][0] = pi_dossier.generate_pi_dossier_data(
+                overrides=overrides if overrides else None)
+        print(f"  PI: done.")
+    except Exception as e:
+        run["result"][0] = {"error": f"PI dossier generation failed: {e}"}
+        print(f"  PI: failed: {e}")
+    finally:
+        with _PI_RUNS_LOCK:
+            _PI_RUNS.pop(key, None)
+        run["done"].set()
+
+
 class ScanHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -3209,15 +3236,32 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             try: overrides["max_market_jumps"] = int(qs["max_market_jumps"][0])
             except ValueError: pass
 
-        print(f"  PI: generating dossier...")
+        key = tuple(sorted(overrides.items()))
+        with _PI_RUNS_LOCK:
+            run = _PI_RUNS.get(key)
+            if run is None:
+                run = {"done": threading.Event(), "result": [None]}
+                _PI_RUNS[key] = run
+                threading.Thread(target=_pi_generate_worker,
+                                 args=(key, overrides, run),
+                                 daemon=True).start()
+                print(f"  PI: generating dossier...")
+            else:
+                print(f"  PI: joining in-flight generation...")
+
+        # Stream a 1-space heartbeat every 10s while the worker computes,
+        # so the browser's idle-socket timeout (~5 min) never fires.
+        # Leading whitespace is ignored by resp.json()/JSON.parse.
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
         try:
-            data = pi_dossier.generate_pi_dossier_data(
-                overrides=overrides if overrides else None)
-        except Exception as e:
-            self._send_json({"error": f"PI dossier generation failed: {e}"}, 500)
-            return
-        print(f"  PI: done.")
-        self._send_json(data)
+            while not run["done"].wait(10):
+                self.wfile.write(b" ")
+                self.wfile.flush()
+            self.wfile.write(json.dumps(run["result"][0]).encode())
+        except (ConnectionError, OSError):
+            pass  # client gave up; shared computation continues for retries
 
     def do_POST(self):
         parsed = urlparse(self.path)
