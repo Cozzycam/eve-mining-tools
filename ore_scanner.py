@@ -523,9 +523,9 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
                            secs_per_jump=SECS_PER_JUMP, max_jumps=None):
     """Find best region to sell reprocessed materials for an ore.
 
-    For the local region (where the player mines), travel is 0 — reprocess
-    in station and sell to local buy orders.  Other regions require hauling
-    minerals to their trade hub, so full jump count applies.
+    Minerals are valued at each region's best (hub) buy order, so every
+    region — including the player's local one — costs the haul to that hub;
+    the cheapest hub by ISK/hr after travel wins.
 
     When compress_in_hold is True, ISK/hr scoring uses the base (uncompressed)
     hold so that travel distance matters when choosing regions.
@@ -565,17 +565,16 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
 
         repro_jumps = None
         if from_system_id is not None:
-            if rkey == local_region_key:
-                # Local region: reprocess in station, sell locally — no travel
-                repro_jumps = 0
-            else:
-                hub_sid = _get_hub_system_id(rkey)
-                if hub_sid:
-                    repro_jumps = get_jump_count(from_system_id, hub_sid)
-                    if repro_jumps < 0:
-                        continue  # unreachable
-                    if max_jumps is not None and repro_jumps > max_jumps:
-                        continue  # beyond the jump budget
+            # Minerals sell at the region's trade hub (repro_val is the
+            # region-best buy), so even the local region costs the haul to
+            # its hub — there's no genuine 0-travel reprocess sale.
+            hub_sid = _get_hub_system_id(rkey)
+            if hub_sid:
+                repro_jumps = get_jump_count(from_system_id, hub_sid)
+                if repro_jumps < 0:
+                    continue  # unreachable
+                if max_jumps is not None and repro_jumps > max_jumps:
+                    continue  # beyond the jump budget
 
         repro_isk_hr = None
         if yield_m3_min > 0:
@@ -1486,6 +1485,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .ship-form input[type="text"] { width: 160px; }
   .ship-form input[type="number"] { width: 110px; }
 
+  tbody tr:hover { background: rgba(88,166,255,0.06); }
+  .sel-row { outline: 1px solid var(--accent); outline-offset: -1px; }
+  .sell-opts { margin: 8px 0 4px; }
+  .sell-opts-h { color: var(--dim); font-size: 0.78em; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.03em; }
+  .sell-opt { font-size: 0.86em; padding: 2px 0; color: var(--dim); }
+  .sell-opt-best { color: var(--text); }
+  .sell-opt .so-at { color: var(--text); }
+  .sell-opt .so-j { color: var(--accent); }
+  .sell-opt .so-hr { color: var(--green); }
+  .sell-opt .so-pick { color: var(--accent); font-size: 0.85em; }
+
   @keyframes spin { to { transform: rotate(360deg); } }
   .spinner {
     display: inline-block;
@@ -2221,6 +2231,12 @@ function showChart(typeKey, oreName) {
 let lastSortKey = null;
 let lastSortAsc = false;
 let lastData = null;
+let selectedTypeId = null;  // ore pinned in the detail card (by type_id)
+
+function selectOre(typeId) {
+  selectedTypeId = (selectedTypeId === typeId) ? null : typeId;
+  if (lastData) renderResults(lastData, true);
+}
 
 function sortResults(key) {
   if (!lastData) return;
@@ -2243,6 +2259,55 @@ function sortResults(key) {
 function pathBadge(p) {
   const labels = {raw:'Raw', compressed:'Comp', reprocess:'Repro', buyback:'Buyback'};
   return '<span class="path-badge path-' + p + '">' + (labels[p] || p) + '</span>';
+}
+
+// Detail card for one ore: headline best path + a "where to sell" breakdown
+// comparing every available path (location, distance, ISK/hr).
+function summaryCardHtml(top, holdSize, taxPct, taxMul) {
+  let h = '<div class="summary">';
+  h += '<h3>' + top.name + ' ' + pathBadge(top.best_path) + '</h3>';
+  if (top.best_isk_hr > 0) {
+    h += '<div class="stat"><span class="isk-hr-big">~' + fmtIsk(top.best_isk_hr) + ' ISK/hr</span></div>';
+  }
+  h += '<div class="stat"><strong>' + fmtNum(top.best_isk_m3) + ' ISK/m&sup3;</strong></div>';
+  const topHold = top.best_isk_hold || 0;
+  if (topHold > 0) {
+    h += '<div class="stat"><span>Full hold (' + holdSize.toLocaleString() + ' m&sup3;):</span> <strong>~' + fmtIsk(topHold) + ' ISK</strong></div>';
+    if (taxPct > 0) {
+      const th = topHold * taxMul;
+      h += '<div class="stat"><span>After ' + taxPct + '% tax:</span> <strong class="take-home">~' + fmtIsk(th) + ' ISK</strong> <span class="tax-cut">(-' + fmtIsk(topHold - th) + ')</span></div>';
+    }
+  }
+
+  // Where to sell: one line per available path
+  const opts = [];
+  if (top.isk_m3 > 0) opts.push({path:'raw', m3:top.isk_m3, hr:top.isk_hr, at:(top.station_name || top.system_name || 'local'), jumps:top.jumps});
+  if (top.comp_isk_m3 > 0) opts.push({path:'compressed', m3:top.comp_isk_m3, hr:top.comp_isk_hr, at:(top.comp_system_name || 'hub'), jumps:top.comp_jumps});
+  if (top.repro_isk_m3 > 0) opts.push({path:'reprocess', m3:top.repro_isk_m3, hr:top.repro_isk_hr, at:(top.repro_hub || 'hub'), jumps:top.repro_jumps});
+  if (top.buyback_isk_m3 > 0) opts.push({path:'buyback', m3:top.buyback_isk_m3, hr:top.buyback_isk_hr, at:'Local (buyback)', jumps:0});
+  if (opts.length) {
+    h += '<div class="sell-opts"><div class="sell-opts-h">Where to sell:</div>';
+    opts.forEach(o => {
+      const best = o.path === top.best_path;
+      const j = (o.jumps !== null && o.jumps !== undefined && o.jumps >= 0) ? (o.jumps + 'j') : '';
+      const metric = o.hr > 0 ? fmtIsk(o.hr) + '/hr' : fmtNum(o.m3) + ' ISK/m³';
+      h += '<div class="sell-opt' + (best ? ' sell-opt-best' : '') + '">' +
+           pathBadge(o.path) + ' <span class="so-at">' + o.at + '</span> ' +
+           (j ? '<span class="so-j">' + j + '</span> ' : '') +
+           '<span class="so-hr">' + metric + '</span>' +
+           (best ? ' <span class="so-pick">&#9664; best</span>' : '') + '</div>';
+    });
+    h += '</div>';
+  }
+
+  // Raw-ore market depth — only meaningful for a raw sale
+  if (top.order_count > 0) {
+    h += '<div class="stat"><span>Raw ore demand:</span> <strong>' + (top.demand ? top.demand.toLocaleString() : '0') + ' units</strong> across ' + top.order_count + ' buy orders</div>';
+  } else {
+    h += '<div class="stat"><span>Raw ore market:</span> <strong>no raw buy orders</strong> &mdash; reprocess/buyback only</div>';
+  }
+  h += '</div>';
+  return h;
 }
 
 function renderResults(data, isResort) {
@@ -2298,7 +2363,8 @@ function renderResults(data, isResort) {
 
   rows.forEach((r, i) => {
     const isBest = i === 0 && (r.best_isk_m3 > 0);
-    html += '<tr class="' + (isBest ? 'best-row' : '') + '">';
+    const isSel = selectedTypeId !== null && r.type_id === selectedTypeId;
+    html += '<tr class="' + (isBest ? 'best-row ' : '') + (isSel ? 'sel-row' : '') + '" onclick="selectOre(' + r.type_id + ')" style="cursor:pointer">';
     html += '<td class="num">' + (r.best_isk_m3 > 0 ? i + 1 : '--') + '</td>';
     html += '<td>' + r.name + (isBest ? '<span class="badge">BEST</span>' : '') + '</td>';
 
@@ -2360,31 +2426,13 @@ function renderResults(data, isResort) {
   });
   html += '</tbody></table></div>';
 
-  // Summary card
-  const top = rows.length && rows[0].best_isk_m3 > 0 ? rows[0] : null;
-  if (top) {
-    const sellAt = top.best_sell_at || top.station_name || top.system_name || 'Unknown';
-    html += '<div class="summary">';
-    html += '<h3>' + top.name + ' ' + pathBadge(top.best_path) + '</h3>';
-    if (top.best_isk_hr > 0) {
-      html += '<div class="stat"><span class="isk-hr-big">~' + fmtIsk(top.best_isk_hr) + ' ISK/hr</span></div>';
-    }
-    html += '<div class="stat"><strong>' + fmtNum(top.best_isk_m3) + ' ISK/m&sup3;</strong></div>';
-    const topHold = top.best_isk_hold || 0;
-    if (topHold > 0) {
-      html += '<div class="stat"><span>Full hold (' + holdSize.toLocaleString() + ' m&sup3;):</span> <strong>~' + fmtIsk(topHold) + ' ISK</strong></div>';
-      if (taxPct > 0) {
-        const th = topHold * taxMul;
-        html += '<div class="stat"><span>After ' + taxPct + '% tax:</span> <strong class="take-home">~' + fmtIsk(th) + ' ISK</strong> <span class="tax-cut">(-' + fmtIsk(topHold - th) + ')</span></div>';
-      }
-    }
-    html += '<div class="stat"><span>Sell at:</span> <strong>' + sellAt + '</strong></div>';
-    if (top.best_jumps !== null && top.best_jumps !== undefined && top.best_jumps >= 0) {
-      html += '<div class="stat"><span>Distance:</span> <strong>' + top.best_jumps + ' jump' + (top.best_jumps !== 1 ? 's' : '') + '</strong></div>';
-    }
-    html += '<div class="stat"><span>Demand:</span> <strong>' + (top.demand ? top.demand.toLocaleString() : '?') + ' units</strong> across ' + top.order_count + ' buy orders</div>';
-    html += '</div>';
+  // Detail card — for the clicked ore, or the best one by default
+  let detail = null;
+  if (rows.length) {
+    if (selectedTypeId !== null) detail = rows.find(r => r.type_id === selectedTypeId) || null;
+    if (!detail && rows[0].best_isk_m3 > 0) detail = rows[0];
   }
+  if (detail) html += summaryCardHtml(detail, holdSize, taxPct, taxMul);
 
   resultsEl.innerHTML = html;
   resultsEl.classList.remove('hidden');

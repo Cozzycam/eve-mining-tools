@@ -1,5 +1,30 @@
 # EVE Mining Tools — Handover Notes
 
+## Ore Scanner — 2026-06-15 — Repro jumps fix + clickable per-ore detail
+
+Follow-ups to the max-sell-jumps work, from a live screenshot showing
+every R4 ore as "REPRO @ Cistuvaert, 0 jumps" while the player was in
+Jufvitte (4j from Cistuvaert):
+
+- **Reprocess no longer claims 0 travel for the local region.** Mineral
+  value is the region-*best* (hub) buy, so selling means hauling to that
+  hub — `calc_best_repro_region` now costs `jumps→hub` for every region
+  including the local one (removed the `rkey==local_region_key → 0`
+  special case). Now repro hubs vary per ore and respect max_jumps
+  honestly (verified: Glistening Bitumens reprocesses best at Dodixie 8j,
+  Glistening Zeolites at Cistuvaert 4j).
+- **Detail card is now click-driven.** Was hardcoded to `rows[0]`. Table
+  rows are clickable (`selectOre(type_id)`, toggles); `selectedTypeId`
+  pins the card to any ore so you can inspect Brimful Bitumens etc.
+  Selected row gets a `.sel-row` outline.
+- **New "Where to sell" breakdown** in the card (`summaryCardHtml`):
+  one line per available path (raw/comp/repro/buyback) with sell
+  location, one-way jumps, and ISK/hr (or ISK/m³), best flagged.
+- **Demand line fixed.** It reflects *raw-ore* buy orders; on ores with
+  no raw market (moon ore → reprocess) it showed "? units / 0 buy
+  orders". Now relabelled "Raw ore demand" and, when 0 orders, shows
+  "no raw buy orders — reprocess/buyback only".
+
 ## Ore Scanner — 2026-06-15 — Max sell jumps + drop Solo yield box
 
 **Solo yield box removed** from the top row — yield is now per ship
