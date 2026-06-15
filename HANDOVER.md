@@ -1,5 +1,34 @@
 # EVE Mining Tools — Handover Notes
 
+## Ore Scanner — 2026-06-15 — Gas harvesting + Compare tab
+
+**Gas clouds** added as a new ore category (`cat="gas"`). 25 gases,
+IDs + volumes confirmed via ESI:
+- cls 9 Mykoserocin (highsec booster gas, 8 colours, 10 m³ each)
+- cls 10 Cytoserocin (lowsec/null booster gas, 8 colours, 10 m³ each)
+- cls 11 Fullerite (WH/null reaction gas, 9 types, 1–10 m³)
+No reprocess (not in REPRO_VARIANTS) and no compression (not in
+COMP_IDS), so only the raw + buyback paths apply — falls out naturally.
+Yield is entered as effective m³/min on the ship profile (same formula
+as mining), so make a separate ship profile for gas (e.g. "Venture
+(gas)") with its hold + harvest rate. Dropdown gains a "Gas Clouds"
+optgroup; `scan()` handles `ore_class=="gas"`; JS clsLabels/oreCounts
+updated (total ORES now 194).
+
+**Compare tab** — snapshot scanner setups and run them side by side.
+- "+ Add to Compare" button on the scanner snapshots the current config
+  (ship, region, ore class, from, max jumps, repro, buyback, compress,
+  fleet boost, tax) → `compareScenarios` in localStorage (`oreCompare`),
+  auto-labelled "Ship · OreClass · Region".
+- Compare tab lists scenarios as removable chips; "Run comparison"
+  fetches each via `/api/scan` (Promise.all) using `scenarioParams()`
+  (rebuilds params from the saved ship's hold/yield/jumpSecs + boost).
+- `renderCompare()` draws a side-by-side table: Setup, Top ore (+path),
+  ISK/hr, ISK/m³, Full hold (+net after that scenario's tax), Sell at
+  (+jumps), Next best (top 2-4). Winning column (by ISK/hr, or ISK/m³ if
+  no yield) gets a green BEST highlight.
+- `switchTab` extended for `tab-compare`; renders scenarios on entry.
+
 ## Ore Scanner — 2026-06-15 — Reprocess per-product breakdown ("show both")
 
 Player reprocesses raw ore as their main path (compression is the rare

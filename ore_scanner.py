@@ -424,6 +424,45 @@ for _outcomes in RANDOM_REPRO_RANGES.values():
     for _mat_id, _, _ in _outcomes:
         REPRO_MATERIAL_IDS.add(_mat_id)
 
+# ── Gas clouds (harvested with gas cloud harvesters) ─────────
+# No reprocessing or compression — sold raw (or via buyback).  Yield is
+# entered as effective m³/min on the ship profile, same as mining lasers.
+# IDs + volumes confirmed via ESI.  cls: 9 Mykoserocin (highsec),
+# 10 Cytoserocin (lowsec/null), 11 Fullerite (wormhole/null).
+GAS_CLOUDS = [
+    # Mykoserocin — highsec booster gas (10 m³ each)
+    {"id": 28694, "name": "Amber Mykoserocin",     "vol": 10.0, "cls": 9},
+    {"id": 28695, "name": "Azure Mykoserocin",     "vol": 10.0, "cls": 9},
+    {"id": 28696, "name": "Celadon Mykoserocin",   "vol": 10.0, "cls": 9},
+    {"id": 28697, "name": "Golden Mykoserocin",    "vol": 10.0, "cls": 9},
+    {"id": 28698, "name": "Lime Mykoserocin",      "vol": 10.0, "cls": 9},
+    {"id": 28699, "name": "Malachite Mykoserocin", "vol": 10.0, "cls": 9},
+    {"id": 28700, "name": "Vermillion Mykoserocin","vol": 10.0, "cls": 9},
+    {"id": 28701, "name": "Viridian Mykoserocin",  "vol": 10.0, "cls": 9},
+    # Cytoserocin — lowsec/null booster gas (10 m³ each)
+    {"id": 25268, "name": "Amber Cytoserocin",     "vol": 10.0, "cls": 10},
+    {"id": 25279, "name": "Azure Cytoserocin",     "vol": 10.0, "cls": 10},
+    {"id": 25275, "name": "Celadon Cytoserocin",   "vol": 10.0, "cls": 10},
+    {"id": 25273, "name": "Golden Cytoserocin",    "vol": 10.0, "cls": 10},
+    {"id": 25277, "name": "Lime Cytoserocin",      "vol": 10.0, "cls": 10},
+    {"id": 25276, "name": "Malachite Cytoserocin", "vol": 10.0, "cls": 10},
+    {"id": 25278, "name": "Vermillion Cytoserocin","vol": 10.0, "cls": 10},
+    {"id": 25274, "name": "Viridian Cytoserocin",  "vol": 10.0, "cls": 10},
+    # Fullerite — wormhole/null reaction gas (variable volume)
+    {"id": 30375, "name": "Fullerite-C28",  "vol": 2.0,  "cls": 11},
+    {"id": 30376, "name": "Fullerite-C32",  "vol": 5.0,  "cls": 11},
+    {"id": 30370, "name": "Fullerite-C50",  "vol": 1.0,  "cls": 11},
+    {"id": 30371, "name": "Fullerite-C60",  "vol": 1.0,  "cls": 11},
+    {"id": 30372, "name": "Fullerite-C70",  "vol": 1.0,  "cls": 11},
+    {"id": 30373, "name": "Fullerite-C72",  "vol": 2.0,  "cls": 11},
+    {"id": 30374, "name": "Fullerite-C84",  "vol": 2.0,  "cls": 11},
+    {"id": 30377, "name": "Fullerite-C320", "vol": 5.0,  "cls": 11},
+    {"id": 30378, "name": "Fullerite-C540", "vol": 10.0, "cls": 11},
+]
+# Each gas is its own group (no variants to collapse)
+for _g in GAS_CLOUDS:
+    _g["group"] = _g["name"]
+
 # Assign categories and combine into single ORES list
 for _o in BELT_ORES:
     _o["cat"] = "belt"
@@ -431,7 +470,9 @@ for _o in MOON_ORES:
     _o["cat"] = "moon"
 for _o in ERRATIC_ORES:
     _o["cat"] = "erratic"
-ORES = BELT_ORES + MOON_ORES + ERRATIC_ORES
+for _o in GAS_CLOUDS:
+    _o["cat"] = "gas"
+ORES = BELT_ORES + MOON_ORES + ERRATIC_ORES + GAS_CLOUDS
 
 SHIPS = {
     "venture":   5000,
@@ -777,6 +818,8 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
         ores = [o for o in ORES if o["cat"] == "moon"]
     elif ore_class == "erratic":
         ores = [o for o in ORES if o["cat"] == "erratic"]
+    elif ore_class == "gas":
+        ores = [o for o in ORES if o["cat"] == "gas"]
     else:
         try:
             cls_int = int(ore_class)
@@ -1556,6 +1599,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .repro-tbl .so-hr { color: var(--green); }
   .repro-tbl .so-j { color: var(--accent); }
 
+  .compare-intro { color: var(--dim); font-size: 0.9em; max-width: 760px; margin: 4px 0 14px; }
+  .compare-empty { color: var(--dim); font-size: 0.9em; }
+  .compare-actions { margin: 14px 0; display: flex; gap: 8px; }
+  .scenario-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .scenario-chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 16px; padding: 5px 6px 5px 14px; font-size: 0.85em;
+  }
+  .scenario-chip .chip-x {
+    background: transparent; border: none; color: var(--dim);
+    cursor: pointer; font-size: 1.1em; line-height: 1; padding: 0 4px;
+  }
+  .scenario-chip .chip-x:hover { color: var(--red); }
+  .compare-tbl { border-collapse: collapse; }
+  .compare-tbl th, .compare-tbl td {
+    border: 1px solid var(--border); padding: 8px 12px;
+    text-align: left; vertical-align: top; font-size: 0.88em;
+  }
+  .compare-tbl thead th { background: var(--surface); }
+  .compare-metric { color: var(--dim); font-weight: 600; white-space: nowrap; }
+  .compare-sub { color: var(--dim); font-size: 0.85em; }
+  .compare-win { background: rgba(63,185,80,0.07); }
+  .compare-tbl thead .compare-win { background: rgba(63,185,80,0.14); }
+  .win-badge {
+    background: var(--green); color: #0d1117; font-size: 0.7em;
+    font-weight: 700; padding: 1px 6px; border-radius: 4px; vertical-align: middle;
+  }
+  .compare-list { line-height: 1.5; }
+
   @keyframes spin { to { transform: rotate(360deg); } }
   .spinner {
     display: inline-block;
@@ -1586,6 +1659,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <button class="tab active" data-tab="scanner" onclick="switchTab('scanner')">Ore Scanner</button>
   <button class="tab" data-tab="fitter" onclick="switchTab('fitter')">Ship Fitter</button>
   <button class="tab" data-tab="pi" onclick="switchTab('pi')">PI Dossier</button>
+  <button class="tab" data-tab="compare" onclick="switchTab('compare')">Compare</button>
 </div>
 
 <div id="tab-scanner">
@@ -1622,6 +1696,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </optgroup>
       <optgroup label="Erratic Ores">
         <option value="erratic">Erratic (Phased Fields)</option>
+      </optgroup>
+      <optgroup label="Gas Clouds">
+        <option value="gas">All gas</option>
+        <option value="9">Mykoserocin (Highsec)</option>
+        <option value="10">Cytoserocin (Lowsec/Null)</option>
+        <option value="11">Fullerite (Wormhole/Null)</option>
       </optgroup>
     </select>
   </div>
@@ -1671,6 +1751,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <label for="show-paths">Show all paths</label>
   </div>
   <button id="scan-btn">Scan</button>
+  <button id="add-compare-btn" class="ghost-btn" onclick="addToCompare()" title="Snapshot this ship + ore class + region setup into the Compare tab">+ Add to Compare</button>
   <div class="auto-wrap">
     <input type="checkbox" id="auto-refresh" style="width:16px;height:16px;accent-color:var(--accent);">
     <label for="auto-refresh" style="font-size:0.85em;color:var(--dim);cursor:pointer;">Auto</label>
@@ -1784,6 +1865,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div id="pi-status"></div>
 <div id="pi-results" class="hidden"></div>
 </div><!-- /tab-pi -->
+
+<div id="tab-compare" class="hidden">
+  <p class="compare-intro">Snapshot setups from the <strong>Ore Scanner</strong> tab (configure ship + ore class + region + options, then hit <strong>+ Add to Compare</strong>) and run them side by side &mdash; e.g. R4 moon in your Mackinaw vs lowsec belts in your Procurer.</p>
+  <div id="compare-scenarios"></div>
+  <div class="compare-actions">
+    <button id="compare-run-btn" onclick="runCompare()">Run comparison</button>
+    <button class="ghost-btn" onclick="clearCompare()">Clear all</button>
+  </div>
+  <div id="compare-status"></div>
+  <div id="compare-results"></div>
+</div><!-- /tab-compare -->
 
 <script>
 const REGIONS = __REGIONS_JSON__;
@@ -2021,8 +2113,8 @@ async function doScan() {
   scanBtn.disabled = true;
   statusEl.className = '';
   const clsVal = document.getElementById('ore-class').value;
-  const clsLabels = {'0':'all ores','belt':'all belt','1':'Highsec','2':'Lowsec','3':'Nullsec','moon':'all moon','4':'R4','5':'R8','6':'R16','7':'R32','8':'R64','erratic':'Erratic'};
-  const oreCounts = {'0':169,'belt':108,'1':32,'2':42,'3':34,'moon':60,'4':12,'5':12,'6':12,'7':12,'8':12,'erratic':1};
+  const clsLabels = {'0':'all ores','belt':'all belt','1':'Highsec','2':'Lowsec','3':'Nullsec','moon':'all moon','4':'R4','5':'R8','6':'R16','7':'R32','8':'R64','erratic':'Erratic','gas':'all gas','9':'Mykoserocin','10':'Cytoserocin','11':'Fullerite'};
+  const oreCounts = {'0':194,'belt':108,'1':32,'2':42,'3':34,'moon':60,'4':12,'5':12,'6':12,'7':12,'8':12,'erratic':1,'gas':25,'9':8,'10':8,'11':9};
   const clsLabel = clsLabels[clsVal] || 'ores';
   const oreCount = oreCounts[clsVal] || 168;
   const reproPct = document.getElementById('repro-pct').value;
@@ -2524,15 +2616,193 @@ function renderResults(data, isResort) {
 }
 
 // ── Tab switching ──
+// ── Compare tab ──────────────────────────────────────────────
+let compareScenarios = [];
+try { compareScenarios = JSON.parse(localStorage.getItem('oreCompare') || '[]'); } catch(e) {}
+function saveCompare() { try { localStorage.setItem('oreCompare', JSON.stringify(compareScenarios)); } catch(e) {} }
+
+function clsLabelFor(v) {
+  const m = {'0':'All ores','belt':'All belt','1':'Highsec','2':'Lowsec','3':'Nullsec','moon':'All moon','4':'R4','5':'R8','6':'R16','7':'R32','8':'R64','erratic':'Erratic','gas':'All gas','9':'Mykoserocin','10':'Cytoserocin','11':'Fullerite'};
+  return m[v] || v;
+}
+
+function addToCompare() {
+  const ship = currentShip();
+  const regionObj = REGIONS.find(r => r.key === regionSel.value) || {};
+  const cls = document.getElementById('ore-class').value;
+  const sc = {
+    id: 'c' + Date.now() + '_' + Math.floor(Math.random() * 1000),
+    ship: ship.name,
+    region: regionSel.value,
+    regionName: regionObj.name || regionSel.value,
+    cls: cls,
+    from: document.getElementById('from-system').value.trim(),
+    maxjumps: document.getElementById('max-jumps').value.trim(),
+    repro: document.getElementById('repro-pct').value,
+    buyback: document.getElementById('buyback-pct').value,
+    compress: document.getElementById('compress-hold').checked,
+    fleetBoost: fleetCheck.checked,
+    boostPct: document.getElementById('boost-pct').value,
+    tax: document.getElementById('tax-rate').value,
+  };
+  sc.label = ship.name + ' · ' + clsLabelFor(cls) + ' · ' + sc.regionName;
+  compareScenarios.push(sc);
+  saveCompare();
+  renderCompareScenarios();
+  const btn = document.getElementById('add-compare-btn');
+  const orig = btn.textContent;
+  btn.textContent = '✓ Added to Compare';
+  setTimeout(() => { btn.textContent = orig; }, 1300);
+}
+
+function removeScenario(id) {
+  compareScenarios = compareScenarios.filter(s => s.id !== id);
+  saveCompare();
+  renderCompareScenarios();
+}
+function clearCompare() {
+  compareScenarios = [];
+  saveCompare();
+  renderCompareScenarios();
+  document.getElementById('compare-results').innerHTML = '';
+}
+
+function renderCompareScenarios() {
+  const el = document.getElementById('compare-scenarios');
+  if (!el) return;
+  if (!compareScenarios.length) {
+    el.innerHTML = '<p class="compare-empty">No scenarios yet. Go to the <strong>Ore Scanner</strong> tab, set things up, and click "+ Add to Compare".</p>';
+    return;
+  }
+  let h = '<div class="scenario-chips">';
+  compareScenarios.forEach(s => {
+    h += '<div class="scenario-chip"><span>' + s.label + '</span>' +
+         '<button class="chip-x" onclick="removeScenario(\'' + s.id + '\')" title="Remove">&times;</button></div>';
+  });
+  h += '</div>';
+  el.innerHTML = h;
+}
+
+function scenarioParams(s) {
+  const ship = ships.find(x => x.name === s.ship) || currentShip();
+  const params = new URLSearchParams();
+  params.set('region', s.region);
+  params.set('hold', Math.round(ship.hold) || 5000);
+  if (ship.jumpSecs > 0) params.set('jumpsecs', ship.jumpSecs);
+  if (s.from) params.set('from', s.from);
+  if (s.maxjumps !== '' && s.from) params.set('maxjumps', s.maxjumps);
+  let yld = parseFloat(ship.yield) || 0;
+  if (s.fleetBoost && yld) {
+    const bp = parseFloat(s.boostPct) || 0;
+    if (bp > 0 && bp < 100) yld = yld / (1 - bp / 100);
+  }
+  if (yld > 0) params.set('yield', yld.toFixed(2));
+  if (s.cls !== '0') params.set('cls', s.cls);
+  if (s.compress) params.set('compress', '1');
+  if (s.repro) params.set('repro', s.repro);
+  if (s.buyback) params.set('buyback', s.buyback);
+  return params;
+}
+
+async function runCompare() {
+  if (!compareScenarios.length) return;
+  const btn = document.getElementById('compare-run-btn');
+  btn.disabled = true;
+  const status = document.getElementById('compare-status');
+  status.className = '';
+  status.innerHTML = '<span class="spinner"></span>Running ' + compareScenarios.length + ' scenario(s)… (first run slower)';
+  try {
+    const settled = await Promise.all(compareScenarios.map(async s => {
+      try {
+        const resp = await fetch('/api/scan?' + scenarioParams(s).toString());
+        const data = await resp.json();
+        return { s, data, error: data.error || null };
+      } catch (e) { return { s, data: null, error: e.message }; }
+    }));
+    renderCompare(settled);
+    status.textContent = '';
+  } catch (e) {
+    status.className = 'error';
+    status.textContent = 'Compare failed: ' + e.message;
+  }
+  btn.disabled = false;
+}
+
+function renderCompare(settled) {
+  const el = document.getElementById('compare-results');
+  if (!settled.length) { el.innerHTML = ''; return; }
+  const tops = settled.map(x =>
+    (x.data && x.data.results && x.data.results.length && x.data.results[0].best_isk_m3 > 0)
+      ? x.data.results[0] : null);
+  const useHr = tops.some(t => t && t.best_isk_hr > 0);
+  let bestIdx = -1, bestVal = -1;
+  tops.forEach((t, i) => {
+    if (!t) return;
+    const v = useHr ? (t.best_isk_hr || 0) : (t.best_isk_m3 || 0);
+    if (v > bestVal) { bestVal = v; bestIdx = i; }
+  });
+
+  const cmpRow = (label, fn) => {
+    let r = '<tr><td class="compare-metric">' + label + '</td>';
+    settled.forEach((x, i) => {
+      r += '<td class="' + (i === bestIdx ? 'compare-win' : '') + '">' + fn(x, tops[i], i) + '</td>';
+    });
+    return r + '</tr>';
+  };
+
+  let h = '<div class="results-wrap"><table class="compare-tbl"><thead><tr><th></th>';
+  settled.forEach((x, i) => {
+    h += '<th class="' + (i === bestIdx ? 'compare-win' : '') + '">' + x.s.label +
+         (i === bestIdx ? ' <span class="win-badge">BEST</span>' : '') + '</th>';
+  });
+  h += '</tr></thead><tbody>';
+
+  h += cmpRow('Setup', (x) => {
+    const sub = [];
+    if (x.s.from) sub.push('from ' + x.s.from);
+    if (x.s.maxjumps && x.s.from) sub.push('≤' + x.s.maxjumps + 'j sell');
+    if (x.s.repro) sub.push('repro ' + x.s.repro + '%');
+    if (x.s.buyback) sub.push('bb ' + x.s.buyback + '%');
+    if (x.s.compress) sub.push('compress');
+    if (x.s.fleetBoost) sub.push('fleet boost');
+    return '<span class="compare-sub">' + (sub.join(' · ') || 'no extras') + '</span>';
+  });
+  h += cmpRow('Top ore', (x, t) => t ? (t.name + ' ' + pathBadge(t.best_path))
+        : (x.error ? '<span class="error">' + x.error + '</span>' : '<span class="compare-sub">no results</span>'));
+  if (useHr) h += cmpRow('ISK/hr', (x, t) => (t && t.best_isk_hr > 0) ? '<span class="isk-hr">' + fmtIsk(t.best_isk_hr) + '</span>' : '—');
+  h += cmpRow('ISK/m³', (x, t) => t ? fmtNum(t.best_isk_m3) : '—');
+  h += cmpRow('Full hold', (x, t) => {
+    if (!t) return '—';
+    const tax = parseFloat(x.s.tax) || 0;
+    const net = (t.best_isk_hold || 0) * (1 - tax / 100);
+    return '~' + fmtIsk(t.best_isk_hold || 0) + (tax > 0 ? ' <span class="compare-sub">(' + fmtIsk(net) + ' net)</span>' : '');
+  });
+  h += cmpRow('Sell at', (x, t) => t ? ((t.best_sell_at || '—') +
+        (t.best_jumps != null ? ' <span class="so-j">' + t.best_jumps + 'j</span>' : '')) : '—');
+  h += cmpRow('Next best', (x) => {
+    if (!x.data || !x.data.results) return '—';
+    const next = x.data.results.filter(r => r.best_isk_m3 > 0).slice(1, 4);
+    if (!next.length) return '<span class="compare-sub">—</span>';
+    return '<div class="compare-list">' + next.map(r => r.name +
+        ' <span class="compare-sub">' + (useHr && r.best_isk_hr > 0 ? fmtIsk(r.best_isk_hr) + '/hr' : fmtNum(r.best_isk_m3) + '/m³') + '</span>'
+      ).join('<br>') + '</div>';
+  });
+
+  h += '</tbody></table></div>';
+  el.innerHTML = h;
+}
+
 function switchTab(tab) {
   document.querySelectorAll('.tab-bar button').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-scanner').classList.add('hidden');
   document.getElementById('tab-fitter').classList.add('hidden');
   document.getElementById('tab-pi').classList.add('hidden');
+  document.getElementById('tab-compare').classList.add('hidden');
   document.getElementById('tab-' + tab).classList.remove('hidden');
   document.querySelector('.tab-bar button[data-tab="' + tab + '"]').classList.add('active');
   try { localStorage.setItem('activeTab', tab); } catch(e) {}
   if (tab === 'pi' && !piConfigLoaded) loadPiConfig();
+  if (tab === 'compare') renderCompareScenarios();
 }
 
 // Show public note if not running locally
