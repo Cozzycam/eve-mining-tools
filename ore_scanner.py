@@ -350,6 +350,18 @@ REPRO_FORMULAS = {
     82205: [(34, 800), (40, 40)],                            # Ueganite → Tritanium, Megacyte
 }
 
+# Reprocessing output names (minerals + moon materials) for breakdown display.
+MATERIAL_NAMES = {
+    34: "Tritanium", 35: "Pyerite", 36: "Mexallon", 37: "Isogen",
+    38: "Nocxium", 39: "Zydrine", 40: "Megacyte", 11399: "Morphite",
+    16633: "Hydrocarbons", 16634: "Atmospheric Gases", 16635: "Evaporite Deposits",
+    16636: "Silicates", 16637: "Tungsten", 16638: "Titanium", 16639: "Scandium",
+    16640: "Cobalt", 16641: "Chromium", 16642: "Vanadium", 16643: "Cadmium",
+    16644: "Platinum", 16646: "Mercury", 16647: "Caesium", 16648: "Hafnium",
+    16649: "Technetium", 16650: "Dysprosium", 16651: "Neodymium",
+    16652: "Promethium", 16653: "Thulium",
+}
+
 # Map every moon ore variant → (base_ore_id, yield_multiplier)
 REPRO_VARIANTS = {}
 _MOON_BASES = [45490, 45491, 45492, 45493,   # R4
@@ -545,6 +557,8 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
 
     best = None
     best_score = -1
+    chosen_rkey = None
+    in_range_prices = {}  # rkey → mat_prices for every hub within the jump budget
 
     for rkey, mat_prices in all_region_mat_prices.items():
         if compress_in_hold and rkey != local_region_key:
@@ -576,6 +590,8 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
                 if max_jumps is not None and repro_jumps > max_jumps:
                     continue  # beyond the jump budget
 
+        in_range_prices[rkey] = mat_prices  # passed all gates → a real option
+
         repro_isk_hr = None
         if yield_m3_min > 0:
             score_isk_hold = repro_isk_m3 * score_hold
@@ -598,6 +614,41 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
                 result["repro_isk_m3_min"] = min_isk / (100 * ore_vol)
                 result["repro_isk_m3_max"] = max_isk / (100 * ore_vol)
             best = result
+            chosen_rkey = rkey
+
+    # ── Per-product breakdown (deterministic ores only) ──────────
+    # ISK/hr above uses the realistic one-hub basket; here we also expose,
+    # for each output, the best hub within range so the player can see the
+    # split-sell upside.
+    if best is not None and not is_random and ore_id in REPRO_VARIANTS and chosen_rkey:
+        base_id, multiplier = REPRO_VARIANTS[ore_id]
+        # per-100-units mineral qty → per-full-hold qty
+        hold_units_factor = hold_size / (100 * ore_vol) if ore_vol > 0 else 0
+        chosen_prices = in_range_prices.get(chosen_rkey, {})
+        products = []
+        split_total = 0.0
+        for mat_id, base_qty in REPRO_FORMULAS.get(base_id, []):
+            qty_hold = int(base_qty * multiplier * repro_efficiency) * hold_units_factor
+            chosen_price = chosen_prices.get(mat_id, 0)
+            chosen_val = qty_hold * chosen_price
+            best_rk, best_price = chosen_rkey, chosen_price
+            for rk, mp in in_range_prices.items():
+                p = mp.get(mat_id, 0)
+                if p > best_price:
+                    best_price, best_rk = p, rk
+            best_val = qty_hold * best_price
+            split_total += best_val
+            products.append({
+                "name": MATERIAL_NAMES.get(mat_id, f"Material {mat_id}"),
+                "qty": qty_hold,
+                "chosen_val": chosen_val,
+                "best_val": best_val,
+                "best_hub": REGION_HUBS[best_rk],
+                "same": best_rk == chosen_rkey,
+            })
+        best["repro_products"] = products
+        best["repro_split_isk_hold"] = split_total
+        best["repro_region_key"] = chosen_rkey
 
     return best
 
@@ -658,6 +709,7 @@ def _empty_result(ore, order_count=0, demand=0):
             "repro_isk_m3": 0, "repro_isk_hold": 0, "repro_isk_hr": None,
             "repro_jumps": None, "repro_region": None, "repro_hub": None,
             "repro_isk_m3_min": None, "repro_isk_m3_max": None,
+            "repro_products": None, "repro_split_isk_hold": None,
             "buyback_isk_m3": 0, "buyback_isk_hold": 0, "buyback_isk_hr": None,
             "buyback_type": None,
             "best_path": "raw", "best_isk_m3": 0, "best_isk_hr": None,
@@ -899,6 +951,8 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
                 entry["repro_hub"] = repro["repro_hub"]
                 entry["repro_isk_m3_min"] = repro.get("repro_isk_m3_min")
                 entry["repro_isk_m3_max"] = repro.get("repro_isk_m3_max")
+                entry["repro_products"] = repro.get("repro_products")
+                entry["repro_split_isk_hold"] = repro.get("repro_split_isk_hold")
 
         # ── Path 4: Buyback (zero travel) ──
         if buyback_rate > 0:
@@ -1495,6 +1549,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .sell-opt .so-j { color: var(--accent); }
   .sell-opt .so-hr { color: var(--green); }
   .sell-opt .so-pick { color: var(--accent); font-size: 0.85em; }
+  .repro-bd { margin: 10px 0 4px; }
+  .repro-tbl { width: auto; border-collapse: collapse; font-size: 0.84em; }
+  .repro-tbl td { padding: 2px 14px 2px 0; border: none; }
+  .repro-tbl td.num { text-align: right; }
+  .repro-tbl .so-hr { color: var(--green); }
+  .repro-tbl .so-j { color: var(--accent); }
 
   @keyframes spin { to { transform: rotate(360deg); } }
   .spinner {
@@ -1589,7 +1649,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span class="hint">Accounting skill reduces this</span>
   </div>
   <div class="cb-field">
-    <input type="checkbox" id="compress-hold" checked>
+    <input type="checkbox" id="compress-hold">
     <label for="compress-hold">Compress in hold</label>
   </div>
   <div class="field">
@@ -2297,6 +2357,31 @@ function summaryCardHtml(top, holdSize, taxPct, taxMul) {
            '<span class="so-hr">' + metric + '</span>' +
            (best ? ' <span class="so-pick">&#9664; best</span>' : '') + '</div>';
     });
+    h += '</div>';
+  }
+
+  // Reprocess output breakdown — every product, value at the one-trip hub,
+  // and which hub pays best (with the split-sell upside).
+  if (top.repro_products && top.repro_products.length) {
+    const oneTrip = top.repro_isk_hold || 0;
+    const split = top.repro_split_isk_hold || 0;
+    const upside = oneTrip > 0 ? ((split / oneTrip - 1) * 100) : 0;
+    const hubCount = new Set(top.repro_products.map(p => p.best_hub)).size;
+    h += '<div class="repro-bd"><div class="sell-opts-h">Reprocess output &mdash; full hold (one trip @ ' + (top.repro_hub || 'hub') + ')</div>';
+    h += '<table class="repro-tbl"><tbody>';
+    top.repro_products.forEach(p => {
+      h += '<tr><td>' + p.name + '</td>' +
+           '<td class="num">' + p.qty.toLocaleString() + '</td>' +
+           '<td class="num">' + fmtIsk(p.chosen_val) + '</td>' +
+           '<td>' + (p.same
+              ? '<span class="so-hr">&#10003; ' + p.best_hub + '</span>'
+              : '<span class="so-j">' + p.best_hub + ' &#8599;</span>') + '</td></tr>';
+    });
+    h += '</tbody></table>';
+    h += '<div class="stat" style="margin-top:6px;"><span>One trip total:</span> <strong>~' + fmtIsk(oneTrip) + '</strong></div>';
+    if (split > oneTrip + 1) {
+      h += '<div class="stat"><span>Split-sell max (' + hubCount + ' hubs):</span> <strong class="so-hr">~' + fmtIsk(split) + '</strong> <span class="tax-cut">(+' + upside.toFixed(1) + '%)</span></div>';
+    }
     h += '</div>';
   }
 
@@ -3675,6 +3760,18 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
         def _r(v):
             return round(v, 2) if v is not None else None
 
+        def _round_products(prods):
+            if not prods:
+                return None
+            return [{
+                "name": p["name"],
+                "qty": int(round(p["qty"])),
+                "chosen_val": round(p["chosen_val"], 2),
+                "best_val": round(p["best_val"], 2),
+                "best_hub": p["best_hub"],
+                "same": p["same"],
+            } for p in prods]
+
         out = []
         for r in results:
             entry = {
@@ -3709,6 +3806,8 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
                 "repro_region": r.get("repro_region"),
                 "repro_isk_m3_min": _r(r.get("repro_isk_m3_min")),
                 "repro_isk_m3_max": _r(r.get("repro_isk_m3_max")),
+                "repro_products": _round_products(r.get("repro_products")),
+                "repro_split_isk_hold": _r(r.get("repro_split_isk_hold")),
                 # Buyback
                 "buyback_isk_m3": _r(r.get("buyback_isk_m3", 0)),
                 "buyback_isk_hold": _r(r.get("buyback_isk_hold", 0)),

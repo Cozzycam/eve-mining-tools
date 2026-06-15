@@ -1,5 +1,31 @@
 # EVE Mining Tools — Handover Notes
 
+## Ore Scanner — 2026-06-15 — Reprocess per-product breakdown ("show both")
+
+Player reprocesses raw ore as their main path (compression is the rare
+fleet-dependent case), so the repro path got a per-product breakdown.
+ISK/hr still uses the realistic one-hub basket; the detail card now also
+exposes where each output sells best and the split-sell upside.
+
+- `MATERIAL_NAMES` static map (28 IDs: minerals 34-40 + 11399, moon goo
+  16633-16653) — names confirmed via ESI /universe/names. R64: 16650
+  Dysprosium, 16651 Neodymium, 16652 Promethium, 16653 Thulium.
+- `calc_best_repro_region` now records `in_range_prices` (every hub that
+  passed the jump/range gate) + `chosen_rkey`, then builds
+  `repro_products` [{name, qty (per full hold), chosen_val (@ best basket
+  hub), best_val, best_hub, same}] + `repro_split_isk_hold` (Σ best_val).
+  Deterministic ores only (random/erratic skipped).
+- Threaded through scan entry + JSON (`_round_products` rounds qty→int,
+  vals→2dp). New keys: `repro_products`, `repro_split_isk_hold`.
+- Detail card (`summaryCardHtml`): "Reprocess output — full hold" table
+  (product · qty · value @ one-trip hub · best hub, ✓ when same / ↗ when
+  it sells better elsewhere), plus "One trip total" vs "Split-sell max
+  (N hubs) +X%". Verified: Glistening Bitumens one-trip @ Jita 9.24M,
+  split-sell 9.92M (+7.4%; Pyerite→Cistuvaert, Mexallon→Dodixie).
+- **"Compress in hold" now defaults OFF** (compression is the exception).
+- Note: per-product best hubs respect Max sell jumps (only in-range hubs
+  considered for both basket and split).
+
 ## Ore Scanner — 2026-06-15 — Repro jumps fix + clickable per-ore detail
 
 Follow-ups to the max-sell-jumps work, from a live screenshot showing
