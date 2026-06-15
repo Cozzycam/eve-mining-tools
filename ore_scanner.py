@@ -520,7 +520,7 @@ def calc_random_repro_range(ore_id, material_prices, repro_efficiency):
 def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
                            from_system_id, hold_size, ore_vol, yield_m3_min,
                            local_region_key=None, compress_in_hold=False,
-                           secs_per_jump=SECS_PER_JUMP):
+                           secs_per_jump=SECS_PER_JUMP, max_jumps=None):
     """Find best region to sell reprocessed materials for an ore.
 
     For the local region (where the player mines), travel is 0 — reprocess
@@ -574,6 +574,8 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
                     repro_jumps = get_jump_count(from_system_id, hub_sid)
                     if repro_jumps < 0:
                         continue  # unreachable
+                    if max_jumps is not None and repro_jumps > max_jumps:
+                        continue  # beyond the jump budget
 
         repro_isk_hr = None
         if yield_m3_min > 0:
@@ -664,8 +666,12 @@ def _empty_result(ore, order_count=0, demand=0):
 
 
 def _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min,
-                     secs_per_jump=SECS_PER_JUMP):
-    """Evaluate raw/compressed buy orders and return best (travel-aware if from_system)."""
+                     secs_per_jump=SECS_PER_JUMP, max_jumps=None):
+    """Evaluate raw/compressed buy orders and return best (travel-aware if from_system).
+
+    max_jumps caps how far (one-way) an order may be to count; orders you can
+    sell to from your current system are always 0 jumps and unaffected.
+    """
     if not buy_orders:
         return None
     units_per_hold = int(hold_size / ore["vol"]) if ore["vol"] > 0 else 0
@@ -682,6 +688,8 @@ def _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min,
         for order in viable[:5]:
             sell_local, eff_jumps, sl_label = evaluate_order_range(order, from_system_id)
             if eff_jumps < 0:
+                continue
+            if max_jumps is not None and eff_jumps > max_jumps:
                 continue
             isk_m3 = order["price"] / ore["vol"]
             isk_hold = order["price"] * units_per_hold
@@ -708,7 +716,7 @@ def _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min,
 def scan(region_id, hold_size, show_all=False, ore_class="0",
          from_system_id=None, yield_m3_min=0,
          repro_efficiency=0, buyback_rate=0, region_key=None,
-         compress_in_hold=False, secs_per_jump=SECS_PER_JUMP):
+         compress_in_hold=False, secs_per_jump=SECS_PER_JUMP, max_jumps=None):
     # Filter ores by class/category
     if ore_class == "0" or ore_class == 0:
         ores = ORES
@@ -727,6 +735,20 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
     results = []
     travel_aware = from_system_id is not None
     jita_region_id = REGIONS["jita"]["id"]
+
+    # ── Trade hubs within the jump budget (one-way), computed once ──
+    # Used to widen the raw sell search and to gate the cross-region
+    # compressed/reprocess searches.  Empty when max_jumps is unset
+    # (→ no gating, preserving prior behaviour).
+    reachable_hubs = {}  # region_key → one-way jumps to that region's hub
+    if from_system_id is not None and max_jumps is not None:
+        for rkey in REGIONS:
+            hub_sid = _get_hub_system_id(rkey)
+            if hub_sid is None:
+                continue
+            j = get_jump_count(from_system_id, hub_sid)
+            if j is not None and 0 <= j <= max_jumps:
+                reachable_hubs[rkey] = j
 
     # ── Pre-fetch: material prices across all regions for repro ──
     all_region_mat_prices = {}
@@ -756,7 +778,36 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
 
         # ── Path 1: Raw ore (skip when compressing — you sell compressed) ──
         if not compress_in_hold:
-            raw = _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min, secs_per_jump)
+            raw = _eval_best_order(buy_orders, ore, hold_size, from_system_id,
+                                   yield_m3_min, secs_per_jump, max_jumps)
+            # Widen: also check other trade hubs within the jump budget and
+            # keep whichever destination gives the best ISK/hr after the haul.
+            if max_jumps is not None and from_system_id is not None:
+                best_raw = raw
+                best_raw_score = (raw.get("isk_hr") or raw.get("isk_m3") or -1) if raw else -1
+                units_per_hold = int(hold_size / ore["vol"]) if ore["vol"] > 0 else 0
+                for rkey, hub_jumps in reachable_hubs.items():
+                    if rkey == region_key or units_per_hold <= 0:
+                        continue  # local region already covered above
+                    hub_orders = fetch_buy_orders(REGIONS[rkey]["id"], ore["id"])
+                    hub_buys = [o for o in hub_orders if o.get("is_buy_order", True)] if hub_orders else []
+                    viable = [o for o in hub_buys if units_per_hold >= o.get("min_volume", 1)]
+                    bo = max(viable, key=lambda o: o["price"], default=None) if viable else None
+                    if bo is None:
+                        time.sleep(0.08)
+                        continue
+                    isk_m3 = bo["price"] / ore["vol"]
+                    isk_hold = bo["price"] * units_per_hold
+                    isk_hr = calc_isk_hr(isk_hold, hold_size, yield_m3_min, hub_jumps, secs_per_jump) if yield_m3_min > 0 else None
+                    score = isk_hr if isk_hr else isk_m3
+                    if score > best_raw_score:
+                        best_raw_score = score
+                        best_raw = {"price": bo["price"], "isk_m3": isk_m3, "isk_hold": isk_hold,
+                                    "isk_hr": isk_hr, "jumps": hub_jumps,
+                                    "system_id": bo.get("system_id"), "location_id": bo.get("location_id"),
+                                    "sell_local": False, "sell_local_label": None}
+                    time.sleep(0.08)
+                raw = best_raw
             if raw:
                 entry["best_buy"] = raw["price"]
                 entry["isk_m3"] = raw["isk_m3"]
@@ -777,6 +828,11 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
                 best_comp = None
                 units_per_hold = int(hold_size / comp_ore["vol"]) if comp_ore["vol"] > 0 else 0
                 for rkey, rinfo in REGIONS.items():
+                    # Honour the jump budget: skip hubs out of range before
+                    # spending an API call on them (local region always kept).
+                    if (max_jumps is not None and rkey != region_key
+                            and from_system_id is not None and rkey not in reachable_hubs):
+                        continue
                     comp_orders = fetch_buy_orders(rinfo["id"], COMP_IDS[ore["id"]])
                     comp_buys = [o for o in comp_orders if o.get("is_buy_order", True)] if comp_orders else []
                     if not comp_buys or units_per_hold <= 0:
@@ -784,7 +840,7 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
                         continue
                     if rkey == region_key:
                         # Same region: normal travel-aware eval
-                        comp_eval = _eval_best_order(comp_buys, comp_ore, hold_size, from_system_id, yield_m3_min, secs_per_jump)
+                        comp_eval = _eval_best_order(comp_buys, comp_ore, hold_size, from_system_id, yield_m3_min, secs_per_jump, max_jumps)
                     else:
                         # Other region: best price + travel to hub
                         viable = [o for o in comp_buys if units_per_hold >= o.get("min_volume", 1)]
@@ -818,7 +874,7 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
             else:
                 comp_orders = fetch_buy_orders(region_id, COMP_IDS[ore["id"]])
                 comp_buys = [o for o in comp_orders if o.get("is_buy_order", True)] if comp_orders else []
-                comp_eval = _eval_best_order(comp_buys, comp_ore, hold_size, from_system_id, yield_m3_min, secs_per_jump)
+                comp_eval = _eval_best_order(comp_buys, comp_ore, hold_size, from_system_id, yield_m3_min, secs_per_jump, max_jumps)
             if comp_eval:
                 entry["comp_buy"] = comp_eval["price"]
                 entry["comp_isk_m3"] = comp_eval["isk_m3"]
@@ -834,7 +890,7 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
                 from_system_id, hold_size, ore["vol"], yield_m3_min,
                 local_region_key=region_key,
                 compress_in_hold=compress_in_hold,
-                secs_per_jump=secs_per_jump)
+                secs_per_jump=secs_per_jump, max_jumps=max_jumps)
             if repro:
                 entry["repro_isk_m3"] = repro["repro_isk_m3"]
                 entry["repro_isk_hold"] = repro["repro_isk_hold"]
@@ -1504,9 +1560,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <input type="text" id="from-system" placeholder="e.g. Cistuvaert" spellcheck="false">
   </div>
   <div class="field">
-    <label>Solo yield (m&sup3;/min)</label>
-    <input type="number" id="yield-rate" placeholder="80" min="1" step="1">
-    <span class="hint">Unboosted laser + drones</span>
+    <label>Max sell jumps</label>
+    <input type="number" id="max-jumps" placeholder="off" min="0" step="1" style="width:70px">
+    <span class="hint">One-way to hub. Needs your system.</span>
   </div>
   <div class="cb-field">
     <input type="checkbox" id="fleet-boost">
@@ -1577,6 +1633,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div class="footer">
   Prices = highest buy order in region (instant sell). Material prices cached ~5 min server-side.<br>
   ISK/hr: per-ship jump time (round trip) + 1 min dock/sell/undock. Reprocess searches all 6 regions for best hub. Buyback = Jita buy &times; rate%, 0 travel.<br>
+  Max sell jumps caps how far (one-way to hub) a sell destination may be; within that budget the scanner weighs hauling to Dodixie/Jita/etc against selling local by ISK/hr. Needs your system. Blank = no limit.<br>
   Best Path picks raw/compressed/reprocess/buyback by highest ISK/hr (or ISK/m&sup3; if no yield entered).
 </div>
 </div><!-- /tab-scanner -->
@@ -1709,11 +1766,7 @@ function populateShipDropdown(selectName) {
 }
 populateShipDropdown();
 
-shipSel.addEventListener('change', () => {
-  const sh = currentShip();
-  if (sh && sh.yield > 0) document.getElementById('yield-rate').value = sh.yield;
-  saveSettings();
-});
+shipSel.addEventListener('change', () => { saveSettings(); });
 
 // Ship editor
 const shipEditor = document.getElementById('ship-editor');
@@ -1774,7 +1827,6 @@ document.getElementById('se-save').addEventListener('click', () => {
   saveShips();
   populateShipDropdown(name);
   renderShipList();
-  if (ship.yield > 0) document.getElementById('yield-rate').value = ship.yield;
   saveSettings();
 });
 
@@ -1786,7 +1838,8 @@ fleetCheck.addEventListener('change', () => {
 });
 
 function getEffectiveYield() {
-  const solo = parseFloat(document.getElementById('yield-rate').value) || 0;
+  // Solo (unboosted) yield comes from the selected ship profile.
+  const solo = parseFloat(currentShip().yield) || 0;
   if (!fleetCheck.checked || !solo) return solo;
   const boostPct = parseFloat(document.getElementById('boost-pct').value) || 0;
   if (boostPct <= 0 || boostPct >= 100) return solo;
@@ -1849,7 +1902,7 @@ try {
   if (saved.region) regionSel.value = saved.region;
   if (saved.ship && ships.some(s => s.name === saved.ship)) shipSel.value = saved.ship;
   if (saved.fromSystem) document.getElementById('from-system').value = saved.fromSystem;
-  if (saved.yieldRate) document.getElementById('yield-rate').value = saved.yieldRate;
+  if (saved.maxJumps) document.getElementById('max-jumps').value = saved.maxJumps;
   if (saved.showAll) document.getElementById('show-all').checked = true;
   if (saved.reproPct) document.getElementById('repro-pct').value = saved.reproPct;
   if (saved.compressHold !== undefined) document.getElementById('compress-hold').checked = saved.compressHold;
@@ -1880,7 +1933,7 @@ function saveSettings() {
       region: regionSel.value,
       ship: shipSel.value,
       fromSystem: document.getElementById('from-system').value,
-      yieldRate: document.getElementById('yield-rate').value,
+      maxJumps: document.getElementById('max-jumps').value,
       showAll: document.getElementById('show-all').checked,
       reproPct: document.getElementById('repro-pct').value,
       compressHold: document.getElementById('compress-hold').checked,
@@ -1920,6 +1973,8 @@ async function doScan() {
   if (ship.jumpSecs > 0) params.set('jumpsecs', ship.jumpSecs);
   const fromSys = document.getElementById('from-system').value.trim();
   if (fromSys) params.set('from', fromSys);
+  const maxJ = document.getElementById('max-jumps').value.trim();
+  if (maxJ !== '' && fromSys) params.set('maxjumps', maxJ);
   const effectiveYield = getEffectiveYield();
   if (effectiveYield > 0) params.set('yield', effectiveYield.toFixed(2));
   if (clsVal !== '0') params.set('cls', clsVal);
@@ -1957,7 +2012,16 @@ async function doScan() {
 
     const now = new Date();
     const ts = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0') + ':' + now.getSeconds().toString().padStart(2,'0');
-    statusEl.textContent = 'Last scan: ' + ts;
+    let statusMsg = 'Last scan: ' + ts;
+    if (data.max_jumps !== null && data.max_jumps !== undefined) {
+      if (data.reachable_hubs && data.reachable_hubs.length) {
+        const hubs = data.reachable_hubs.map(h => h.hub + ' (' + h.jumps + 'j)').join(', ');
+        statusMsg += ' · Hubs ≤' + data.max_jumps + 'j one-way: ' + hubs;
+      } else {
+        statusMsg += ' · No hubs within ' + data.max_jumps + 'j (selling in-region only)';
+      }
+    }
+    statusEl.textContent = statusMsg;
 
     if (autoCheck.checked) startAutoRefresh();
   } catch (e) {
@@ -3521,6 +3585,15 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 pass
 
+        max_jumps = None
+        if "maxjumps" in qs and qs["maxjumps"][0].strip() != "":
+            try:
+                mj = int(float(qs["maxjumps"][0]))
+                if mj >= 0:
+                    max_jumps = mj
+            except ValueError:
+                pass
+
         from_system_id = None
         from_name = qs.get("from", [None])[0]
         if from_name and from_name.strip():
@@ -3535,8 +3608,21 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
                        from_system_id=from_system_id, yield_m3_min=yield_m3_min,
                        repro_efficiency=repro_efficiency,
                        buyback_rate=buyback_rate, region_key=region_key,
-                       compress_in_hold=compress_in_hold, secs_per_jump=secs_per_jump)
+                       compress_in_hold=compress_in_hold, secs_per_jump=secs_per_jump,
+                       max_jumps=max_jumps)
         results = enrich_results(results, from_system_id=from_system_id)
+
+        # Which trade hubs are within the jump budget (one-way) — for the UI
+        reachable_hubs = []
+        if from_system_id is not None and max_jumps is not None:
+            for rkey in REGIONS:
+                hub_sid = _get_hub_system_id(rkey)
+                if hub_sid is None:
+                    continue
+                j = get_jump_count(from_system_id, hub_sid)
+                if j is not None and 0 <= j <= max_jumps:
+                    reachable_hubs.append({"hub": REGION_HUBS[rkey], "jumps": j})
+            reachable_hubs.sort(key=lambda x: x["jumps"])
 
         def _r(v):
             return round(v, 2) if v is not None else None
@@ -3593,6 +3679,8 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
         self._send_json({
             "region": region["name"],
             "hold_size": hold_size,
+            "max_jumps": max_jumps,
+            "reachable_hubs": reachable_hubs,
             "results": out,
         })
 

@@ -1,5 +1,39 @@
 # EVE Mining Tools — Handover Notes
 
+## Ore Scanner — 2026-06-15 — Max sell jumps + drop Solo yield box
+
+**Solo yield box removed** from the top row — yield is now per ship
+(stored on the ship profile). `getEffectiveYield()` reads
+`currentShip().yield` as the unboosted base; fleet boost still multiplies
+on top. Dropped `yieldRate` from settings save/load and the auto-fill
+hooks (no `yield-rate` element remains).
+
+**Max sell jumps** (`#max-jumps`, one-way to hub; needs Your system):
+caps how far a sell destination may be, and within that budget the
+scanner weighs hauling to Dodixie/Jita/etc against selling local by
+ISK/hr. Implementation:
+
+- `scan(max_jumps=)` computes `reachable_hubs` once (region_key → one-way
+  jumps) for hubs within budget; empty when `max_jumps` unset → no gating
+  (prior behaviour preserved).
+- **Raw path widened**: when `max_jumps` set + not compressing, after the
+  local-region eval it checks each in-budget hub's best buy for the raw
+  ore and keeps the best ISK/hr-after-haul. (Raw stays local-only when
+  `max_jumps` is blank — avoids 5×/ore calls by default.)
+- **Compressed loop gated**: skips out-of-budget hubs *before* the API
+  call (`rkey not in reachable_hubs`); local region always kept.
+- **Reprocess gated**: `calc_best_repro_region(max_jumps=)` skips
+  non-local regions whose hub is beyond budget.
+- **`_eval_best_order(max_jumps=)`**: drops individual orders >max_jumps
+  one-way (sell-local orders are 0j, always kept).
+- Handler parses `maxjumps`; response carries `max_jumps` +
+  `reachable_hubs` [{hub, jumps}]; status line shows "Hubs ≤Nj one-way:
+  …" or "No hubs within Nj (selling in-region only)".
+- Jumps shown are one-way; ISK/hr still costs the round trip (2×).
+- Verified live (Jufvitte): mj=8 → Cistuvaert(4)+Dodixie(8), Jita(13)
+  excluded, top raw ore sells at Dodixie; mj=3 → in-region only; mj=20
+  +compress → top picks Jita(13).
+
 ## Ore Scanner — 2026-06-15 — Saved ships + per-ship jump time
 
 Ship dropdown was hardcoded presets (hold size only) plus a "Custom…"
