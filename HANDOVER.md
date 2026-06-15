@@ -1,5 +1,28 @@
 # EVE Mining Tools — Handover Notes
 
+## Ore Scanner — 2026-06-15 — Saved ships + per-ship jump time
+
+Ship dropdown was hardcoded presets (hold size only) plus a "Custom…"
+hold field; yield and travel time were global. Numbers didn't reflect
+the player's skills/fit. Replaced with localStorage-backed **ship
+profiles**, each carrying its own stats:
+
+- `oreShips` in localStorage: `[{name, hold (m³), yield (m³/min,
+  unboosted), jumpSecs (avg time between jumps)}]`. Seeds Venture/
+  Procurer/Retriever/Covetor on first load (Venture 45s/jump, rest 66s).
+- Dropdown is populated from saved ships; "Manage ships" toggles an
+  inline editor (`#ship-editor`) to add/edit/delete. Selecting a ship
+  auto-fills the Solo yield field (if the ship has a yield) so fleet
+  boost still multiplies on top. `currentShip()` resolves the selection.
+- **Per-ship jump time** now drives ISK/hr. `calc_isk_hr(...,
+  secs_per_jump=SECS_PER_JUMP)` replaces the global 66s constant;
+  threaded through `_eval_best_order`, `calc_best_repro_region`, and
+  `scan(secs_per_jump=)`. Handler parses `jumpsecs` query param; frontend
+  sends `hold` + `jumpsecs` from the selected ship (no more `ship`/
+  `custom` branch). Default 66s preserves prior numbers exactly.
+- Backend `SHIPS` dict kept only as a fallback for the legacy `ship=`
+  query param; the JS `SHIPS` injection is now unused but harmless.
+
 ## Web server — 2026-06-12 — PI generate: single-flight + heartbeat
 
 User's VPS generate timed out (~5 min browser idle limit) and retries

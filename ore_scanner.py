@@ -519,7 +519,8 @@ def calc_random_repro_range(ore_id, material_prices, repro_efficiency):
 
 def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
                            from_system_id, hold_size, ore_vol, yield_m3_min,
-                           local_region_key=None, compress_in_hold=False):
+                           local_region_key=None, compress_in_hold=False,
+                           secs_per_jump=SECS_PER_JUMP):
     """Find best region to sell reprocessed materials for an ore.
 
     For the local region (where the player mines), travel is 0 — reprocess
@@ -577,7 +578,7 @@ def calc_best_repro_region(ore_id, all_region_mat_prices, repro_efficiency,
         repro_isk_hr = None
         if yield_m3_min > 0:
             score_isk_hold = repro_isk_m3 * score_hold
-            repro_isk_hr = calc_isk_hr(score_isk_hold, score_hold, yield_m3_min, repro_jumps)
+            repro_isk_hr = calc_isk_hr(score_isk_hold, score_hold, yield_m3_min, repro_jumps, secs_per_jump)
             score = repro_isk_hr or 0
         else:
             score = repro_isk_m3
@@ -662,7 +663,8 @@ def _empty_result(ore, order_count=0, demand=0):
             "best_isk_hold": 0, "best_sell_at": None, "best_jumps": None}
 
 
-def _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min):
+def _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min,
+                     secs_per_jump=SECS_PER_JUMP):
     """Evaluate raw/compressed buy orders and return best (travel-aware if from_system)."""
     if not buy_orders:
         return None
@@ -683,7 +685,7 @@ def _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min):
                 continue
             isk_m3 = order["price"] / ore["vol"]
             isk_hold = order["price"] * units_per_hold
-            isk_hr = calc_isk_hr(isk_hold, hold_size, yield_m3_min, eff_jumps) if yield_m3_min > 0 else None
+            isk_hr = calc_isk_hr(isk_hold, hold_size, yield_m3_min, eff_jumps, secs_per_jump) if yield_m3_min > 0 else None
             score = isk_hr if isk_hr else isk_m3
             if score > best_score:
                 best_score = score
@@ -696,7 +698,7 @@ def _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min):
         best_order = max(buy_orders, key=lambda o: o["price"])
         isk_m3 = best_order["price"] / ore["vol"]
         isk_hold = best_order["price"] * units_per_hold
-        isk_hr = calc_isk_hr(isk_hold, hold_size, yield_m3_min, None) if yield_m3_min > 0 else None
+        isk_hr = calc_isk_hr(isk_hold, hold_size, yield_m3_min, None, secs_per_jump) if yield_m3_min > 0 else None
         return {"price": best_order["price"], "isk_m3": isk_m3, "isk_hold": isk_hold,
                 "isk_hr": isk_hr, "jumps": None,
                 "system_id": best_order.get("system_id"), "location_id": best_order.get("location_id"),
@@ -706,7 +708,7 @@ def _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min):
 def scan(region_id, hold_size, show_all=False, ore_class="0",
          from_system_id=None, yield_m3_min=0,
          repro_efficiency=0, buyback_rate=0, region_key=None,
-         compress_in_hold=False):
+         compress_in_hold=False, secs_per_jump=SECS_PER_JUMP):
     # Filter ores by class/category
     if ore_class == "0" or ore_class == 0:
         ores = ORES
@@ -754,7 +756,7 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
 
         # ── Path 1: Raw ore (skip when compressing — you sell compressed) ──
         if not compress_in_hold:
-            raw = _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min)
+            raw = _eval_best_order(buy_orders, ore, hold_size, from_system_id, yield_m3_min, secs_per_jump)
             if raw:
                 entry["best_buy"] = raw["price"]
                 entry["isk_m3"] = raw["isk_m3"]
@@ -782,7 +784,7 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
                         continue
                     if rkey == region_key:
                         # Same region: normal travel-aware eval
-                        comp_eval = _eval_best_order(comp_buys, comp_ore, hold_size, from_system_id, yield_m3_min)
+                        comp_eval = _eval_best_order(comp_buys, comp_ore, hold_size, from_system_id, yield_m3_min, secs_per_jump)
                     else:
                         # Other region: best price + travel to hub
                         viable = [o for o in comp_buys if units_per_hold >= o.get("min_volume", 1)]
@@ -800,7 +802,7 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
                                 if jumps < 0:
                                     time.sleep(0.08)
                                     continue
-                        isk_hr = calc_isk_hr(isk_hold, hold_size, yield_m3_min, jumps) if yield_m3_min > 0 else None
+                        isk_hr = calc_isk_hr(isk_hold, hold_size, yield_m3_min, jumps, secs_per_jump) if yield_m3_min > 0 else None
                         comp_eval = {"price": best_order["price"], "isk_m3": isk_m3,
                                      "isk_hold": isk_hold, "isk_hr": isk_hr, "jumps": jumps,
                                      "system_id": best_order.get("system_id"),
@@ -816,7 +818,7 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
             else:
                 comp_orders = fetch_buy_orders(region_id, COMP_IDS[ore["id"]])
                 comp_buys = [o for o in comp_orders if o.get("is_buy_order", True)] if comp_orders else []
-                comp_eval = _eval_best_order(comp_buys, comp_ore, hold_size, from_system_id, yield_m3_min)
+                comp_eval = _eval_best_order(comp_buys, comp_ore, hold_size, from_system_id, yield_m3_min, secs_per_jump)
             if comp_eval:
                 entry["comp_buy"] = comp_eval["price"]
                 entry["comp_isk_m3"] = comp_eval["isk_m3"]
@@ -831,7 +833,8 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
                 ore["id"], all_region_mat_prices, repro_efficiency,
                 from_system_id, hold_size, ore["vol"], yield_m3_min,
                 local_region_key=region_key,
-                compress_in_hold=compress_in_hold)
+                compress_in_hold=compress_in_hold,
+                secs_per_jump=secs_per_jump)
             if repro:
                 entry["repro_isk_m3"] = repro["repro_isk_m3"]
                 entry["repro_isk_hold"] = repro["repro_isk_hold"]
@@ -874,11 +877,11 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
             if entry["comp_isk_m3"] > 0:
                 entry["comp_isk_hr"] = calc_isk_hr(
                     entry["comp_isk_m3"] * base_hold, base_hold,
-                    yield_m3_min, entry.get("comp_jumps"))
+                    yield_m3_min, entry.get("comp_jumps"), secs_per_jump)
             if entry["repro_isk_m3"] > 0:
                 entry["repro_isk_hr"] = calc_isk_hr(
                     entry["repro_isk_m3"] * base_hold, base_hold,
-                    yield_m3_min, entry.get("repro_jumps"))
+                    yield_m3_min, entry.get("repro_jumps"), secs_per_jump)
             if entry["buyback_isk_m3"] > 0:
                 entry["buyback_isk_hr"] = calc_isk_hr(
                     entry["buyback_isk_m3"] * base_hold, base_hold,
@@ -980,14 +983,19 @@ def enrich_results(results, from_system_id=None):
     return results
 
 
-def calc_isk_hr(isk_hold, hold_size, yield_m3_min, jumps):
-    """Estimate ISK/hr factoring in mining time and round-trip travel."""
+def calc_isk_hr(isk_hold, hold_size, yield_m3_min, jumps, secs_per_jump=SECS_PER_JUMP):
+    """Estimate ISK/hr factoring in mining time and round-trip travel.
+
+    secs_per_jump is the ship's average time between jumps (align + warp +
+    gate); slower hulls (e.g. a Mackinaw) spend longer per jump, which lowers
+    ISK/hr on hauls.
+    """
     if yield_m3_min <= 0 or hold_size <= 0:
         return None
     mine_min = hold_size / yield_m3_min
     if jumps is not None and jumps >= 0:
         # Round trip: jumps * 2, plus dock/sell/undock overhead
-        travel_min = (jumps * 2 * SECS_PER_JUMP + SECS_DOCK_UNDOCK) / 60.0
+        travel_min = (jumps * 2 * secs_per_jump + SECS_DOCK_UNDOCK) / 60.0
     else:
         travel_min = SECS_DOCK_UNDOCK / 60.0  # just dock/undock, 0 jumps
     cycle_min = mine_min + travel_min
@@ -1390,6 +1398,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   .hidden { display: none; }
 
+  .ghost-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--dim);
+    padding: 7px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85em;
+  }
+  .ghost-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .ship-editor {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin: 4px 0 16px;
+  }
+  .ship-editor h4 { margin: 0 0 4px; color: var(--text); }
+  .ship-hint { font-size: 0.78em; color: var(--dim); margin: 0 0 10px; }
+  #ship-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+  .ship-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+    font-size: 0.85em;
+  }
+  .ship-row .ship-name { font-weight: 600; min-width: 120px; }
+  .ship-row .ship-stats { color: var(--dim); flex: 1; }
+  .ship-row button { font-size: 0.78em; padding: 3px 9px; }
+  .ship-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .ship-form input[type="text"] { width: 160px; }
+  .ship-form input[type="number"] { width: 110px; }
+
   @keyframes spin { to { transform: rotate(360deg); } }
   .spinner {
     display: inline-block;
@@ -1430,17 +1470,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
   <div class="field">
     <label>Ship</label>
-    <select id="ship">
-      <option value="venture" selected>Venture (5,000 m&sup3;)</option>
-      <option value="procurer">Procurer (16,000 m&sup3;)</option>
-      <option value="retriever">Retriever (22,000 m&sup3;)</option>
-      <option value="covetor">Covetor (7,000 m&sup3;)</option>
-      <option value="custom">Custom...</option>
-    </select>
+    <select id="ship"></select>
   </div>
-  <div class="field hidden" id="custom-hold-wrap">
-    <label>Hold size (m&sup3;)</label>
-    <input type="number" id="custom-hold" placeholder="5000" min="100" step="100">
+  <div class="field">
+    <label>&nbsp;</label>
+    <button type="button" id="ship-manage-btn" class="ghost-btn">Manage ships</button>
   </div>
   <div class="field">
     <label>Ore class</label>
@@ -1523,12 +1557,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div id="ship-editor" class="ship-editor hidden">
+  <h4>Saved ships</h4>
+  <p class="ship-hint">Stats are yours &mdash; type the hold size, the yield you actually mine (m&sup3;/min, unboosted), and your average time between jumps. Pick a ship above to load its stats into the scan.</p>
+  <div id="ship-list"></div>
+  <div class="ship-form">
+    <input type="text" id="se-name" placeholder="Name (e.g. Mackinaw)" spellcheck="false">
+    <input type="number" id="se-hold" placeholder="Hold m&sup3;" min="100" step="100">
+    <input type="number" id="se-yield" placeholder="Yield m&sup3;/min" min="0" step="1">
+    <input type="number" id="se-jump" placeholder="Jump time (s)" min="1" step="1">
+    <button type="button" id="se-save">Save ship</button>
+    <button type="button" id="se-clear" class="ghost-btn">New</button>
+  </div>
+</div>
+
 <div id="status"></div>
 <div id="results" class="hidden"></div>
 
 <div class="footer">
   Prices = highest buy order in region (instant sell). Material prices cached ~5 min server-side.<br>
-  ISK/hr: 66s/jump (round trip) + 1 min dock/sell/undock. Reprocess searches all 6 regions for best hub. Buyback = Jita buy &times; rate%, 0 travel.<br>
+  ISK/hr: per-ship jump time (round trip) + 1 min dock/sell/undock. Reprocess searches all 6 regions for best hub. Buyback = Jita buy &times; rate%, 0 travel.<br>
   Best Path picks raw/compressed/reprocess/buyback by highest ISK/hr (or ISK/m&sup3; if no yield entered).
 </div>
 </div><!-- /tab-scanner -->
@@ -1623,12 +1671,111 @@ REGIONS.forEach(r => {
   regionSel.appendChild(opt);
 });
 
-// Ship / custom hold toggle
+// ── Saved ships (localStorage) ──────────────────────────────
+// Each ship carries its OWN stats so numbers reflect your skills/fit:
+//   { name, hold (m³), yield (m³/min, unboosted), jumpSecs (avg time/jump) }
 const shipSel = document.getElementById('ship');
-const customWrap = document.getElementById('custom-hold-wrap');
-const customInput = document.getElementById('custom-hold');
+const DEFAULT_SHIPS = [
+  { name: 'Venture',   hold: 5000,  yield: 0, jumpSecs: 45 },
+  { name: 'Procurer',  hold: 16000, yield: 0, jumpSecs: 66 },
+  { name: 'Retriever', hold: 22000, yield: 0, jumpSecs: 66 },
+  { name: 'Covetor',   hold: 7000,  yield: 0, jumpSecs: 66 },
+];
+function loadShips() {
+  try {
+    const s = JSON.parse(localStorage.getItem('oreShips') || 'null');
+    if (Array.isArray(s) && s.length) return s;
+  } catch(e) {}
+  return DEFAULT_SHIPS.map(s => ({...s}));
+}
+function saveShips() {
+  try { localStorage.setItem('oreShips', JSON.stringify(ships)); } catch(e) {}
+}
+let ships = loadShips();
+
+function currentShip() {
+  return ships.find(s => s.name === shipSel.value) || ships[0] || DEFAULT_SHIPS[0];
+}
+function populateShipDropdown(selectName) {
+  const want = selectName || shipSel.value;
+  shipSel.innerHTML = '';
+  ships.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s.name;
+    opt.textContent = s.name + ' (' + Number(s.hold).toLocaleString() + ' m³)';
+    shipSel.appendChild(opt);
+  });
+  if (want && ships.some(s => s.name === want)) shipSel.value = want;
+}
+populateShipDropdown();
+
 shipSel.addEventListener('change', () => {
-  customWrap.classList.toggle('hidden', shipSel.value !== 'custom');
+  const sh = currentShip();
+  if (sh && sh.yield > 0) document.getElementById('yield-rate').value = sh.yield;
+  saveSettings();
+});
+
+// Ship editor
+const shipEditor = document.getElementById('ship-editor');
+document.getElementById('ship-manage-btn').addEventListener('click', () => {
+  shipEditor.classList.toggle('hidden');
+  if (!shipEditor.classList.contains('hidden')) renderShipList();
+});
+function renderShipList() {
+  const list = document.getElementById('ship-list');
+  list.innerHTML = '';
+  ships.forEach((s, i) => {
+    const row = document.createElement('div');
+    row.className = 'ship-row';
+    const nameEl = document.createElement('span');
+    nameEl.className = 'ship-name';
+    nameEl.textContent = s.name;
+    const statsEl = document.createElement('span');
+    statsEl.className = 'ship-stats';
+    statsEl.textContent = Number(s.hold).toLocaleString() + ' m³ · ' +
+      (s.yield > 0 ? s.yield + ' m³/min' : 'no yield') + ' · ' +
+      s.jumpSecs + 's/jump';
+    const edit = document.createElement('button');
+    edit.className = 'ghost-btn'; edit.textContent = 'Edit';
+    edit.onclick = () => loadShipIntoForm(i);
+    const del = document.createElement('button');
+    del.className = 'ghost-btn'; del.textContent = 'Delete';
+    del.onclick = () => {
+      ships.splice(i, 1);
+      if (!ships.length) ships = DEFAULT_SHIPS.map(x => ({...x}));
+      saveShips(); populateShipDropdown(); renderShipList(); saveSettings();
+    };
+    row.appendChild(nameEl); row.appendChild(statsEl);
+    row.appendChild(edit); row.appendChild(del);
+    list.appendChild(row);
+  });
+}
+function loadShipIntoForm(i) {
+  const s = ships[i];
+  document.getElementById('se-name').value = s.name;
+  document.getElementById('se-hold').value = s.hold;
+  document.getElementById('se-yield').value = s.yield || '';
+  document.getElementById('se-jump').value = s.jumpSecs;
+}
+document.getElementById('se-clear').addEventListener('click', () => {
+  ['se-name','se-hold','se-yield','se-jump'].forEach(id => { document.getElementById(id).value = ''; });
+  document.getElementById('se-name').focus();
+});
+document.getElementById('se-save').addEventListener('click', () => {
+  const name = document.getElementById('se-name').value.trim();
+  const hold = parseFloat(document.getElementById('se-hold').value) || 0;
+  const yld = parseFloat(document.getElementById('se-yield').value) || 0;
+  const jump = parseFloat(document.getElementById('se-jump').value) || 66;
+  if (!name) { alert('Give the ship a name.'); return; }
+  if (hold <= 0) { alert('Ship needs a hold size (m³).'); return; }
+  const ship = { name, hold, yield: yld, jumpSecs: jump };
+  const existing = ships.findIndex(s => s.name.toLowerCase() === name.toLowerCase());
+  if (existing >= 0) ships[existing] = ship; else ships.push(ship);
+  saveShips();
+  populateShipDropdown(name);
+  renderShipList();
+  if (ship.yield > 0) document.getElementById('yield-rate').value = ship.yield;
+  saveSettings();
 });
 
 // Fleet boost toggle
@@ -1700,11 +1847,7 @@ autoInterval.addEventListener('change', () => {
 try {
   const saved = JSON.parse(localStorage.getItem('oreScanner') || '{}');
   if (saved.region) regionSel.value = saved.region;
-  if (saved.ship) {
-    shipSel.value = saved.ship;
-    if (saved.ship === 'custom') customWrap.classList.remove('hidden');
-  }
-  if (saved.customHold) customInput.value = saved.customHold;
+  if (saved.ship && ships.some(s => s.name === saved.ship)) shipSel.value = saved.ship;
   if (saved.fromSystem) document.getElementById('from-system').value = saved.fromSystem;
   if (saved.yieldRate) document.getElementById('yield-rate').value = saved.yieldRate;
   if (saved.showAll) document.getElementById('show-all').checked = true;
@@ -1736,7 +1879,6 @@ function saveSettings() {
     localStorage.setItem('oreScanner', JSON.stringify({
       region: regionSel.value,
       ship: shipSel.value,
-      customHold: customInput.value,
       fromSystem: document.getElementById('from-system').value,
       yieldRate: document.getElementById('yield-rate').value,
       showAll: document.getElementById('show-all').checked,
@@ -1773,11 +1915,9 @@ async function doScan() {
 
   const params = new URLSearchParams();
   params.set('region', regionSel.value);
-  if (shipSel.value === 'custom') {
-    params.set('hold', customInput.value || '5000');
-  } else {
-    params.set('ship', shipSel.value);
-  }
+  const ship = currentShip();
+  params.set('hold', Math.round(ship.hold) || 5000);
+  if (ship.jumpSecs > 0) params.set('jumpsecs', ship.jumpSecs);
   const fromSys = document.getElementById('from-system').value.trim();
   if (fromSys) params.set('from', fromSys);
   const effectiveYield = getEffectiveYield();
@@ -3372,6 +3512,15 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 yield_m3_min = 0
 
+        secs_per_jump = SECS_PER_JUMP
+        if "jumpsecs" in qs:
+            try:
+                v = float(qs["jumpsecs"][0])
+                if v > 0:
+                    secs_per_jump = v
+            except ValueError:
+                pass
+
         from_system_id = None
         from_name = qs.get("from", [None])[0]
         if from_name and from_name.strip():
@@ -3386,7 +3535,7 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
                        from_system_id=from_system_id, yield_m3_min=yield_m3_min,
                        repro_efficiency=repro_efficiency,
                        buyback_rate=buyback_rate, region_key=region_key,
-                       compress_in_hold=compress_in_hold)
+                       compress_in_hold=compress_in_hold, secs_per_jump=secs_per_jump)
         results = enrich_results(results, from_system_id=from_system_id)
 
         def _r(v):
