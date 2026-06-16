@@ -283,6 +283,8 @@ COMP_IDS = {
     45513: 62513, 46318: 62514, 46319: 62515,                    # Ytterbite
     # Erratic
     90041: 90307,                                                # Prismaticite
+    # Special (Gallente X-Grade event ore)
+    92567: 92820,                                                # Moissanite X-Grade
 }
 
 COMPRESSION_RATIO = 100  # universal: 100 raw units → 1 compressed unit
@@ -348,6 +350,8 @@ REPRO_FORMULAS = {
     11396: [(11399, 140)],                                   # Mercoxit → Morphite
     19:    [(34, 48000), (37, 1000), (38, 160), (39, 80), (40, 40)],  # Spodumain
     82205: [(34, 800), (40, 40)],                            # Ueganite → Tritanium, Megacyte
+    # ── Special: Gallente X-Grade event ore (in-game Show Info) ──
+    92567: [(34, 1000), (35, 750), (92571, 10)],             # Moissanite X-Grade → Tritanium, Pyerite, Crystalline Moissanite
 }
 
 # Reprocessing output names (minerals + moon materials) for breakdown display.
@@ -360,6 +364,7 @@ MATERIAL_NAMES = {
     16644: "Platinum", 16646: "Mercury", 16647: "Caesium", 16648: "Hafnium",
     16649: "Technetium", 16650: "Dysprosium", 16651: "Neodymium",
     16652: "Promethium", 16653: "Thulium",
+    92571: "Crystalline Moissanite",
 }
 
 # Map every moon ore variant → (base_ore_id, yield_multiplier)
@@ -398,6 +403,9 @@ for _o in BELT_ORES:
         REPRO_VARIANTS[_o["id"]] = (_base_id, 1.05)
     else:
         REPRO_VARIANTS[_o["id"]] = (_base_id, 1.0)
+
+# Special ores: each is its own base (no grade variants)
+REPRO_VARIANTS[92567] = (92567, 1.0)  # Moissanite X-Grade
 
 # All unique material type IDs used in reprocessing (for price fetching)
 REPRO_MATERIAL_IDS = set()
@@ -463,6 +471,13 @@ GAS_CLOUDS = [
 for _g in GAS_CLOUDS:
     _g["group"] = _g["name"]
 
+# ── Special ores (Gallente X-Grade event ore; asteroid belts) ─
+# Single grade only; reprocesses via Simple Ore Processing into minerals
+# plus a unique high-value material (Crystalline Moissanite).  cls 12.
+SPECIAL_ORES = [
+    {"id": 92567, "name": "Moissanite X-Grade", "vol": 1.0, "group": "Moissanite", "cls": 12},
+]
+
 # Assign categories and combine into single ORES list
 for _o in BELT_ORES:
     _o["cat"] = "belt"
@@ -472,7 +487,9 @@ for _o in ERRATIC_ORES:
     _o["cat"] = "erratic"
 for _o in GAS_CLOUDS:
     _o["cat"] = "gas"
-ORES = BELT_ORES + MOON_ORES + ERRATIC_ORES + GAS_CLOUDS
+for _o in SPECIAL_ORES:
+    _o["cat"] = "special"
+ORES = BELT_ORES + MOON_ORES + ERRATIC_ORES + GAS_CLOUDS + SPECIAL_ORES
 
 SHIPS = {
     "venture":   5000,
@@ -820,6 +837,8 @@ def scan(region_id, hold_size, show_all=False, ore_class="0",
         ores = [o for o in ORES if o["cat"] == "erratic"]
     elif ore_class == "gas":
         ores = [o for o in ORES if o["cat"] == "gas"]
+    elif ore_class == "special":
+        ores = [o for o in ORES if o["cat"] == "special"]
     else:
         try:
             cls_int = int(ore_class)
@@ -1703,6 +1722,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <option value="10">Cytoserocin (Lowsec/Null)</option>
         <option value="11">Fullerite (Wormhole/Null)</option>
       </optgroup>
+      <optgroup label="Special Ores">
+        <option value="special">All special</option>
+        <option value="12">Moissanite X-Grade</option>
+      </optgroup>
     </select>
   </div>
   <div class="field">
@@ -2113,8 +2136,8 @@ async function doScan() {
   scanBtn.disabled = true;
   statusEl.className = '';
   const clsVal = document.getElementById('ore-class').value;
-  const clsLabels = {'0':'all ores','belt':'all belt','1':'Highsec','2':'Lowsec','3':'Nullsec','moon':'all moon','4':'R4','5':'R8','6':'R16','7':'R32','8':'R64','erratic':'Erratic','gas':'all gas','9':'Mykoserocin','10':'Cytoserocin','11':'Fullerite'};
-  const oreCounts = {'0':194,'belt':108,'1':32,'2':42,'3':34,'moon':60,'4':12,'5':12,'6':12,'7':12,'8':12,'erratic':1,'gas':25,'9':8,'10':8,'11':9};
+  const clsLabels = {'0':'all ores','belt':'all belt','1':'Highsec','2':'Lowsec','3':'Nullsec','moon':'all moon','4':'R4','5':'R8','6':'R16','7':'R32','8':'R64','erratic':'Erratic','gas':'all gas','9':'Mykoserocin','10':'Cytoserocin','11':'Fullerite','special':'special','12':'Moissanite'};
+  const oreCounts = {'0':195,'belt':108,'1':32,'2':42,'3':34,'moon':60,'4':12,'5':12,'6':12,'7':12,'8':12,'erratic':1,'gas':25,'9':8,'10':8,'11':9,'special':1,'12':1};
   const clsLabel = clsLabels[clsVal] || 'ores';
   const oreCount = oreCounts[clsVal] || 168;
   const reproPct = document.getElementById('repro-pct').value;

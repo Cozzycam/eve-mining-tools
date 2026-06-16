@@ -1,5 +1,31 @@
 # EVE Mining Tools — Handover Notes
 
+## Ore Scanner — 2026-06-16 — Moissanite X-Grade (special ore)
+
+Added Moissanite X-Grade, a Gallente "X-Grade" event ore (group 5085).
+Base Moissanite (46256) is dormant/unpublished with no market or SDE
+reprocess recipe — the ACTIVE ore is **Moissanite X-Grade (92567)**,
+confirmed via live ESI (Jita buy ~100 ISK) + the player's in-game Show
+Info for the reprocess recipe.
+
+- New `cat="special"` category, `cls=12`; `SPECIAL_ORES` list; "Special
+  Ores" dropdown optgroup; `scan()` handles `ore_class=="special"`.
+- `REPRO_FORMULAS[92567] = [(34,1000),(35,750),(92571,10)]` — per 100
+  units: Tritanium 1000, Pyerite 750, **Crystalline Moissanite 10** (a
+  new material, type 92571, Jita buy ~1.5k). Exact from Show Info.
+- `REPRO_VARIANTS[92567]=(92567,1.0)` (single grade, its own base),
+  `COMP_IDS[92567]=92820` (Compressed Moissanite X-Grade),
+  `MATERIAL_NAMES[92571]="Crystalline Moissanite"` (auto-added to
+  REPRO_MATERIAL_IDS via the formula scan, so its price is fetched).
+- vol 1.0 m³, reprocess skill Simple Ore Processing. ORES now 195.
+- Verified live: raw 100 ISK/m³, reprocess 266 ISK/m³ (wins); breakdown
+  shows Crystalline Moissanite dominating value, pulling the one-trip hub
+  to Dodixie while the minerals are best at Jita.
+- SIBLINGS EXIST (same X-Grade family, live): Polycrase X-Grade (92566),
+  Kangite X-Grade (92568), Raspite X-Grade (92565), each with its own
+  Crystalline material (92570/92572/92569). NOT added — need their
+  in-game Show Info reprocess recipes to add without fabricating data.
+
 ## Ore Scanner — 2026-06-15 — Gas harvesting + Compare tab
 
 **Gas clouds** added as a new ore category (`cat="gas"`). 25 gases,
