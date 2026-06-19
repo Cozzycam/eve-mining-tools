@@ -1,5 +1,47 @@
 # EVE Mining Tools — Handover Notes
 
+## PI Dossier — 2026-06-20 — Editable build sheet (manual BIF/AIF override)
+
+The optimizer can't model power-grid cost of links, so its per-planet BIF
+count can be off by ±1 vs what really fits. The Build Sheet is now editable
+so you can correct it and have the factory output recalculate.
+
+**What you can do (web Build Sheet, per chain):**
+- Edit the **BIF** count on each extractor planet (inline number input).
+- Leave **AIF** blank → factory AIFs auto-derive from the resulting P1
+  supply ("how many AIFs do I need"). Type a number to override (caps output
+  when below supply; extra AIFs just starve).
+- **Recalculate** / **Reset** buttons per chain. Live what-if only — edits
+  live in the browser session; Reset restores optimizer values; regenerating
+  clears them. Over-PG/CPU after edits is allowed (the link-power case) and
+  flagged with a red ⚠ note + red bar.
+
+**How it works (no full re-run of the ~90s optimizer):**
+- `pi_dossier.py`: builders now stash raw `extract_rates` (and P1
+  type/volume) on each planet entry; P2-SC layout stores `bif_split`.
+- The P3 cascade (P1 supply → P2 AIFs → P3 AIFs) was factored out of
+  `_build_p3_vc` into `_p3_factory_cascade(chain, p1_supply, ctx)` — reused
+  by both the builder and the recompute (self-test confirms parity).
+- `_recompute_chain(vc, ctx, aif_overrides)` recomputes throughput from the
+  (overridden) facility counts for all 4 layout types; `recalc_chain_build(
+  layout_index, chain_index, bif_overrides, aif_overrides)` mutates the
+  in-memory vc, re-prices via `_compute_economics_single`, and recomputes the
+  layout total_net + route ISK/haul-min. Last run kept in `_LAST_RUN`.
+- Build-sheet JSON factored into `_chain_entry_json` / `_planet_detail_json`
+  (shared by initial render + recalc); planet JSON adds `is_factory`,
+  `bif_editable`, `aif_editable`, `over_budget`.
+- `ore_scanner.py`: new `POST /api/pi/recalc` endpoint; JS adds
+  `piChainSheetInner` (editable build sheet), `recalcChain`/`resetChain`/
+  `applyChainUpdate`/`piSummaryInner`, `piData`/`piOriginal` globals,
+  `.fac-edit` CSS. Layout summary line + per-chain ISK cell get stable ids
+  so they update in place.
+- If the server restarts / hasn't generated yet, recalc returns an error
+  ("generate the dossier first") — UI shows it inline. Markdown copy still
+  reflects the original generation, not live edits.
+- New self-test section "Manual build overrides" (BIF→P1, auto-derive AIF,
+  extra-BIF→extra-AIF, AIF cap, over-budget flag, no-run error). Validated
+  live end-to-end against a real P3 (Guidance Systems) layout.
+
 ## Ore Scanner — 2026-06-16 — Moissanite X-Grade (special ore)
 
 Added Moissanite X-Grade, a Gallente "X-Grade" event ore (group 5085).

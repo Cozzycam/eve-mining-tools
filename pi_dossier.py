@@ -1072,6 +1072,7 @@ def compute_p2_selfcontained_layout(chain, extraction_rates, pg_budget, cpu_budg
                 "cpu_used": cpu_budget - cpu_rem,
                 "role": "self-contained",
                 "p0_consumed_hr": [min(r, b * bif_input_rate) for r, b in zip(extraction_rates, bifs_per_p0)],
+                "bif_split": list(bifs_per_p0),
             }
 
     return None
@@ -1116,6 +1117,114 @@ def compute_factory_layout(chain, pg_budget, cpu_budget):
         "pg_used": pg_budget - pg_rem,
         "cpu_used": cpu_budget - cpu_rem,
         "role": "factory",
+    }
+
+
+def _p3_factory_cascade(chain, p1_supply, ctx):
+    """Trace P1 supply -> P2 AIFs -> P3 AIFs for a P3 combined factory.
+
+    p1_supply: {p1_type_id: units/hr available}.
+    Returns {units_hr, p2_aif_details, p3_aif_count, total_aifs,
+             aif_breakdown, flags}. Pure throughput math — no PG/CPU check,
+     so it can be re-run with user-overridden P1 supply for what-if recalc.
+    """
+    pi_types = ctx["pi_types"]
+    schematics = ctx["schematics"]
+    flags = []
+
+    p3_cycle = chain["schematic"]["cycle_time"]
+    p3_out_qty = chain["schematic"]["output"]["quantity"]
+    p3_out_per_aif_hr = p3_out_qty * (3600 / p3_cycle)
+
+    # For each P2 input of the P3 chain, compute max AIFs from P1 supply
+    p2_aif_details = []
+    for p2_inp in chain["inputs"]:
+        p2_tid = p2_inp["type_id"]
+        p2_type = pi_types.get(p2_tid)
+        if not p2_type:
+            continue
+
+        # Find P2 production schematic
+        p2_sch = None
+        for sid in p2_type.get("produced_by", []):
+            p2_sch = schematics.get(sid)
+            if p2_sch:
+                break
+        if not p2_sch:
+            flags.append(f"NO SCHEMATIC ({p2_type['name']})")
+            continue
+
+        p2_cycle = p2_sch["cycle_time"]
+        p2_out_qty = p2_sch["output"]["quantity"]
+        p2_out_per_aif_hr = p2_out_qty * (3600 / p2_cycle)
+
+        # Max P2 AIFs from P1 supply (each P2 AIF needs X P1/hr per input)
+        max_aifs = float('inf')
+        for p1_inp in p2_sch["inputs"]:
+            p1_tid = p1_inp["type_id"]
+            p1_need_per_aif_hr = p1_inp["quantity"] * (3600 / p2_cycle)
+            supply = p1_supply.get(p1_tid, 0)
+            if p1_need_per_aif_hr > 0:
+                max_aifs = min(max_aifs, supply / p1_need_per_aif_hr)
+
+        aif_count = int(max_aifs) if max_aifs != float('inf') else 0
+        p2_aif_details.append({
+            "name": p2_type["name"],
+            "type_id": p2_tid,
+            "aif_count": aif_count,
+            "out_per_aif_hr": p2_out_per_aif_hr,
+            "total_hr": aif_count * p2_out_per_aif_hr,
+        })
+
+    # P3 AIFs limited by P2 supply
+    max_p3_aifs = 0.0
+    if p2_aif_details:
+        max_p3_aifs = float('inf')
+        for i, p2_inp in enumerate(chain["inputs"]):
+            p2_need_per_p3_hr = p2_inp["quantity"] * (3600 / p3_cycle)
+            p2_supply = p2_aif_details[i]["total_hr"] if i < len(p2_aif_details) else 0
+            if p2_need_per_p3_hr > 0:
+                max_p3_aifs = min(max_p3_aifs, p2_supply / p2_need_per_p3_hr)
+        if max_p3_aifs == float('inf'):
+            max_p3_aifs = 0.0
+
+    p3_aif_count = int(max_p3_aifs)
+    if p3_aif_count == 0 and max_p3_aifs >= 0.1:
+        p3_aif_count = 1  # allow partial throughput
+
+    actual_p3 = min(p3_aif_count, max_p3_aifs)
+    units_hr = actual_p3 * p3_out_per_aif_hr
+
+    # Trim excess P2 AIFs — don't produce more P2 than the P3 stage consumes
+    for i, p2_inp in enumerate(chain["inputs"]):
+        if i < len(p2_aif_details):
+            p2_need_total = p2_inp["quantity"] * (3600 / p3_cycle) * actual_p3
+            out_per = p2_aif_details[i]["out_per_aif_hr"]
+            if out_per > 0:
+                needed = math.ceil(p2_need_total / out_per)
+                p2_aif_details[i]["aif_count"] = min(
+                    p2_aif_details[i]["aif_count"], needed)
+                p2_aif_details[i]["total_hr"] = (
+                    p2_aif_details[i]["aif_count"] * out_per)
+
+    total_p2_aifs = sum(d["aif_count"] for d in p2_aif_details)
+    total_aifs = total_p2_aifs + p3_aif_count
+
+    # Build AIF breakdown for display
+    aif_breakdown = []
+    for d in p2_aif_details:
+        aif_breakdown.append(
+            f"{d['aif_count']} AIF -> {d['total_hr']:.0f} {d['name']}/hr")
+    aif_breakdown.append(
+        f"{p3_aif_count} AIF -> {units_hr:.1f} {chain['output_name']}/hr")
+
+    return {
+        "units_hr": units_hr,
+        "p2_aif_details": p2_aif_details,
+        "p3_aif_count": p3_aif_count,
+        "total_aifs": total_aifs,
+        "aif_breakdown": aif_breakdown,
+        "flags": flags,
     }
 
 
@@ -1351,6 +1460,7 @@ def _build_p1_vc(chain, sel, ctx):
         "planets_used": [{"system": system, "type": f"{ptype} {inst}",
                           "role": f"Extract {p0_name} -> {chain['output_name']}",
                           "layout": layout,
+                          "extract_rates": [rate],
                           "rate_detail": f"{p0_name}: {rate:.0f}/hr [{tag}]"}],
         "planet_count": 1,
         "units_hr": layout["units_hr"],
@@ -1383,7 +1493,9 @@ def _build_p2sc_vc(chain, sel, ctx):
         "chain": chain, "viable": True, "layout_type": "p2_selfcontained",
         "planets_used": [{"system": system, "type": f"{ptype} {inst}",
                           "role": f"Extract+Process -> {chain['output_name']}",
-                          "layout": layout, "rate_details": rate_details}],
+                          "layout": layout, "rate_details": rate_details,
+                          "extract_rates": list(rates),
+                          "p0_names": list(p0_names)}],
         "planet_count": 1,
         "units_hr": layout["units_hr"],
         "volume_hr": layout["volume_hr"],
@@ -1414,6 +1526,10 @@ def _build_p2f_vc(chain, sel, ctx):
             "role": f"Extract {p0_name} -> {p1_type['name']}",
             "layout": p1_layout,
             "p1_output_hr": p1_layout["units_hr"],
+            "extract_rates": [rate],
+            "p1_type_id": p1_input["type_id"],
+            "p1_name": p1_type["name"],
+            "p1_volume": p1_type["volume"],
             "rate_detail": f"{p0_name}: {rate:.0f}/hr [{tag}]",
         })
         all_tags.append(tag)
@@ -1476,6 +1592,8 @@ def _build_p3_vc(chain, sel, ctx):
             "p1_output_hr": p1_layout["units_hr"],
             "p1_name": p1_info["name"],
             "p1_type_id": p1_info["type_id"],
+            "p1_volume": p1_info["volume"],
+            "extract_rates": [rate],
             "rate_detail": f"{p0_name}: {rate:.0f}/hr [{tag}]",
         })
         all_tags.append(tag)
@@ -1498,83 +1616,12 @@ def _build_p3_vc(chain, sel, ctx):
         if p1_tid:
             p1_supply[p1_tid] = p1_supply.get(p1_tid, 0) + ep["p1_output_hr"]
 
-    p3_cycle = chain["schematic"]["cycle_time"]
-    p3_out_qty = chain["schematic"]["output"]["quantity"]
-    p3_out_per_aif_hr = p3_out_qty * (3600 / p3_cycle)
-
-    # For each P2 input of the P3 chain, compute max AIFs from P1 supply
-    p2_aif_details = []
-    for p2_inp in chain["inputs"]:
-        p2_tid = p2_inp["type_id"]
-        p2_type = pi_types.get(p2_tid)
-        if not p2_type:
-            continue
-
-        # Find P2 production schematic
-        p2_sch = None
-        for sid in p2_type.get("produced_by", []):
-            p2_sch = schematics.get(sid)
-            if p2_sch:
-                break
-        if not p2_sch:
-            flags.append(f"NO SCHEMATIC ({p2_type['name']})")
-            continue
-
-        p2_cycle = p2_sch["cycle_time"]
-        p2_out_qty = p2_sch["output"]["quantity"]
-        p2_out_per_aif_hr = p2_out_qty * (3600 / p2_cycle)
-
-        # Max P2 AIFs from P1 supply (each P2 AIF needs X P1/hr per input)
-        max_aifs = float('inf')
-        for p1_inp in p2_sch["inputs"]:
-            p1_tid = p1_inp["type_id"]
-            p1_need_per_aif_hr = p1_inp["quantity"] * (3600 / p2_cycle)
-            supply = p1_supply.get(p1_tid, 0)
-            if p1_need_per_aif_hr > 0:
-                max_aifs = min(max_aifs, supply / p1_need_per_aif_hr)
-
-        aif_count = int(max_aifs) if max_aifs != float('inf') else 0
-        p2_aif_details.append({
-            "name": p2_type["name"],
-            "type_id": p2_tid,
-            "aif_count": aif_count,
-            "out_per_aif_hr": p2_out_per_aif_hr,
-            "total_hr": aif_count * p2_out_per_aif_hr,
-        })
-
-    # P3 AIFs limited by P2 supply
-    max_p3_aifs = 0.0
-    if p2_aif_details:
-        max_p3_aifs = float('inf')
-        for i, p2_inp in enumerate(chain["inputs"]):
-            p2_need_per_p3_hr = p2_inp["quantity"] * (3600 / p3_cycle)
-            p2_supply = p2_aif_details[i]["total_hr"] if i < len(p2_aif_details) else 0
-            if p2_need_per_p3_hr > 0:
-                max_p3_aifs = min(max_p3_aifs, p2_supply / p2_need_per_p3_hr)
-        if max_p3_aifs == float('inf'):
-            max_p3_aifs = 0.0
-
-    p3_aif_count = int(max_p3_aifs)
-    if p3_aif_count == 0 and max_p3_aifs >= 0.1:
-        p3_aif_count = 1  # allow partial throughput
-
-    actual_p3 = min(p3_aif_count, max_p3_aifs)
-    units_hr = actual_p3 * p3_out_per_aif_hr
-
-    # Trim excess P2 AIFs — don't produce more P2 than the P3 stage consumes
-    for i, p2_inp in enumerate(chain["inputs"]):
-        if i < len(p2_aif_details):
-            p2_need_total = p2_inp["quantity"] * (3600 / p3_cycle) * actual_p3
-            out_per = p2_aif_details[i]["out_per_aif_hr"]
-            if out_per > 0:
-                needed = math.ceil(p2_need_total / out_per)
-                p2_aif_details[i]["aif_count"] = min(
-                    p2_aif_details[i]["aif_count"], needed)
-                p2_aif_details[i]["total_hr"] = (
-                    p2_aif_details[i]["aif_count"] * out_per)
-
-    total_p2_aifs = sum(d["aif_count"] for d in p2_aif_details)
-    total_aifs = total_p2_aifs + p3_aif_count
+    casc = _p3_factory_cascade(chain, p1_supply, ctx)
+    flags.extend(casc["flags"])
+    units_hr = casc["units_hr"]
+    p3_aif_count = casc["p3_aif_count"]
+    total_aifs = casc["total_aifs"]
+    aif_breakdown = casc["aif_breakdown"]
 
     # Check PG/CPU
     facilities = {"aif": total_aifs, "launchpad": 1}
@@ -1595,14 +1642,6 @@ def _build_p3_vc(chain, sel, ctx):
         }
 
     volume_hr = units_hr * chain["volume"]
-
-    # Build AIF breakdown for display
-    aif_breakdown = []
-    for d in p2_aif_details:
-        aif_breakdown.append(
-            f"{d['aif_count']} AIF -> {d['total_hr']:.0f} {d['name']}/hr")
-    aif_breakdown.append(
-        f"{p3_aif_count} AIF -> {units_hr:.1f} {chain['output_name']}/hr")
 
     factory_layout = {
         "facilities": facilities,
@@ -3534,6 +3573,334 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
     return "\n".join(lines)
 
 
+# ── Build-sheet JSON + manual-override recompute ──────────────
+#
+# The web Build Sheet lets you hand-edit BIF counts per extractor planet
+# (link power means each planet really fits a slightly different number than
+# the optimizer assumed). The factory's AIFs are then re-derived from the
+# resulting P1 supply. _LAST_RUN keeps the in-memory run so one chain can be
+# recomputed without re-running the whole multi-minute optimizer.
+
+_LAST_RUN = {"state": None}
+
+
+def _planet_detail_json(p, pg_budget, cpu_budget):
+    """JSON for one planet's build-sheet row (+ editability flags)."""
+    pl = p.get("layout", {})
+    fac = pl.get("facilities", {})
+    p0_consumed = pl.get("p0_consumed_hr", 0)
+    if isinstance(p0_consumed, (int, float)):
+        p0_consumed = [p0_consumed] if p0_consumed > 0 else []
+    return {
+        "system": p.get("system", ""),
+        "type": p.get("type", ""),
+        "role": p.get("role", ""),
+        "facilities": fac,
+        "ecu_heads": DEFAULT_ECU_HEADS if fac.get("ecu", 0) > 0 else 0,
+        "p0_consumed_hr": p0_consumed,
+        "units_hr": pl.get("units_hr", 0),
+        "volume_hr": pl.get("volume_hr", 0),
+        "pg_used": pl.get("pg_used", 0),
+        "cpu_used": pl.get("cpu_used", 0),
+        "pg_budget": pg_budget,
+        "cpu_budget": cpu_budget,
+        "over_budget": bool(pl.get("over_budget", False)),
+        "rate_detail": p.get("rate_detail", ""),
+        "rate_details": p.get("rate_details", []),
+        "aif_breakdown": pl.get("aif_breakdown", []),
+        "is_factory": bool(p.get("is_factory")),
+        "bif_editable": bool(fac.get("bif")),
+        "aif_editable": bool(fac.get("aif")),
+    }
+
+
+def _chain_entry_json(vc, pg_budget, cpu_budget):
+    """JSON for one chain's build sheet + market block (used by both the
+    initial dossier render and the single-chain recalc endpoint)."""
+    chain = vc["chain"]
+    planets_detail = [_planet_detail_json(p, pg_budget, cpu_budget)
+                      for p in vc.get("planets_used", [])]
+    return {
+        "output_name": chain["output_name"],
+        "tier": chain["tier"],
+        "layout_type": vc.get("layout_type", ""),
+        "units_hr": vc.get("units_hr", 0),
+        "net_isk_hr": vc.get("net_isk_hr", 0),
+        "gross_isk_hr": vc.get("gross_isk_hr", 0),
+        "tax_per_hr": vc.get("tax_per_hr", 0),
+        "haul_minutes_per_day": vc.get("haul_minutes_per_day", 0),
+        "planets_used": planets_detail,
+        "bottleneck": vc.get("bottleneck", ""),
+        "flags": vc.get("flags", []),
+        "market": {
+            "local_buy": vc.get("local_buy_price", 0),
+            "local_sustained": vc.get("local_sustained", 0),
+            "buyer_system": vc.get("local_buyer_system", ""),
+            "buyer_jumps": vc.get("local_buyer_jumps", 0),
+            "depth_days": vc.get("local_real_buy_days", 0),
+            "depth_units": vc.get("local_real_depth", 0),
+            "avg_daily_vol": vc.get("local_avg_daily_vol", 0),
+            "active_days": vc.get("local_active_days", 0),
+            "order_count": vc.get("local_order_count", 0),
+            "jita_buy": vc.get("jita_buy_price", 0),
+            "jita_vwap": vc.get("jita_vwap", 0),
+            "jita_daily_vol": vc.get("jita_avg_daily_vol", 0),
+            "sell_recommendation": vc.get("sell_recommendation", ""),
+        },
+    }
+
+
+def _split_bifs(total, rates):
+    """Distribute `total` BIFs across P0 lines proportional to extraction rate.
+
+    Each active line gets at least 1; rounding remainder goes to the faster
+    line(s). Returns a list of ints summing to `total` (or fewer when
+    total < number of lines, filling the fastest lines first)."""
+    n = len(rates)
+    if n == 0 or total <= 0:
+        return [0] * n
+    if total <= n:
+        order = sorted(range(n), key=lambda i: -rates[i])
+        split = [0] * n
+        for k in range(total):
+            split[order[k]] = 1
+        return split
+    rate_sum = sum(rates) or 1
+    raw = [r / rate_sum * total for r in rates]
+    split = [max(1, int(x)) for x in raw]
+    diff = total - sum(split)
+    frac_order = sorted(range(n), key=lambda i: -(raw[i] - int(raw[i])))
+    k = 0
+    while diff > 0:
+        split[frac_order[k % n]] += 1
+        diff -= 1
+        k += 1
+    small_order = sorted(range(n), key=lambda i: split[i])
+    k = 0
+    guard = 0
+    while diff < 0 and guard < 10000:
+        idx = small_order[k % n]
+        if split[idx] > 1:
+            split[idx] -= 1
+            diff += 1
+        k += 1
+        guard += 1
+    return split
+
+
+def _recompute_chain(vc, ctx, aif_overrides=None):
+    """Recompute a chain's throughput from its planets' current (possibly
+    user-edited) facility counts + stored raw extraction rates. Mutates vc.
+
+    aif_overrides: {planet_index: int} optional factory-AIF target. Below the
+    supply-supported max it caps output; above it, output stays capped by P1
+    supply (extra AIFs would just starve)."""
+    aif_overrides = aif_overrides or {}
+    lt = vc.get("layout_type", "")
+    planets = vc.get("planets_used", [])
+    chain = vc["chain"]
+    pgb, cpub = ctx["pg_budget"], ctx["cpu_budget"]
+    BIF_FULL = 6000
+    AIF_P1_NEED = 40  # P1/hr per input per P2 AIF
+
+    def refresh_power(p):
+        lay = p.get("layout") or {}
+        fac = lay.get("facilities", {})
+        pg_rem, cpu_rem = _planet_budget_remaining(pgb, cpub, fac)
+        lay["pg_used"] = pgb - pg_rem
+        lay["cpu_used"] = cpub - cpu_rem
+        lay["over_budget"] = (pg_rem < 0) or (cpu_rem < 0)
+
+    def fac_int(lay, key):
+        try:
+            return max(0, int(lay.get("facilities", {}).get(key, 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    if not planets:
+        return
+
+    if lt == "p1_extractor":
+        p = planets[0]
+        lay = p["layout"]
+        rate = (p.get("extract_rates") or [lay.get("p0_consumed_hr", 0)])[0]
+        bif = fac_int(lay, "bif")
+        units = _bif_p1_output(rate, bif)
+        lay["units_hr"] = units
+        lay["volume_hr"] = units * chain["volume"]
+        lay["p0_consumed_hr"] = min(rate, bif * BIF_FULL)
+        refresh_power(p)
+        vc["units_hr"] = units
+        vc["volume_hr"] = lay["volume_hr"]
+
+    elif lt == "p2_selfcontained":
+        p = planets[0]
+        lay = p["layout"]
+        rates = p.get("extract_rates") or []
+        total_bif = fac_int(lay, "bif")
+        split = _split_bifs(total_bif, rates)
+        lay["facilities"]["bif"] = sum(split)
+        lay["bif_split"] = split
+        p1_outs = [_bif_p1_output(r, b) for r, b in zip(rates, split)]
+        min_p1 = min(p1_outs) if p1_outs else 0
+        max_aif = min_p1 / AIF_P1_NEED
+        if 0 in aif_overrides:
+            aif = aif_overrides[0]
+            eff_aif = min(aif, max_aif)  # AIFs past supply just starve
+        else:
+            aif = int(max_aif)  # auto-derive whole AIFs the supply sustains
+            eff_aif = aif
+        lay["facilities"]["aif"] = aif
+        units = eff_aif * 5
+        lay["units_hr"] = units
+        lay["volume_hr"] = units * chain["volume"]
+        lay["p0_consumed_hr"] = [min(r, b * BIF_FULL)
+                                 for r, b in zip(rates, split)]
+        refresh_power(p)
+        vc["units_hr"] = units
+        vc["volume_hr"] = units * chain["volume"]
+
+    elif lt == "p2_factory":
+        supply_by_input = {}
+        fac_idx = None
+        for i, p in enumerate(planets):
+            if p.get("is_factory"):
+                fac_idx = i
+                continue
+            lay = p["layout"]
+            rate = (p.get("extract_rates") or [0])[0]
+            bif = fac_int(lay, "bif")
+            po = _bif_p1_output(rate, bif)
+            lay["units_hr"] = po
+            lay["volume_hr"] = po * (p.get("p1_volume", 0) or 0)
+            lay["p0_consumed_hr"] = min(rate, bif * BIF_FULL)
+            p["p1_output_hr"] = po
+            refresh_power(p)
+            key = p.get("p1_type_id") or p.get("p1_name") or i
+            supply_by_input[key] = supply_by_input.get(key, 0) + po
+        min_p1 = min(supply_by_input.values()) if supply_by_input else 0
+        max_aif = min_p1 / AIF_P1_NEED
+        if fac_idx is not None:
+            flay = planets[fac_idx]["layout"]
+            if fac_idx in aif_overrides:
+                aif = aif_overrides[fac_idx]
+                eff_aif = min(aif, max_aif)  # AIFs past supply just starve
+            else:
+                aif = int(max_aif)  # auto-derive whole AIFs supply sustains
+                eff_aif = aif
+            units = eff_aif * 5
+            flay["facilities"]["aif"] = aif
+            flay["units_hr"] = units
+            flay["volume_hr"] = units * chain["volume"]
+            refresh_power(planets[fac_idx])
+            vc["units_hr"] = units
+            vc["volume_hr"] = units * chain["volume"]
+
+    elif lt == "p3_multi":
+        p1_supply = {}
+        fac_idx = None
+        for i, p in enumerate(planets):
+            if p.get("is_factory"):
+                fac_idx = i
+                continue
+            lay = p["layout"]
+            rate = (p.get("extract_rates") or [0])[0]
+            bif = fac_int(lay, "bif")
+            po = _bif_p1_output(rate, bif)
+            lay["units_hr"] = po
+            lay["volume_hr"] = po * (p.get("p1_volume", 0) or 0)
+            lay["p0_consumed_hr"] = min(rate, bif * BIF_FULL)
+            p["p1_output_hr"] = po
+            refresh_power(p)
+            tid = p.get("p1_type_id")
+            if tid:
+                p1_supply[tid] = p1_supply.get(tid, 0) + po
+        casc = _p3_factory_cascade(chain, p1_supply, ctx)
+        units = casc["units_hr"]
+        total_aifs = casc["total_aifs"]
+        breakdown = list(casc["aif_breakdown"])
+        if fac_idx is not None:
+            flay = planets[fac_idx]["layout"]
+            override = aif_overrides.get(fac_idx)
+            if (override is not None and total_aifs > 0
+                    and override < total_aifs):
+                scale = override / total_aifs
+                units *= scale
+                total_aifs = override
+                breakdown.append(f"(scaled to {override} AIF cap)")
+            flay["facilities"]["aif"] = total_aifs
+            flay["units_hr"] = units
+            flay["volume_hr"] = units * chain["volume"]
+            flay["aif_breakdown"] = breakdown
+            refresh_power(planets[fac_idx])
+        vc["units_hr"] = units
+        vc["volume_hr"] = units * chain["volume"]
+
+
+def recalc_chain_build(layout_index, chain_index, bif_overrides=None,
+                       aif_overrides=None):
+    """Recompute a single chain's build + economics from manual facility
+    overrides, reusing the last in-memory run. Returns the updated chain
+    entry + the layout's new total, or {"error": ...} if no run is cached."""
+    state = _LAST_RUN.get("state")
+    if not state:
+        return {"error": "No PI run in memory — generate the dossier first."}
+    layouts = state["layouts"]
+    try:
+        layout = layouts[layout_index]
+        vc = layout["allocated"][chain_index]
+    except (IndexError, KeyError, TypeError):
+        return {"error": "Chain not found — please regenerate the dossier."}
+
+    ctx, ectx, cfg = state["ctx"], state["ectx"], state["cfg"]
+    pgb, cpub = state["pg_budget"], state["cpu_budget"]
+    planets = vc.get("planets_used", [])
+
+    for k, v in (bif_overrides or {}).items():
+        try:
+            idx, cnt = int(k), max(0, int(v))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(planets):
+            lay = planets[idx].get("layout")
+            if lay and "bif" in lay.get("facilities", {}):
+                lay["facilities"]["bif"] = cnt
+
+    aif_ov = {}
+    for k, v in (aif_overrides or {}).items():
+        try:
+            aif_ov[int(k)] = max(0, int(v))
+        except (TypeError, ValueError):
+            continue
+
+    _recompute_chain(vc, ctx, aif_ov)
+
+    # Re-price this chain (clear the idempotency guard first)
+    vc["_econ_done"] = False
+    _compute_economics_single(vc, ectx)
+
+    # Layout total + route economics (output volume changed -> trip count)
+    total_net = sum(c.get("adjusted_net_isk_hr", 0)
+                    for c in layout["allocated"])
+    layout["total_net"] = total_net
+    route = layout.get("route", {})
+    rm = route.get("route_minutes", 0)
+    if rm:
+        trips = _compute_trips_per_day(layout["allocated"], cfg["hauler_m3"])
+        daily = rm * trips
+        route["trips_per_day"] = trips
+        route["daily_haul_minutes"] = daily
+        route["isk_per_haul_min"] = (total_net * 24 / daily) if daily > 0 else 0
+
+    return {
+        "layout_index": layout_index,
+        "chain_index": chain_index,
+        "entry": _chain_entry_json(vc, pgb, cpub),
+        "total_net": total_net,
+        "route": route,
+    }
+
+
 # ── Web API entry point ───────────────────────────────────────
 
 def generate_pi_dossier_data(overrides=None):
@@ -3710,71 +4077,21 @@ def generate_pi_dossier_data(overrides=None):
 
     layouts_json = []
     for layout in layouts:
-        layout_entries = []
-        for vc in layout["allocated"]:
-            chain = vc["chain"]
-            # Per-planet build sheet
-            planets_detail = []
-            for p in vc.get("planets_used", []):
-                pl = p.get("layout", {})
-                fac = pl.get("facilities", {})
-                p0_consumed = pl.get("p0_consumed_hr", 0)
-                # Normalise p0_consumed to a list for display
-                if isinstance(p0_consumed, (int, float)):
-                    p0_consumed = [p0_consumed] if p0_consumed > 0 else []
-                pd = {
-                    "system": p.get("system", ""),
-                    "type": p.get("type", ""),
-                    "role": p.get("role", ""),
-                    "facilities": fac,
-                    "ecu_heads": DEFAULT_ECU_HEADS if fac.get("ecu", 0) > 0 else 0,
-                    "p0_consumed_hr": p0_consumed,
-                    "units_hr": pl.get("units_hr", 0),
-                    "volume_hr": pl.get("volume_hr", 0),
-                    "pg_used": pl.get("pg_used", 0),
-                    "cpu_used": pl.get("cpu_used", 0),
-                    "pg_budget": pg_budget,
-                    "cpu_budget": cpu_budget,
-                    "rate_detail": p.get("rate_detail", ""),
-                    "rate_details": p.get("rate_details", []),
-                    "aif_breakdown": pl.get("aif_breakdown", []),
-                }
-                planets_detail.append(pd)
-
-            layout_entries.append({
-                "output_name": chain["output_name"],
-                "tier": chain["tier"],
-                "layout_type": vc.get("layout_type", ""),
-                "units_hr": vc.get("units_hr", 0),
-                "net_isk_hr": vc.get("net_isk_hr", 0),
-                "gross_isk_hr": vc.get("gross_isk_hr", 0),
-                "tax_per_hr": vc.get("tax_per_hr", 0),
-                "haul_minutes_per_day": vc.get("haul_minutes_per_day", 0),
-                "planets_used": planets_detail,
-                "bottleneck": vc.get("bottleneck", ""),
-                "flags": vc.get("flags", []),
-                "market": {
-                    "local_buy": vc.get("local_buy_price", 0),
-                    "local_sustained": vc.get("local_sustained", 0),
-                    "buyer_system": vc.get("local_buyer_system", ""),
-                    "buyer_jumps": vc.get("local_buyer_jumps", 0),
-                    "depth_days": vc.get("local_real_buy_days", 0),
-                    "depth_units": vc.get("local_real_depth", 0),
-                    "avg_daily_vol": vc.get("local_avg_daily_vol", 0),
-                    "active_days": vc.get("local_active_days", 0),
-                    "order_count": vc.get("local_order_count", 0),
-                    "jita_buy": vc.get("jita_buy_price", 0),
-                    "jita_vwap": vc.get("jita_vwap", 0),
-                    "jita_daily_vol": vc.get("jita_avg_daily_vol", 0),
-                    "sell_recommendation": vc.get("sell_recommendation", ""),
-                },
-            })
+        layout_entries = [_chain_entry_json(vc, pg_budget, cpu_budget)
+                          for vc in layout["allocated"]]
         layouts_json.append({
             "strategy": layout["strategy"],
             "total_net": layout["total_net"],
             "allocated": layout_entries,
             "route": layout.get("route", {}),
         })
+
+    # Stash the in-memory run so the web UI can recompute a single chain's
+    # build (manual BIF/AIF overrides) without re-running the whole optimizer.
+    _LAST_RUN["state"] = {
+        "ctx": ctx, "ectx": ectx, "cfg": cfg, "layouts": layouts,
+        "pg_budget": pg_budget, "cpu_budget": cpu_budget,
+    }
 
     return {
         "char_info": char_info,
@@ -4339,6 +4656,71 @@ def self_test():
     inter = _interesting_systems(t_ctx, "Sys1")
     check("Interesting systems include extraction hosts",
           set(inter) == {"Sys1", "Sys2"}, f"got {inter}")
+
+    # ── Manual build overrides (BIF/AIF recompute) ──
+    print("\nManual build overrides:")
+    sb = _split_bifs(5, [12000, 6000])
+    check("_split_bifs sums to total", sum(sb) == 5, f"got {sb}")
+    check("_split_bifs gives each line >=1", all(b >= 1 for b in sb),
+          f"got {sb}")
+    check("_split_bifs favours faster line", sb[0] >= sb[1], f"got {sb}")
+
+    # P1 extractor: BIF count drives P1 output
+    p1_vc = {"layout_type": "p1_extractor", "chain": {"volume": 0.19},
+             "planets_used": [{"extract_rates": [12000], "layout": {
+                 "facilities": {"ecu": 1, "bif": 2, "launchpad": 1}}}]}
+    _recompute_chain(p1_vc, t_ctx)
+    check("P1 recompute: 2 BIF @ 12000 -> 80/hr", p1_vc["units_hr"] == 80,
+          f"got {p1_vc['units_hr']}")
+    p1_vc["planets_used"][0]["layout"]["facilities"]["bif"] = 1
+    _recompute_chain(p1_vc, t_ctx)
+    check("P1 recompute: 1 BIF @ 12000 -> 40/hr", p1_vc["units_hr"] == 40,
+          f"got {p1_vc['units_hr']}")
+
+    # P2 factory: AIFs auto-derive from the slowest P1 input
+    def _mk_p2f():
+        return {"layout_type": "p2_factory",
+                "chain": {"volume": 0.75, "output_name": "TestP2"},
+                "planets_used": [
+                    {"is_factory": False, "extract_rates": [12000],
+                     "p1_type_id": 1, "p1_volume": 0.38,
+                     "layout": {"facilities": {"ecu": 1, "bif": 2,
+                                               "launchpad": 1}}},
+                    {"is_factory": False, "extract_rates": [12000],
+                     "p1_type_id": 2, "p1_volume": 0.38,
+                     "layout": {"facilities": {"ecu": 1, "bif": 1,
+                                               "launchpad": 1}}},
+                    {"is_factory": True,
+                     "layout": {"facilities": {"aif": 1, "launchpad": 1}}}]}
+    p2f = _mk_p2f()
+    _recompute_chain(p2f, t_ctx)
+    check("P2f recompute: min supply 40 -> 1 AIF, 5/hr",
+          p2f["units_hr"] == 5
+          and p2f["planets_used"][2]["layout"]["facilities"]["aif"] == 1,
+          f"units={p2f['units_hr']}, "
+          f"aif={p2f['planets_used'][2]['layout']['facilities']['aif']}")
+    # One extra BIF on the slow input lifts supply -> one more AIF -> more P2
+    p2f["planets_used"][1]["layout"]["facilities"]["bif"] = 2
+    _recompute_chain(p2f, t_ctx)
+    check("P2f recompute: extra BIF -> 2 AIF, 10/hr",
+          p2f["units_hr"] == 10
+          and p2f["planets_used"][2]["layout"]["facilities"]["aif"] == 2,
+          f"units={p2f['units_hr']}, "
+          f"aif={p2f['planets_used'][2]['layout']['facilities']['aif']}")
+    # Manual AIF override below supply caps the output
+    p2f2 = _mk_p2f()
+    p2f2["planets_used"][1]["layout"]["facilities"]["bif"] = 2
+    _recompute_chain(p2f2, t_ctx, aif_overrides={2: 1})
+    check("P2f AIF override caps output", p2f2["units_hr"] == 5,
+          f"got {p2f2['units_hr']}")
+    # Over-budget facilities flagged but still recomputed
+    p1_vc["planets_used"][0]["layout"]["facilities"]["bif"] = 20
+    _recompute_chain(p1_vc, t_ctx)
+    check("Over-budget facilities flagged",
+          p1_vc["planets_used"][0]["layout"].get("over_budget") is True,
+          "expected over_budget True")
+    check("recalc_chain_build errors with no run",
+          "error" in recalc_chain_build(0, 0))
 
     print(f"\n{'='*40}")
     if errors:

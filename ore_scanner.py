@@ -1515,6 +1515,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .build-row .lbl { color: var(--dim); min-width: 60px; }
   .build-row .val { color: var(--text); font-weight: 600; }
   .build-row .accent { color: var(--accent); }
+  .fac-edit { background: var(--bg); color: var(--text); border: 1px solid var(--accent);
+    border-radius: 3px; padding: 1px 3px; font-size: 0.95em; }
   .pg-bar, .cpu-bar {
     display: inline-block; height: 8px; border-radius: 3px; margin-right: 6px; vertical-align: middle;
   }
@@ -3172,6 +3174,8 @@ function copyDossier() {
 // ── PI Dossier logic ──
 let piConfigLoaded = false;
 let piMarkdown = '';
+let piData = null;       // last rendered dossier (mutated by recalc)
+let piOriginal = null;   // deep clone of layouts for Reset
 
 function piStatus(msg, isError) {
   const el = document.getElementById('pi-status');
@@ -3465,6 +3469,8 @@ async function doPi() {
 
 function renderPi(data) {
   const el = document.getElementById('pi-results');
+  piData = data;
+  piOriginal = JSON.parse(JSON.stringify(data.layouts || []));
   let h = '';
 
   // Character info
@@ -3505,15 +3511,7 @@ function renderPi(data) {
       const label = labels[li] || '#' + (li+1);
       h += '<div class="fitter-section"><h2 style="cursor:pointer;" title="Show this route on the map" onclick="showPiRoute(' + li + ')">' + label + ' Layout</h2>';
       const rt = layout.route || {};
-      let haulStr = '';
-      if (rt.daily_haul_minutes != null) {
-        const trips = rt.trips_per_day || 1;
-        haulStr = rt.daily_haul_minutes.toFixed(0) + ' min/day (' + trips + ' trip' + (trips > 1 ? 's' : '') + ')';
-        if (rt.isk_per_haul_min) haulStr += ' &bull; ' + fmtIsk(rt.isk_per_haul_min) + '/haul-min';
-      }
-      h += '<p><strong>' + fmtIsk(layout.total_net) + '/hr net</strong> &mdash; <span style="color:var(--dim)">' + layout.strategy + '</span>';
-      if (haulStr) h += ' &nbsp;|&nbsp; Haul: ' + haulStr;
-      h += '</p>';
+      h += '<p id="pi-summary-' + li + '">' + piSummaryInner(layout) + '</p>';
       if (rt.systems_ordered && rt.systems_ordered.length) {
         const sell = rt.sell_system || '';
         const parts = rt.systems_ordered.map(s => s === sell ? s + ' (sell)' : s);
@@ -3521,128 +3519,25 @@ function renderPi(data) {
       }
       h += '<div class="results-wrap"><table><thead><tr><th>#</th><th>System</th><th>Type</th><th>Role</th><th>Product</th><th class="num">ISK/hr (chain)</th></tr></thead><tbody>';
       let slot = 0;
-      (layout.allocated||[]).forEach(a => {
+      (layout.allocated||[]).forEach((a, ai) => {
         if (a.planets_used && a.planets_used.length) {
           a.planets_used.forEach((p, i) => {
             slot++;
-            const iskCol = i === 0 ? fmtIsk(a.net_isk_hr) + '/hr' : '';
+            const iskCol = i === 0 ? '<span id="pi-rowisk-' + li + '-' + ai + '">' + fmtIsk(a.net_isk_hr) + '/hr</span>' : '';
             h += '<tr><td>' + slot + '</td><td>' + p.system + '</td><td>' + p.type + '</td><td>' + p.role + '</td><td>' + a.output_name + '</td><td class="num">' + iskCol + '</td></tr>';
           });
         } else {
           slot++;
-          h += '<tr><td>' + slot + '</td><td>--</td><td>--</td><td>' + a.layout_type + '</td><td>' + a.output_name + '</td><td class="num">' + fmtIsk(a.net_isk_hr) + '/hr</td></tr>';
+          h += '<tr><td>' + slot + '</td><td>--</td><td>--</td><td>' + a.layout_type + '</td><td>' + a.output_name + '</td><td class="num"><span id="pi-rowisk-' + li + '-' + ai + '">' + fmtIsk(a.net_isk_hr) + '/hr</span></td></tr>';
         }
       });
       h += '</tbody></table></div>';
 
-      // Build sheet + market detail per chain
+      // Build sheet + market detail per chain (editable \u2014 see piChainSheetInner)
       (layout.allocated||[]).forEach((a, ai) => {
         h += '<details class="build-detail"' + (ai === 0 ? ' open' : '') + '>';
         h += '<summary>' + a.output_name + ' &mdash; Build Sheet &amp; Market</summary>';
-
-        // Per-planet build sheet
-        (a.planets_used||[]).forEach((p, pi) => {
-          h += '<div class="build-planet">';
-          h += '<h4>Planet ' + (pi+1) + ': ' + p.system + ' ' + p.type + '</h4>';
-          h += '<div style="color:var(--dim);margin-bottom:6px;">' + p.role + '</div>';
-
-          // Facilities
-          const fac = p.facilities || {};
-          const facParts = [];
-          if (fac.ecu) facParts.push(fac.ecu + ' ECU (' + (p.ecu_heads||10) + ' heads)');
-          if (fac.bif) facParts.push(fac.bif + ' BIF');
-          if (fac.aif) facParts.push(fac.aif + ' AIF');
-          if (fac.launchpad) facParts.push(fac.launchpad + ' Launchpad');
-          if (fac.storage) facParts.push(fac.storage + ' Storage');
-          if (facParts.length) {
-            h += '<div class="build-row"><span class="lbl">Build:</span><span class="val">' + facParts.join(' &bull; ') + '</span></div>';
-          }
-
-          // Extraction rates
-          const p0hr = p.p0_consumed_hr || [];
-          const rateStr = p.rate_detail || '';
-          const rateStrs = p.rate_details || [];
-          if (rateStrs.length) {
-            rateStrs.forEach(r => {
-              h += '<div class="build-row"><span class="lbl">Extract:</span><span class="val">' + r + '</span></div>';
-            });
-          } else if (rateStr) {
-            h += '<div class="build-row"><span class="lbl">Extract:</span><span class="val">' + rateStr + '</span></div>';
-          }
-
-          // AIF breakdown (P3 factory planets)
-          const aifBd = p.aif_breakdown || [];
-          if (aifBd.length) {
-            aifBd.forEach(line => {
-              h += '<div class="build-row"><span class="lbl">AIF:</span><span class="val">' + line + '</span></div>';
-            });
-          }
-
-          // Output
-          if (p.units_hr > 0 && !aifBd.length) {
-            h += '<div class="build-row"><span class="lbl">Output:</span><span class="val accent">' + p.units_hr.toFixed(1) + ' units/hr</span>';
-            if (p.volume_hr > 0) h += ' <span class="dim">(' + p.volume_hr.toFixed(1) + ' m\u00b3/hr)</span>';
-            h += '</div>';
-          }
-
-          // PG / CPU bars
-          if (p.pg_budget > 0) {
-            const pgPct = Math.min(100, p.pg_used / p.pg_budget * 100);
-            const cpuPct = Math.min(100, p.cpu_used / p.cpu_budget * 100);
-            const pgColor = pgPct > 90 ? '#c44' : pgPct > 70 ? '#ca4' : '#4a9';
-            const cpuColor = cpuPct > 90 ? '#c44' : cpuPct > 70 ? '#ca4' : '#59c';
-            h += '<div class="build-row" style="margin-top:4px;">';
-            h += '<span class="lbl">PG:</span>';
-            h += '<span class="bar-bg"><span class="bar-fill" style="width:' + pgPct + '%;background:' + pgColor + '"></span></span> ';
-            h += '<span class="val">' + (p.pg_used||0).toLocaleString() + '</span><span class="dim"> / ' + p.pg_budget.toLocaleString() + ' (' + pgPct.toFixed(0) + '%)</span>';
-            h += '&nbsp;&nbsp;&nbsp;';
-            h += '<span class="lbl">CPU:</span>';
-            h += '<span class="bar-bg"><span class="bar-fill" style="width:' + cpuPct + '%;background:' + cpuColor + '"></span></span> ';
-            h += '<span class="val">' + (p.cpu_used||0).toLocaleString() + '</span><span class="dim"> / ' + p.cpu_budget.toLocaleString() + ' (' + cpuPct.toFixed(0) + '%)</span>';
-            h += '</div>';
-          }
-
-          h += '</div>'; // build-planet
-        });
-
-        // Bottleneck
-        if (a.bottleneck) {
-          h += '<div class="bottleneck-box"><strong>Bottleneck:</strong> ' + a.bottleneck + '</div>';
-        }
-
-        // Market detail
-        const m = a.market || {};
-        if (m.local_buy > 0 || m.jita_buy > 0) {
-          h += '<div class="market-box">';
-          if (m.sell_recommendation) {
-            h += '<div class="sell-rec">' + m.sell_recommendation + '</div>';
-          }
-          h += '<div class="market-grid">';
-          // Local
-          if (m.local_buy > 0) {
-            h += '<div>Local buy: <span class="val">' + fmtIsk(m.local_buy) + '</span> @ ' + (m.buyer_system||'?') + ' (' + (m.buyer_jumps||0) + 'j)</div>';
-            h += '<div>Sustained: <span class="val">' + fmtIsk(m.local_sustained||0) + '</span> (30d blend)</div>';
-            h += '<div>Order depth: <span class="val">' + (m.depth_days||0).toFixed(0) + 'd</span> (' + (m.depth_units||0).toLocaleString() + ' units)</div>';
-            h += '<div>History: <span class="val">' + (m.order_count||0) + ' trades/30d</span>, ' + (m.active_days||0) + 'd active, ' + (m.avg_daily_vol||0).toFixed(0) + ' units/day</div>';
-          } else {
-            h += '<div style="color:var(--yellow)">No local buy orders in range</div><div></div>';
-          }
-          // Jita
-          if (m.jita_buy > 0 || m.jita_vwap > 0) {
-            h += '<div>Jita buy: <span class="val">' + fmtIsk(m.jita_buy||0) + '</span></div>';
-            h += '<div>Jita VWAP: <span class="val">' + fmtIsk(m.jita_vwap||0) + '</span>, ' + (m.jita_daily_vol||0).toFixed(0) + ' units/day</div>';
-          }
-          // Revenue breakdown
-          h += '<div style="margin-top:4px;grid-column:1/-1;border-top:1px solid var(--border);padding-top:4px;">';
-          h += 'Revenue: <span class="val">' + fmtIsk(a.gross_isk_hr||0) + '/hr</span> gross';
-          h += ' &minus; <span style="color:var(--yellow)">' + fmtIsk(a.tax_per_hr||0) + '/hr</span> tax';
-          h += ' = <span class="val" style="color:var(--accent)">' + fmtIsk(a.net_isk_hr||0) + '/hr</span> net';
-          if (a.haul_minutes_per_day > 0) h += ' &nbsp;|&nbsp; Haul: ' + a.haul_minutes_per_day.toFixed(0) + ' min/day';
-          h += '</div>';
-          h += '</div>'; // market-grid
-          h += '</div>'; // market-box
-        }
-
+        h += '<div id="pi-sheet-' + li + '-' + ai + '">' + piChainSheetInner(a, li, ai) + '</div>';
         h += '</details>';
       });
 
@@ -3723,6 +3618,189 @@ function copyPiMarkdown() {
     btn.textContent = 'Copied!';
     setTimeout(() => { btn.textContent = 'Copy Markdown to Clipboard'; }, 2000);
   });
+}
+
+// ── Editable build sheet (manual BIF/AIF overrides) ──
+function piSummaryInner(layout) {
+  const rt = layout.route || {};
+  let haulStr = '';
+  if (rt.daily_haul_minutes != null) {
+    const trips = rt.trips_per_day || 1;
+    haulStr = rt.daily_haul_minutes.toFixed(0) + ' min/day (' + trips + ' trip' + (trips > 1 ? 's' : '') + ')';
+    if (rt.isk_per_haul_min) haulStr += ' &bull; ' + fmtIsk(rt.isk_per_haul_min) + '/haul-min';
+  }
+  let s = '<strong>' + fmtIsk(layout.total_net) + '/hr net</strong> &mdash; <span style="color:var(--dim)">' + layout.strategy + '</span>';
+  if (haulStr) s += ' &nbsp;|&nbsp; Haul: ' + haulStr;
+  return s;
+}
+
+function piChainSheetInner(a, li, ai) {
+  let h = '';
+  const editable = (a.planets_used||[]).some(p => p.bif_editable || p.aif_editable);
+
+  (a.planets_used||[]).forEach((p, pi) => {
+    h += '<div class="build-planet">';
+    h += '<h4>Planet ' + (pi+1) + ': ' + p.system + ' ' + p.type + '</h4>';
+    h += '<div style="color:var(--dim);margin-bottom:6px;">' + p.role + '</div>';
+
+    // Facilities — BIF/AIF become inline editors
+    const fac = p.facilities || {};
+    const facParts = [];
+    if (fac.ecu) facParts.push(fac.ecu + ' ECU (' + (p.ecu_heads||10) + ' heads)');
+    if (p.bif_editable) {
+      facParts.push('<input type="number" min="0" class="fac-edit" id="bif-' + li + '-' + ai + '-' + pi + '" value="' + (fac.bif||0) + '" style="width:3.4em;"> BIF');
+    } else if (fac.bif) {
+      facParts.push(fac.bif + ' BIF');
+    }
+    if (p.aif_editable) {
+      facParts.push('<input type="number" min="0" class="fac-edit" id="aif-' + li + '-' + ai + '-' + pi + '" placeholder="' + (fac.aif||0) + '" value="" title="Blank = auto-derive from P1 supply" style="width:3.4em;"> AIF <span class="dim">(auto: ' + (fac.aif||0) + ')</span>');
+    } else if (fac.aif) {
+      facParts.push(fac.aif + ' AIF');
+    }
+    if (fac.launchpad) facParts.push(fac.launchpad + ' Launchpad');
+    if (fac.storage) facParts.push(fac.storage + ' Storage');
+    if (facParts.length) {
+      h += '<div class="build-row"><span class="lbl">Build:</span><span class="val">' + facParts.join(' &bull; ') + '</span></div>';
+    }
+
+    // Extraction rates
+    const rateStr = p.rate_detail || '';
+    const rateStrs = p.rate_details || [];
+    if (rateStrs.length) {
+      rateStrs.forEach(r => {
+        h += '<div class="build-row"><span class="lbl">Extract:</span><span class="val">' + r + '</span></div>';
+      });
+    } else if (rateStr) {
+      h += '<div class="build-row"><span class="lbl">Extract:</span><span class="val">' + rateStr + '</span></div>';
+    }
+
+    // AIF breakdown (P3 factory planets)
+    const aifBd = p.aif_breakdown || [];
+    if (aifBd.length) {
+      aifBd.forEach(line => {
+        h += '<div class="build-row"><span class="lbl">AIF:</span><span class="val">' + line + '</span></div>';
+      });
+    }
+
+    // Output
+    if (p.units_hr > 0 && !aifBd.length) {
+      h += '<div class="build-row"><span class="lbl">Output:</span><span class="val accent">' + p.units_hr.toFixed(1) + ' units/hr</span>';
+      if (p.volume_hr > 0) h += ' <span class="dim">(' + p.volume_hr.toFixed(1) + ' m³/hr)</span>';
+      h += '</div>';
+    }
+
+    // PG / CPU bars
+    if (p.pg_budget > 0) {
+      const pgPct = Math.min(100, p.pg_used / p.pg_budget * 100);
+      const cpuPct = Math.min(100, p.cpu_used / p.cpu_budget * 100);
+      const pgColor = pgPct > 90 ? '#c44' : pgPct > 70 ? '#ca4' : '#4a9';
+      const cpuColor = cpuPct > 90 ? '#c44' : cpuPct > 70 ? '#ca4' : '#59c';
+      h += '<div class="build-row" style="margin-top:4px;">';
+      h += '<span class="lbl">PG:</span>';
+      h += '<span class="bar-bg"><span class="bar-fill" style="width:' + pgPct + '%;background:' + pgColor + '"></span></span> ';
+      h += '<span class="val">' + (p.pg_used||0).toLocaleString() + '</span><span class="dim"> / ' + p.pg_budget.toLocaleString() + ' (' + pgPct.toFixed(0) + '%)</span>';
+      h += '&nbsp;&nbsp;&nbsp;';
+      h += '<span class="lbl">CPU:</span>';
+      h += '<span class="bar-bg"><span class="bar-fill" style="width:' + cpuPct + '%;background:' + cpuColor + '"></span></span> ';
+      h += '<span class="val">' + (p.cpu_used||0).toLocaleString() + '</span><span class="dim"> / ' + p.cpu_budget.toLocaleString() + ' (' + cpuPct.toFixed(0) + '%)</span>';
+      h += '</div>';
+      if (p.over_budget) {
+        h += '<div class="build-row"><span class="val" style="color:#c44;">⚠ Over PG/CPU budget — only fits with careful link routing.</span></div>';
+      }
+    }
+
+    h += '</div>'; // build-planet
+  });
+
+  // Apply / Reset controls
+  if (editable) {
+    h += '<div class="build-row" style="margin:8px 0;gap:8px;">';
+    h += '<button onclick="recalcChain(' + li + ',' + ai + ')">Recalculate</button>';
+    h += '<button onclick="resetChain(' + li + ',' + ai + ')" style="background:#555;margin-left:6px;">Reset</button>';
+    h += '<span class="dim" id="pi-recalc-msg-' + li + '-' + ai + '" style="margin-left:8px;"></span>';
+    h += '</div>';
+    h += '<div class="build-row"><span class="dim" style="font-size:0.85em;">Edit BIFs per P1 planet (link power means each really fits a few more/fewer); leave AIF blank to auto-derive from the resulting P1 supply.</span></div>';
+  }
+
+  // Bottleneck
+  if (a.bottleneck) {
+    h += '<div class="bottleneck-box"><strong>Bottleneck:</strong> ' + a.bottleneck + '</div>';
+  }
+
+  // Market detail
+  const m = a.market || {};
+  if (m.local_buy > 0 || m.jita_buy > 0) {
+    h += '<div class="market-box">';
+    if (m.sell_recommendation) {
+      h += '<div class="sell-rec">' + m.sell_recommendation + '</div>';
+    }
+    h += '<div class="market-grid">';
+    if (m.local_buy > 0) {
+      h += '<div>Local buy: <span class="val">' + fmtIsk(m.local_buy) + '</span> @ ' + (m.buyer_system||'?') + ' (' + (m.buyer_jumps||0) + 'j)</div>';
+      h += '<div>Sustained: <span class="val">' + fmtIsk(m.local_sustained||0) + '</span> (30d blend)</div>';
+      h += '<div>Order depth: <span class="val">' + (m.depth_days||0).toFixed(0) + 'd</span> (' + (m.depth_units||0).toLocaleString() + ' units)</div>';
+      h += '<div>History: <span class="val">' + (m.order_count||0) + ' trades/30d</span>, ' + (m.active_days||0) + 'd active, ' + (m.avg_daily_vol||0).toFixed(0) + ' units/day</div>';
+    } else {
+      h += '<div style="color:var(--yellow)">No local buy orders in range</div><div></div>';
+    }
+    if (m.jita_buy > 0 || m.jita_vwap > 0) {
+      h += '<div>Jita buy: <span class="val">' + fmtIsk(m.jita_buy||0) + '</span></div>';
+      h += '<div>Jita VWAP: <span class="val">' + fmtIsk(m.jita_vwap||0) + '</span>, ' + (m.jita_daily_vol||0).toFixed(0) + ' units/day</div>';
+    }
+    h += '<div style="margin-top:4px;grid-column:1/-1;border-top:1px solid var(--border);padding-top:4px;">';
+    h += 'Revenue: <span class="val">' + fmtIsk(a.gross_isk_hr||0) + '/hr</span> gross';
+    h += ' &minus; <span style="color:var(--yellow)">' + fmtIsk(a.tax_per_hr||0) + '/hr</span> tax';
+    h += ' = <span class="val" style="color:var(--accent)">' + fmtIsk(a.net_isk_hr||0) + '/hr</span> net';
+    if (a.haul_minutes_per_day > 0) h += ' &nbsp;|&nbsp; Haul: ' + a.haul_minutes_per_day.toFixed(0) + ' min/day';
+    h += '</div>';
+    h += '</div>'; // market-grid
+    h += '</div>'; // market-box
+  }
+  return h;
+}
+
+function applyChainUpdate(li, ai) {
+  const layout = piData.layouts[li];
+  const a = layout.allocated[ai];
+  const sheet = document.getElementById('pi-sheet-' + li + '-' + ai);
+  if (sheet) sheet.innerHTML = piChainSheetInner(a, li, ai);
+  const sm = document.getElementById('pi-summary-' + li);
+  if (sm) sm.innerHTML = piSummaryInner(layout);
+  const ri = document.getElementById('pi-rowisk-' + li + '-' + ai);
+  if (ri) ri.textContent = fmtIsk(a.net_isk_hr) + '/hr';
+}
+
+async function recalcChain(li, ai) {
+  const a = piData.layouts[li].allocated[ai];
+  const bif = {}, aif = {};
+  (a.planets_used||[]).forEach((p, pi) => {
+    const bel = document.getElementById('bif-' + li + '-' + ai + '-' + pi);
+    if (bel && bel.value !== '') bif[pi] = parseInt(bel.value, 10);
+    const ael = document.getElementById('aif-' + li + '-' + ai + '-' + pi);
+    if (ael && ael.value !== '') aif[pi] = parseInt(ael.value, 10);
+  });
+  const msg = document.getElementById('pi-recalc-msg-' + li + '-' + ai);
+  if (msg) msg.textContent = 'Recalculating…';
+  try {
+    const resp = await fetch('/api/pi/recalc', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({layout_index: li, chain_index: ai, bif_overrides: bif, aif_overrides: aif})});
+    const res = await resp.json();
+    if (res.error) { if (msg) msg.textContent = '⚠ ' + res.error; return; }
+    piData.layouts[li].allocated[ai] = res.entry;
+    piData.layouts[li].total_net = res.total_net;
+    if (res.route) piData.layouts[li].route = res.route;
+    applyChainUpdate(li, ai);
+    if (msg) msg.textContent = 'Updated.';
+  } catch (e) {
+    if (msg) msg.textContent = 'Failed: ' + e;
+  }
+}
+
+function resetChain(li, ai) {
+  piData.layouts[li].allocated[ai] = JSON.parse(JSON.stringify(piOriginal[li].allocated[ai]));
+  piData.layouts[li].total_net = piOriginal[li].total_net;
+  piData.layouts[li].route = JSON.parse(JSON.stringify(piOriginal[li].route || {}));
+  applyChainUpdate(li, ai);
 }
 </script>
 </body>
@@ -3914,7 +3992,25 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             self._handle_pi_save_taxes(body)
             return
 
+        if parsed.path == "/api/pi/recalc":
+            self._handle_pi_recalc(body)
+            return
+
         self.send_error(404)
+
+    def _handle_pi_recalc(self, body):
+        import pi_dossier
+        try:
+            data = json.loads(body.decode()) if body else {}
+            result = pi_dossier.recalc_chain_build(
+                int(data.get("layout_index", -1)),
+                int(data.get("chain_index", -1)),
+                bif_overrides=data.get("bif_overrides") or {},
+                aif_overrides=data.get("aif_overrides") or {},
+            )
+            self._send_json(result)
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
 
     def _handle_pi_save_inventory(self, body):
         import pi_dossier
