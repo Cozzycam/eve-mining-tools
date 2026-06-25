@@ -3545,6 +3545,35 @@ function renderPi(data) {
     });
   }
 
+  // Target-a-product what-if: pick any product + your sell price, see its
+  // full setup and ISK/hr at that price vs the best.
+  if ((data.chains||[]).length) {
+    const allChains = (data.chains||[]).slice();
+    const viableChains = allChains.filter(c => c.viable);
+    const srcChains = viableChains.length ? viableChains : allChains;
+    h += '<div class="fitter-section"><h2>Target a Product (what-if)</h2>';
+    h += '<div style="color:var(--dim);font-size:0.85em;margin-bottom:8px;">Pick any product and, optionally, the price you\'d actually sell it at. Shows the full setup + ISK/hr at <em>your</em> price (taken as guaranteed: gross &minus; tax, no liquidity penalty), compared against the best product.</div>';
+    h += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">';
+    h += '<select id="pi-target-product" onchange="onPiTargetChange()" style="min-width:240px;padding:3px;">';
+    h += '<option value="">-- choose a product --</option>';
+    ['P1','P2','P3','P4'].forEach(tier => {
+      const inTier = srcChains.filter(c => c.tier === tier);
+      if (!inTier.length) return;
+      h += '<optgroup label="' + tier + '">';
+      inTier.forEach(c => {
+        const nm = c.output_name.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+        h += '<option value="' + nm + '" data-price="' + Math.round(c.local_sustained||0) + '">' + c.output_name + '</option>';
+      });
+      h += '</optgroup>';
+    });
+    h += '</select>';
+    h += '<label style="font-size:0.88em;">Your price <input type="number" id="pi-target-price" min="0" step="1" placeholder="sustained" style="width:120px;"> ISK</label>';
+    h += '<button onclick="comparePiProduct()">Compare</button>';
+    h += '</div>';
+    h += '<div id="pi-target-result"></div>';
+    h += '</div>';
+  }
+
   // All chains by tier
   ['P1','P2','P3','P4'].forEach(tier => {
     const chains = (data.chains||[]).filter(c => c.tier === tier);
@@ -3620,6 +3649,75 @@ function copyPiMarkdown() {
   });
 }
 
+// ── Target-a-product what-if ──
+function onPiTargetChange() {
+  const sel = document.getElementById('pi-target-product');
+  const opt = sel.options[sel.selectedIndex];
+  const priceEl = document.getElementById('pi-target-price');
+  priceEl.value = '';
+  priceEl.placeholder = (opt && opt.getAttribute('data-price')) ? opt.getAttribute('data-price') : 'sustained';
+}
+
+async function comparePiProduct() {
+  const sel = document.getElementById('pi-target-product');
+  const name = sel.value;
+  const out = document.getElementById('pi-target-result');
+  if (!name) { out.innerHTML = '<span style="color:var(--yellow)">Choose a product first.</span>'; return; }
+  const priceRaw = document.getElementById('pi-target-price').value;
+  let url = '/api/pi/product?name=' + encodeURIComponent(name);
+  if (priceRaw !== '' && !isNaN(parseFloat(priceRaw))) url += '&price=' + parseFloat(priceRaw);
+  out.innerHTML = '<span class="dim">Loading…</span>';
+  try {
+    const resp = await fetch(url);
+    const d = await resp.json();
+    if (d.error) { out.innerHTML = '<span style="color:#c44">' + d.error + '</span>'; return; }
+    out.innerHTML = renderPiTarget(d);
+  } catch (e) {
+    out.innerHTML = '<span style="color:#c44">' + e + '</span>';
+  }
+}
+
+function fmtIskSigned(v) {
+  return (v >= 0 ? '+' : '−') + fmtIsk(Math.abs(v));
+}
+
+function renderPiTarget(d) {
+  const e = d.entry || {};
+  const usingCustom = (d.custom_net_isk_hr != null);
+  const yourNet = usingCustom ? d.custom_net_isk_hr : d.market_net_isk_hr;
+  const yourPrice = usingCustom ? d.custom_price : d.market_price;
+  let h = '';
+
+  h += '<div class="market-box" style="margin-bottom:10px;">';
+  h += '<div style="font-size:1.05em;"><strong>' + e.output_name + '</strong> <span class="dim">(' + e.tier + ' &mdash; ' + (e.layout_type||'') + ')</span></div>';
+  if (!d.viable) h += '<div style="color:var(--yellow);font-size:0.85em;">⚠ Not currently viable with your inventory' + ((d.flags&&d.flags.length)?(': ' + d.flags.join(', ')):'') + '</div>';
+  h += '<div class="market-grid" style="margin-top:6px;">';
+  h += '<div>Setup: <span class="val">' + (e.planets_used||[]).length + ' planet(s)</span></div>';
+  h += '<div>Output: <span class="val">' + (d.units_hr||0).toFixed(1) + ' units/hr</span></div>';
+  h += '<div>Your price: <span class="val">' + fmtIsk(yourPrice||0) + '</span> ' + (usingCustom ? '<span class="dim">(yours)</span>' : '<span class="dim">(market sustained)</span>') + '</div>';
+  h += '<div>Tax: <span style="color:var(--yellow)">' + fmtIsk(d.tax_per_hr||0) + '/hr</span></div>';
+  h += '<div style="grid-column:1/-1;border-top:1px solid var(--border);padding-top:5px;font-size:1.05em;">At your price: <span class="val" style="color:var(--accent);">' + fmtIsk(yourNet) + '/hr net</span>';
+  if (usingCustom) h += ' <span class="dim">&mdash; market sustained would be ' + fmtIsk(d.market_net_isk_hr||0) + '/hr</span>';
+  if (d.haul_minutes_per_day > 0) h += ' <span class="dim">&nbsp;|&nbsp; Haul: ' + d.haul_minutes_per_day.toFixed(0) + ' min/day</span>';
+  h += '</div>';
+
+  if (d.best) {
+    if (d.best.is_target) {
+      h += '<div style="grid-column:1/-1;color:var(--accent);">★ This <em>is</em> the best product right now.</div>';
+    } else {
+      const bestNet = d.best.net_isk_hr || 0;
+      const diff = yourNet - bestNet;
+      h += '<div style="grid-column:1/-1;">vs best (<strong>' + d.best.output_name + '</strong> @ ' + fmtIsk(bestNet) + '/hr net, ' + d.best.planet_count + 'p): <span style="color:' + (diff>=0?'var(--accent)':'#c44') + '">' + fmtIskSigned(diff) + '/hr</span></div>';
+    }
+  }
+  h += '</div></div>'; // market-grid, market-box
+
+  // Full build sheet (read-only — editing stays on the layout cards above).
+  h += '<details class="build-detail" open><summary>' + e.output_name + ' &mdash; Build Sheet &amp; Market</summary>';
+  h += '<div>' + piChainSheetInner(e, -1, -1, true) + '</div></details>';
+  return h;
+}
+
 // ── Editable build sheet (manual BIF/AIF overrides) ──
 function piSummaryInner(layout) {
   const rt = layout.route || {};
@@ -3634,9 +3732,9 @@ function piSummaryInner(layout) {
   return s;
 }
 
-function piChainSheetInner(a, li, ai) {
+function piChainSheetInner(a, li, ai, readonly) {
   let h = '';
-  const editable = (a.planets_used||[]).some(p => p.bif_editable || p.aif_editable);
+  const editable = !readonly && (a.planets_used||[]).some(p => p.bif_editable || p.aif_editable);
 
   (a.planets_used||[]).forEach((p, pi) => {
     h += '<div class="build-planet">';
@@ -3647,12 +3745,12 @@ function piChainSheetInner(a, li, ai) {
     const fac = p.facilities || {};
     const facParts = [];
     if (fac.ecu) facParts.push(fac.ecu + ' ECU (' + (p.ecu_heads||10) + ' heads)');
-    if (p.bif_editable) {
+    if (editable && p.bif_editable) {
       facParts.push('<input type="number" min="0" class="fac-edit" id="bif-' + li + '-' + ai + '-' + pi + '" value="' + (fac.bif||0) + '" style="width:3.4em;"> BIF');
     } else if (fac.bif) {
       facParts.push(fac.bif + ' BIF');
     }
-    if (p.aif_editable) {
+    if (editable && p.aif_editable) {
       facParts.push('<input type="number" min="0" class="fac-edit" id="aif-' + li + '-' + ai + '-' + pi + '" placeholder="' + (fac.aif||0) + '" value="" title="Blank = auto-derive from P1 supply" style="width:3.4em;"> AIF <span class="dim">(auto: ' + (fac.aif||0) + ')</span>');
     } else if (fac.aif) {
       facParts.push(fac.aif + ' AIF');
@@ -3883,7 +3981,31 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             self._handle_pi_generate(parse_qs(parsed.query))
             return
 
+        if parsed.path == "/api/pi/product":
+            self._handle_pi_product(parse_qs(parsed.query))
+            return
+
         self.send_error(404)
+
+    def _handle_pi_product(self, qs):
+        import pi_dossier
+        name = qs.get("name", [""])[0]
+        if not name or not name.strip():
+            self._send_json({"error": "Missing 'name' parameter."}, 400)
+            return
+        price = None
+        if "price" in qs and qs["price"][0] != "":
+            try:
+                price = float(qs["price"][0])
+            except ValueError:
+                price = None
+        try:
+            result = pi_dossier.product_at_price(name.strip(),
+                                                 price_override=price)
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+            return
+        self._send_json(result)
 
     def _handle_fitter(self, qs):
         import fit_dossier

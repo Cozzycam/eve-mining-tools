@@ -3901,6 +3901,72 @@ def recalc_chain_build(layout_index, chain_index, bif_overrides=None,
     }
 
 
+def product_at_price(output_name, price_override=None):
+    """Full build sheet + economics for one named product, optionally
+    re-priced at a user-supplied *guaranteed* sell price.
+
+    The optimizer prices every product off the local buy-order book (blended
+    with VWAP). This lets the user pick any product and assert "I'd sell it at
+    X" — gross = units/hr × X, minus POCO tax, with NO liquidity/activity
+    penalty (the price is taken as guaranteed, so depth doesn't cap it).
+
+    Returns the product's build sheet (same shape the layout cards use), its
+    market-based net for reference, the at-price net, and the current best
+    viable product for side-by-side comparison. Reuses the last in-memory run.
+    """
+    state = _LAST_RUN.get("state")
+    if not state:
+        return {"error": "No PI run in memory — generate the dossier first."}
+    ranked = state.get("ranked") or []
+    pgb, cpub = state["pg_budget"], state["cpu_budget"]
+
+    vc = next((v for v in ranked
+               if v["chain"]["output_name"] == output_name), None)
+    if vc is None:
+        return {"error": f"Product '{output_name}' not found — regenerate the dossier."}
+
+    entry = _chain_entry_json(vc, pgb, cpub)
+    units_hr = vc.get("units_hr", 0)
+    tax_per_hr = vc.get("tax_per_hr", 0)
+
+    out = {
+        "entry": entry,
+        "units_hr": units_hr,
+        "tax_per_hr": tax_per_hr,
+        "market_price": vc.get("local_sustained", 0),
+        "market_gross_isk_hr": vc.get("gross_isk_hr", 0),
+        "market_net_isk_hr": vc.get("net_isk_hr", 0),
+        "haul_minutes_per_day": vc.get("haul_minutes_per_day", 0),
+        "viable": vc.get("viable", False),
+        "flags": vc.get("flags", []),
+    }
+
+    if price_override is not None and price_override > 0:
+        gross = units_hr * price_override
+        out["custom_price"] = price_override
+        out["custom_gross_isk_hr"] = gross
+        out["custom_net_isk_hr"] = gross - tax_per_hr
+
+    # Best = highest activity-adjusted net among viable products (the headline
+    # "this is the best thing" recommendation). Falls back to top of ranked.
+    best = next((v for v in ranked if v.get("viable")),
+                ranked[0] if ranked else None)
+    if best is not None:
+        out["best"] = {
+            "output_name": best["chain"]["output_name"],
+            "tier": best["chain"]["tier"],
+            "net_isk_hr": best.get("net_isk_hr", 0),
+            "adjusted_net_isk_hr": best.get("adjusted_net_isk_hr", 0),
+            "market_price": best.get("local_sustained", 0),
+            "units_hr": best.get("units_hr", 0),
+            "layout_type": best.get("layout_type", ""),
+            "planet_count": best.get("planet_count",
+                                     len(best.get("planets_used", []))),
+            "is_target": best["chain"]["output_name"] == output_name,
+        }
+    return out
+
+
 # ── Web API entry point ───────────────────────────────────────
 
 def generate_pi_dossier_data(overrides=None):
@@ -4090,6 +4156,7 @@ def generate_pi_dossier_data(overrides=None):
     # build (manual BIF/AIF overrides) without re-running the whole optimizer.
     _LAST_RUN["state"] = {
         "ctx": ctx, "ectx": ectx, "cfg": cfg, "layouts": layouts,
+        "ranked": ranked,
         "pg_budget": pg_budget, "cpu_budget": cpu_budget,
     }
 
