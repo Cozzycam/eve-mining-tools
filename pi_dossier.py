@@ -3984,12 +3984,13 @@ def _build_scaled_vc(base_vc, ctx, total_planets):
     pgb, cpub = ctx["pg_budget"], ctx["cpu_budget"]
     p0_to_p1 = ctx["p0_to_p1"]
 
-    def vc_dict(layout_type, planets, units, tags, flags=None):
+    def vc_dict(layout_type, planets, units, tags, flags=None, bottleneck=None):
         return {
             "chain": chain, "viable": True, "layout_type": layout_type,
             "planets_used": planets, "planet_count": len(planets),
             "units_hr": units, "volume_hr": units * chain.get("volume", 0),
             "rate_sources": tags, "flags": flags or [],
+            "bottleneck": bottleneck or "",
         }
 
     if lt == "p1_extractor":
@@ -4069,22 +4070,33 @@ def _build_scaled_vc(base_vc, ctx, total_planets):
             return None  # no spare planet to host the factory
 
         if lt == "p2_factory":
-            factory_layout = compute_factory_layout(chain, pgb, cpub)
-            if not factory_layout:
+            cap_layout = compute_factory_layout(chain, pgb, cpub)
+            if not cap_layout:
                 return None
-            fac_cap = factory_layout["facilities"]["aif"]
+            fac_cap = cap_layout["facilities"]["aif"]
             min_supply = min((supply_by_p1.get(inp["type_id"], 0)
                               for inp in chain["inputs"]), default=0)
             aifs = max(0, min(fac_cap, int(min_supply / 40)))
             units = aifs * 5
-            factory_layout = dict(factory_layout)
-            factory_layout["facilities"] = {"aif": aifs, "launchpad": 1}
-            factory_layout["units_hr"] = units
-            factory_layout["volume_hr"] = units * chain["volume"]
-            factory_layout["role"] = "factory"
+            # PG/CPU must reflect the AIFs actually placed, not the cap.
+            facilities = {"aif": aifs, "launchpad": 1}
+            pg_rem, cpu_rem = _planet_budget_remaining(pgb, cpub, facilities)
+            factory_layout = {
+                "facilities": facilities, "units_hr": units,
+                "volume_hr": units * chain["volume"],
+                "pg_used": pgb - pg_rem, "cpu_used": cpub - cpu_rem,
+                "role": "factory",
+            }
+            if aifs >= fac_cap:
+                bottleneck = (f"Factory AIF capacity (PG/CPU): {aifs} AIF "
+                              f"-> {units:.0f} P2/hr")
+            else:
+                bottleneck = (f"P1 supply: {min_supply:.0f}/hr each input "
+                              f"-> {aifs} AIF -> {units:.0f} P2/hr")
             planets = list(extraction_planets)
             planets.append(_factory_planet_entry(fac, chain, factory_layout))
-            return vc_dict("p2_factory", planets, units, tags)
+            return vc_dict("p2_factory", planets, units, tags,
+                           bottleneck=bottleneck)
 
         # p3_multi: trace the real P1 -> P2 -> P3 cascade for this supply.
         casc = _p3_factory_cascade(chain, supply_by_p1, ctx)
@@ -4137,12 +4149,13 @@ def product_scaling(output_name, price_override=None):
 
     # Display fields copied onto each scaled vc so _chain_entry_json's market
     # block renders (prices don't change with scale; only volumes do).
+    # bottleneck is intentionally NOT copied — each scaled build computes its
+    # own (the base build's bottleneck is wrong at other planet counts).
     market_keys = ("local_buy_price", "local_sustained", "local_buyer_system",
                    "local_buyer_jumps", "local_real_buy_days",
                    "local_real_depth", "local_avg_daily_vol",
                    "local_active_days", "local_order_count", "jita_buy_price",
-                   "jita_vwap", "jita_avg_daily_vol", "sell_recommendation",
-                   "bottleneck")
+                   "jita_vwap", "jita_avg_daily_vol", "sell_recommendation")
 
     scales = []
     seen = set()
@@ -4158,6 +4171,8 @@ def product_scaling(output_name, price_override=None):
         seen.add((pc, u))
         for k in market_keys:
             svc.setdefault(k, base.get(k))
+        if not svc.get("bottleneck"):
+            svc["bottleneck"] = _identify_bottleneck(svc)
         svc["tax_per_hr"] = tax_per_unit * svc["units_hr"]
         svc["gross_isk_hr"] = sustained * svc["units_hr"]
         svc["net_isk_hr"] = svc["gross_isk_hr"] - svc["tax_per_hr"]
