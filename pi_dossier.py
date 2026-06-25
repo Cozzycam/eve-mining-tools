@@ -3901,6 +3901,301 @@ def recalc_chain_build(layout_index, chain_index, bif_overrides=None,
     }
 
 
+# ── Single-product scaling (dedicate more planets to one product) ──────
+#
+# The optimizer sizes every product to a *minimal* footprint (one extractor
+# per P0 + one factory) so the other planets stay free for other products.
+# The Target-a-Product what-if asks the opposite: "if I commit my colony to
+# THIS product, what does each extra planet buy me?" These helpers re-resolve
+# the same chain across more extractor planets (balanced by P1 supply) and
+# report output + the per-planet layout at every planet count up to
+# max_planets. Tax-per-unit is recipe-determined, so net at a guaranteed
+# price scales linearly with throughput — the work is all in units_hr.
+
+
+def _scaled_ext_alloc(ctx, n_ext, p0_names, exclude=frozenset()):
+    """Greedily place n_ext extractor planets balanced across p0_names.
+
+    Each new planet goes to the P0 type with the lowest running P1 supply,
+    drawing the best unused candidate (global rank) for it. Output is gated
+    by the *slowest* input line, so equalising supply maximises throughput.
+    Returns (alloc, used) where alloc is a list of (p0_name, candidate) and
+    used is the set of claimed (system, ptype, instance) instances.
+    """
+    pgb, cpub = ctx["pg_budget"], ctx["cpu_budget"]
+    pools = {n: ctx["p0_candidates"].get(n, []) for n in dict.fromkeys(p0_names)}
+    used = set(exclude)
+    supply = {n: 0.0 for n in pools}
+    alloc = []
+
+    def _p1_out(rate):
+        lay = compute_p1_layout({"volume": 0.38, "tier": "P1"}, rate, pgb, cpub)
+        return lay["units_hr"] if lay else 0  # P1 units_hr is volume-independent
+
+    for _ in range(n_ext):
+        pick = None
+        for name in sorted(supply, key=lambda n: supply[n]):
+            for c in pools[name]:
+                if (c[2], c[3], c[4]) not in used:
+                    pick = (name, c)
+                    break
+            if pick:
+                break
+        if not pick:
+            break  # inventory exhausted — curve plateaus here
+        name, c = pick
+        used.add((c[2], c[3], c[4]))
+        supply[name] += _p1_out(c[0])
+        alloc.append((name, c))
+    return alloc, used
+
+
+def _scaled_extractor_planet(p0_name, cand, p1_info, ctx):
+    """One extractor planet entry producing p1_info from p0_name at cand's rate."""
+    rate, tag, system, ptype, inst = cand
+    vol = p1_info.get("volume", 0.38)
+    p1_layout = compute_p1_layout({"volume": vol, "tier": "P1"}, rate,
+                                  ctx["pg_budget"], ctx["cpu_budget"])
+    if not p1_layout:
+        return None
+    return {
+        "system": system, "type": f"{ptype} {inst}",
+        "role": f"Extract {p0_name} -> {p1_info.get('name', 'P1')}",
+        "layout": p1_layout,
+        "p1_output_hr": p1_layout["units_hr"],
+        "p1_type_id": p1_info.get("type_id", 0),
+        "p1_name": p1_info.get("name", "P1"),
+        "p1_volume": vol,
+        "extract_rates": [rate],
+        "rate_detail": f"{p0_name}: {rate:.0f}/hr [{tag}]",
+    }
+
+
+def _build_scaled_vc(base_vc, ctx, total_planets):
+    """Re-resolve base_vc's product to occupy `total_planets` planets.
+
+    Returns a vc-shaped dict (planets_used / units_hr / planet_count) or None
+    when the product can't be placed at that size (e.g. inventory ran out of
+    candidate planets, or no spare planet for the factory). Economics are
+    attached by the caller. P4 chains have no concrete layout and are skipped.
+    """
+    chain = base_vc["chain"]
+    lt = base_vc.get("layout_type", "")
+    pgb, cpub = ctx["pg_budget"], ctx["cpu_budget"]
+    p0_to_p1 = ctx["p0_to_p1"]
+
+    def vc_dict(layout_type, planets, units, tags, flags=None):
+        return {
+            "chain": chain, "viable": True, "layout_type": layout_type,
+            "planets_used": planets, "planet_count": len(planets),
+            "units_hr": units, "volume_hr": units * chain.get("volume", 0),
+            "rate_sources": tags, "flags": flags or [],
+        }
+
+    if lt == "p1_extractor":
+        # Independent extractor planets; output is the simple sum.
+        p0 = chain["p0_inputs"][0]["name"] if chain.get("p0_inputs") else None
+        p1_info = {"name": chain["output_name"],
+                   "volume": chain.get("volume", 0.38),
+                   "type_id": chain["output_type_id"]}
+        planets, tags = [], []
+        for cand in ctx["p0_candidates"].get(p0, []):
+            if len(planets) >= total_planets:
+                break
+            ent = _scaled_extractor_planet(p0, cand, p1_info, ctx)
+            if ent:
+                ent["role"] = f"Extract {p0} -> {chain['output_name']}"
+                planets.append(ent)
+                tags.append(cand[1])
+        if not planets:
+            return None
+        units = sum(p["layout"]["units_hr"] for p in planets)
+        return vc_dict("p1_extractor", planets, units, tags)
+
+    if lt == "p2_selfcontained":
+        # Independent self-contained planets; output is the sum.
+        p0_names = [p["name"] for p in chain["p0_inputs"]]
+        planets, tags = [], []
+        for c in _sc_candidates_for_chain(chain, ctx)[:total_planets]:
+            inst_rates = ctx["instance_rates"].get(
+                (c["system"], c["ptype"], c["instance"]), {})
+            pair = [inst_rates.get(n, (0, "?")) for n in p0_names]
+            rates = [p[0] for p in pair]
+            ptags = [p[1] for p in pair]
+            layout = compute_p2_selfcontained_layout(chain, rates, pgb, cpub)
+            if not layout:
+                continue
+            planets.append({
+                "system": c["system"], "type": f"{c['ptype']} {c['instance']}",
+                "role": f"Extract+Process -> {chain['output_name']}",
+                "layout": layout,
+                "rate_details": [f"{n}: {r:.0f}/hr [{t}]"
+                                 for n, r, t in zip(p0_names, rates, ptags)],
+                "extract_rates": list(rates), "p0_names": list(p0_names),
+            })
+            tags.extend(ptags)
+        if not planets:
+            return None
+        units = sum(p["layout"]["units_hr"] for p in planets)
+        return vc_dict("p2_selfcontained", planets, units, tags)
+
+    if lt in ("p2_factory", "p3_multi"):
+        if lt == "p2_factory":
+            p0_names = [p["name"] for p in chain["p0_inputs"]]
+        else:
+            p0_names = list(chain["all_p0_names"])
+        n_ext = max(1, total_planets - 1)  # reserve 1 planet for the factory
+        alloc, used = _scaled_ext_alloc(ctx, n_ext, p0_names)
+        if not alloc:
+            return None
+        extraction_planets, tags = [], []
+        supply_by_p1 = {}
+        for name, cand in alloc:
+            p1_info = p0_to_p1.get(name, {"name": "P1", "volume": 0.38,
+                                          "type_id": 0})
+            ent = _scaled_extractor_planet(name, cand, p1_info, ctx)
+            if not ent:
+                continue
+            extraction_planets.append(ent)
+            tags.append(cand[1])
+            tid = p1_info.get("type_id", 0)
+            supply_by_p1[tid] = supply_by_p1.get(tid, 0) + ent["p1_output_hr"]
+        if not extraction_planets:
+            return None
+        fac = _pick_factory_planet(
+            [p["system"] for p in extraction_planets],
+            sorted(ctx["inv"]), used, ctx)
+        if not fac:
+            return None  # no spare planet to host the factory
+
+        if lt == "p2_factory":
+            factory_layout = compute_factory_layout(chain, pgb, cpub)
+            if not factory_layout:
+                return None
+            fac_cap = factory_layout["facilities"]["aif"]
+            min_supply = min((supply_by_p1.get(inp["type_id"], 0)
+                              for inp in chain["inputs"]), default=0)
+            aifs = max(0, min(fac_cap, int(min_supply / 40)))
+            units = aifs * 5
+            factory_layout = dict(factory_layout)
+            factory_layout["facilities"] = {"aif": aifs, "launchpad": 1}
+            factory_layout["units_hr"] = units
+            factory_layout["volume_hr"] = units * chain["volume"]
+            factory_layout["role"] = "factory"
+            planets = list(extraction_planets)
+            planets.append(_factory_planet_entry(fac, chain, factory_layout))
+            return vc_dict("p2_factory", planets, units, tags)
+
+        # p3_multi: trace the real P1 -> P2 -> P3 cascade for this supply.
+        casc = _p3_factory_cascade(chain, supply_by_p1, ctx)
+        units = casc["units_hr"]
+        facilities = {"aif": casc["total_aifs"], "launchpad": 1}
+        pg_rem, cpu_rem = _planet_budget_remaining(pgb, cpub, facilities)
+        flags = list(casc.get("flags", []))
+        if pg_rem < 0 or cpu_rem < 0:
+            flags.append("FACTORY POWER LIMIT")
+        factory_layout = {
+            "facilities": facilities, "units_hr": units,
+            "volume_hr": units * chain["volume"],
+            "pg_used": pgb - pg_rem, "cpu_used": cpub - cpu_rem,
+            "role": "factory", "aif_breakdown": casc["aif_breakdown"],
+        }
+        planets = list(extraction_planets)
+        planets.append(_factory_planet_entry(fac, chain, factory_layout))
+        return vc_dict("p3_multi", planets, units, tags, flags)
+
+    return None  # p4_full and unknown layouts don't scale
+
+
+def product_scaling(output_name, price_override=None):
+    """Scaling curve for one product: output + net + per-planet layout at
+    each planet count from its minimal footprint up to max_planets.
+
+    Reuses the last in-memory run. Tax-per-unit is taken from the optimizer's
+    minimal build (recipe-determined, planet-count-independent), so net at a
+    guaranteed price is just units_hr × (price − tax_per_unit). Rows that buy
+    no extra output over a smaller build are flagged (a 2-input product only
+    gains output when extractors are added in balanced pairs).
+    """
+    state = _LAST_RUN.get("state")
+    if not state:
+        return {"error": "No PI run in memory — generate the dossier first."}
+    ctx, cfg = state["ctx"], state["cfg"]
+    pgb, cpub = state["pg_budget"], state["cpu_budget"]
+    ranked = state.get("ranked") or []
+    base = next((v for v in ranked
+                 if v["chain"]["output_name"] == output_name), None)
+    if base is None:
+        return {"error": f"Product '{output_name}' not found — regenerate the dossier."}
+
+    base_units = base.get("units_hr", 0)
+    tax_per_unit = (base.get("tax_per_hr", 0) / base_units
+                    if base_units > 0 else 0)
+    sustained = base.get("local_sustained", 0)
+    max_planets = cfg["max_planets"]
+    base_count = base.get("planet_count", len(base.get("planets_used", [])))
+
+    # Display fields copied onto each scaled vc so _chain_entry_json's market
+    # block renders (prices don't change with scale; only volumes do).
+    market_keys = ("local_buy_price", "local_sustained", "local_buyer_system",
+                   "local_buyer_jumps", "local_real_buy_days",
+                   "local_real_depth", "local_avg_daily_vol",
+                   "local_active_days", "local_order_count", "jita_buy_price",
+                   "jita_vwap", "jita_avg_daily_vol", "sell_recommendation",
+                   "bottleneck")
+
+    scales = []
+    seen = set()
+    prev_units = -1.0
+    for total in range(base_count, max_planets + 1):
+        svc = _build_scaled_vc(base, ctx, total)
+        if not svc:
+            continue
+        pc = svc["planet_count"]
+        u = round(svc["units_hr"], 3)
+        if (pc, u) in seen:
+            continue
+        seen.add((pc, u))
+        for k in market_keys:
+            svc.setdefault(k, base.get(k))
+        svc["tax_per_hr"] = tax_per_unit * svc["units_hr"]
+        svc["gross_isk_hr"] = sustained * svc["units_hr"]
+        svc["net_isk_hr"] = svc["gross_isk_hr"] - svc["tax_per_hr"]
+        if 0 <= prev_units >= svc["units_hr"] and pc > base_count:
+            svc.setdefault("flags", []).insert(
+                0, "NO EXTRA OUTPUT (needs a balanced pair)")
+        prev_units = svc["units_hr"]
+
+        sp = {
+            "planet_count": pc,
+            "units_hr": svc["units_hr"],
+            "volume_hr": svc["volume_hr"],
+            "tax_per_hr": svc["tax_per_hr"],
+            "market_gross_isk_hr": svc["gross_isk_hr"],
+            "market_net_isk_hr": svc["net_isk_hr"],
+            "is_base": pc == base_count,
+            "entry": _chain_entry_json(svc, pgb, cpub),
+            "flags": svc.get("flags", []),
+        }
+        if price_override is not None and price_override > 0:
+            gross = svc["units_hr"] * price_override
+            sp["custom_price"] = price_override
+            sp["custom_gross_isk_hr"] = gross
+            sp["custom_net_isk_hr"] = gross - svc["tax_per_hr"]
+        scales.append(sp)
+
+    return {
+        "output_name": output_name,
+        "tier": base["chain"]["tier"],
+        "base_planet_count": base_count,
+        "max_planets": max_planets,
+        "tax_per_unit": tax_per_unit,
+        "market_price": sustained,
+        "scalable": len(scales) > 1,
+        "scales": scales,
+    }
+
+
 def product_at_price(output_name, price_override=None):
     """Full build sheet + economics for one named product, optionally
     re-priced at a user-supplied *guaranteed* sell price.
@@ -3964,6 +4259,11 @@ def product_at_price(output_name, price_override=None):
                                      len(best.get("planets_used", []))),
             "is_target": best["chain"]["output_name"] == output_name,
         }
+
+    # Scaling curve: what each extra dedicated planet buys for this product.
+    scaling = product_scaling(output_name, price_override)
+    if "error" not in scaling:
+        out["scaling"] = scaling
     return out
 
 
@@ -4788,6 +5088,63 @@ def self_test():
           "expected over_budget True")
     check("recalc_chain_build errors with no run",
           "error" in recalc_chain_build(0, 0))
+
+    # ── Single-product scaling (more planets -> more output) ──
+    print("\nSingle-product scaling:")
+    scale_chain = {
+        "output_type_id": 90030, "output_name": "TestRocketFuel", "tier": "P2",
+        "volume": 0.75,
+        "p0_inputs": [{"name": "Suspended Plasma"}, {"name": "Ionic Solutions"}],
+        "inputs": [{"type_id": 2, "name": "Plasmoids", "tier": "P1",
+                    "quantity": 40},
+                   {"type_id": 1, "name": "Electrolytes", "tier": "P1",
+                    "quantity": 40}],
+        "all_p0_names": {"Suspended Plasma", "Ionic Solutions"},
+        "schematic": {"output": {"quantity": 5}, "cycle_time": 3600,
+                      "inputs": []},
+    }
+    scale_ctx = {
+        "pg_budget": 17000, "cpu_budget": 21315,
+        "p0_candidates": {
+            "Suspended Plasma": [(8000, "DFL", "S1", "Lava", "A"),
+                                 (8000, "DFL", "S2", "Lava", "A"),
+                                 (8000, "DFL", "S3", "Lava", "A")],
+            "Ionic Solutions": [(8000, "DFL", "S4", "Gas", "A"),
+                                (8000, "DFL", "S5", "Gas", "A"),
+                                (8000, "DFL", "S6", "Gas", "A")],
+        },
+        "p0_to_p1": {
+            "Suspended Plasma": {"name": "Plasmoids", "volume": 0.38,
+                                 "type_id": 2},
+            "Ionic Solutions": {"name": "Electrolytes", "volume": 0.38,
+                                "type_id": 1},
+        },
+        "inv": {"S1": {"Lava": 1}, "S2": {"Lava": 1}, "S3": {"Lava": 1},
+                "S4": {"Gas": 1}, "S5": {"Gas": 1}, "S6": {"Gas": 1},
+                "S7": {"Barren": 1}},
+        "instance_rates": {}, "planet_taxes": {}, "cfg": {"tax_rate": 0.15},
+        "sc_cache": {},
+    }
+    scale_base = {"chain": scale_chain, "layout_type": "p2_factory"}
+    s3 = _build_scaled_vc(scale_base, scale_ctx, 3)
+    s4 = _build_scaled_vc(scale_base, scale_ctx, 4)
+    s5 = _build_scaled_vc(scale_base, scale_ctx, 5)
+    check("Scale 3 planets: 2 ext + 1 factory, 5/hr",
+          s3["planet_count"] == 3 and s3["units_hr"] == 5,
+          f"pc={s3['planet_count']}, units={s3['units_hr']}")
+    check("Scale 4 planets (2+1 ext): no extra output (5/hr)",
+          s4["planet_count"] == 4 and s4["units_hr"] == 5,
+          f"pc={s4['planet_count']}, units={s4['units_hr']}")
+    check("Scale 5 planets (2+2 ext): output doubles to 10/hr",
+          s5["planet_count"] == 5 and s5["units_hr"] == 10,
+          f"pc={s5['planet_count']}, units={s5['units_hr']}")
+    check("Scaled build has exactly one factory",
+          sum(1 for p in s5["planets_used"] if p.get("is_factory")) == 1,
+          f"factories={sum(1 for p in s5['planets_used'] if p.get('is_factory'))}")
+    check("Scaling is monotonic non-decreasing",
+          s3["units_hr"] <= s4["units_hr"] <= s5["units_hr"])
+    check("product_scaling errors with no run",
+          "error" in product_scaling("Anything"))
 
     print(f"\n{'='*40}")
     if errors:

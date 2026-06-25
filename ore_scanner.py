@@ -3701,6 +3701,19 @@ function renderPiTarget(d) {
   if (d.haul_minutes_per_day > 0) h += ' <span class="dim">&nbsp;|&nbsp; Haul: ' + d.haul_minutes_per_day.toFixed(0) + ' min/day</span>';
   h += '</div>';
 
+  const sc = d.scaling;
+  if (sc && sc.scalable && sc.scales && sc.scales.length) {
+    let bestS = sc.scales[0];
+    let bestSN = usingCustom ? (bestS.custom_net_isk_hr||0) : (bestS.market_net_isk_hr||0);
+    sc.scales.forEach(s => {
+      const n = usingCustom ? (s.custom_net_isk_hr||0) : (s.market_net_isk_hr||0);
+      if (n > bestSN) { bestSN = n; bestS = s; }
+    });
+    if (bestS.planet_count > sc.base_planet_count && bestS.units_hr > (d.units_hr||0)) {
+      h += '<div style="grid-column:1/-1;color:var(--accent);">▲ Dedicate <strong>' + bestS.planet_count + ' planets</strong> → ' + bestS.units_hr.toFixed(1) + ' units/hr (' + fmtIsk(bestSN) + '/hr net) &mdash; see scaling below.</div>';
+    }
+  }
+
   if (d.best) {
     if (d.best.is_target) {
       h += '<div style="grid-column:1/-1;color:var(--accent);">★ This <em>is</em> the best product right now.</div>';
@@ -3712,9 +3725,53 @@ function renderPiTarget(d) {
   }
   h += '</div></div>'; // market-grid, market-box
 
-  // Full build sheet (read-only — editing stays on the layout cards above).
-  h += '<details class="build-detail" open><summary>' + e.output_name + ' &mdash; Build Sheet &amp; Market</summary>';
-  h += '<div>' + piChainSheetInner(e, -1, -1, true) + '</div></details>';
+  // Scaling curve (per-planet layouts) when the product can use more planets;
+  // otherwise the single minimal build sheet. Editing stays on layout cards.
+  if (sc && sc.scalable && sc.scales && sc.scales.length > 1) {
+    h += renderPiScaling(sc, usingCustom, d.units_hr || 0);
+  } else {
+    h += '<details class="build-detail" open><summary>' + e.output_name + ' &mdash; Build Sheet &amp; Market</summary>';
+    h += '<div>' + piChainSheetInner(e, -1, -1, true) + '</div></details>';
+  }
+  return h;
+}
+
+function piSetupLabel(entry) {
+  const lt = entry.layout_type || '';
+  const pc = (entry.planets_used || []).length;
+  if (lt === 'p2_factory' || lt === 'p3_multi') return (pc - 1) + ' ext + 1 factory';
+  if (lt === 'p1_extractor') return pc + ' extractor' + (pc > 1 ? 's' : '');
+  if (lt === 'p2_selfcontained') return pc + ' self-contained';
+  return pc + ' planet' + (pc > 1 ? 's' : '');
+}
+
+function renderPiScaling(sc, usingCustom, baseUnits) {
+  const netOf = s => usingCustom ? (s.custom_net_isk_hr || 0) : (s.market_net_isk_hr || 0);
+  let bestIdx = 0, bestNet = -Infinity;
+  sc.scales.forEach((s, i) => { const n = netOf(s); if (n > bestNet) { bestNet = n; bestIdx = i; } });
+  const base = sc.scales[0];
+  const baseNet = netOf(base);
+
+  let h = '<div class="market-box" style="margin-bottom:10px;">';
+  h += '<div style="font-size:1.0em;margin-bottom:4px;"><strong>Scaling</strong> <span class="dim">&mdash; what each extra dedicated planet buys (up to ' + sc.max_planets + ' planets). Net at ' + (usingCustom ? 'your' : 'market sustained') + ' price.</span></div>';
+  h += '<div class="results-wrap"><table><thead><tr><th>Planets</th><th>Setup</th><th class="num">Units/hr</th><th class="num">Net ISK/hr</th><th class="num">vs base</th><th>Notes</th></tr></thead><tbody>';
+  sc.scales.forEach((s, i) => {
+    const net = netOf(s);
+    const noGain = (s.flags || []).some(f => f.indexOf('NO EXTRA') >= 0);
+    const isBest = i === bestIdx && sc.scales.length > 1;
+    const rowStyle = isBest ? ' style="background:rgba(80,200,120,0.12);"' : (noGain ? ' style="opacity:0.55;"' : '');
+    const note = noGain ? '<span style="color:var(--yellow)">no gain &mdash; add a balanced pair</span>' : (isBest ? '<span style="color:var(--accent)">★ best</span>' : '');
+    h += '<tr' + rowStyle + '><td>' + s.planet_count + '</td><td>' + piSetupLabel(s.entry) + '</td><td class="num">' + s.units_hr.toFixed(1) + '</td><td class="num">' + fmtIsk(net) + '</td><td class="num">' + (i === 0 ? '&mdash;' : fmtIskSigned(net - baseNet)) + '</td><td>' + note + '</td></tr>';
+  });
+  h += '</tbody></table></div>';
+
+  // Per-planet-count build sheets (the best one open by default).
+  sc.scales.forEach((s, i) => {
+    const open = (i === bestIdx) ? ' open' : '';
+    h += '<details class="build-detail"' + open + '><summary>' + s.planet_count + ' planets &mdash; ' + s.units_hr.toFixed(1) + ' units/hr build sheet</summary>';
+    h += '<div>' + piChainSheetInner(s.entry, -1, -1, true) + '</div></details>';
+  });
+  h += '</div>';
   return h;
 }
 
