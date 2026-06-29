@@ -282,8 +282,14 @@ MODULE_SEEDS = [
     ("high", "Compressors", "Medium Asteroid Ore Compressor I"),
     ("high", "Cloaking Devices", "Prototype Cloaking Device I"),
     ("high", "Hybrid Turrets", "Light Neutron Blaster I"),
-    ("high", "Missile Launchers", "Light Missile Launcher I"),
     ("high", "Rocket Launchers", "Rocket Launcher I"),
+    ("high", "Light Missile Launchers", "Light Missile Launcher I"),
+    ("high", "Rapid Light Missile Launchers", "Rapid Light Missile Launcher I"),
+    ("high", "Heavy Assault Missile Launchers", "Heavy Assault Missile Launcher I"),
+    ("high", "Heavy Missile Launchers", "Heavy Missile Launcher I"),
+    ("high", "Rapid Heavy Missile Launchers", "Rapid Heavy Missile Launcher I"),
+    ("high", "Cruise Missile Launchers", "Cruise Missile Launcher I"),
+    ("high", "Torpedo Launchers", "Torpedo Launcher I"),
     ("high", "Energy Nosferatu", "Small Energy Nosferatu I"),
     ("high", "Energy Neutralizers", "Small Energy Neutralizer I"),
     ("high", "Probe Launchers", "Core Probe Launcher I"),
@@ -405,11 +411,37 @@ CATEGORY_COLUMNS = {
         ("Optimal", 54, "flat"),              # maxRange (m)
         ("Tracking", 160, "flat"),            # trackingSpeed (rad/s)
     ],
-    "Missile Launchers": [
-        ("ROF", 51, "flat"),                  # speed (ms) — damage comes from the missile
+    # Missile/rocket launchers — damage comes from the missile, not the launcher,
+    # so the launcher's own stats are rate of fire and reload time.
+    "Rocket Launchers": [
+        ("ROF", 51, "flat"),                  # speed (ms)
         ("Reload", 1795, "flat"),             # reloadTime (ms)
     ],
-    "Rocket Launchers": [
+    "Light Missile Launchers": [
+        ("ROF", 51, "flat"),
+        ("Reload", 1795, "flat"),
+    ],
+    "Rapid Light Missile Launchers": [
+        ("ROF", 51, "flat"),
+        ("Reload", 1795, "flat"),
+    ],
+    "Heavy Assault Missile Launchers": [
+        ("ROF", 51, "flat"),
+        ("Reload", 1795, "flat"),
+    ],
+    "Heavy Missile Launchers": [
+        ("ROF", 51, "flat"),
+        ("Reload", 1795, "flat"),
+    ],
+    "Rapid Heavy Missile Launchers": [
+        ("ROF", 51, "flat"),
+        ("Reload", 1795, "flat"),
+    ],
+    "Cruise Missile Launchers": [
+        ("ROF", 51, "flat"),
+        ("Reload", 1795, "flat"),
+    ],
+    "Torpedo Launchers": [
         ("ROF", 51, "flat"),
         ("Reload", 1795, "flat"),
     ],
@@ -466,7 +498,10 @@ ROLE_HIDDEN_CATEGORIES = {
         "high": {"Strip Miners", "Modulated Strip Miners", "Mining Lasers",
                  "Industrial Cores", "Compressors", "Mining Foreman Bursts",
                  "Remote Shield Boosters", "Gas Cloud Harvesters",
-                 "Hybrid Turrets", "Missile Launchers", "Rocket Launchers",
+                 "Hybrid Turrets", "Rocket Launchers", "Light Missile Launchers",
+                 "Rapid Light Missile Launchers", "Heavy Assault Missile Launchers",
+                 "Heavy Missile Launchers", "Rapid Heavy Missile Launchers",
+                 "Cruise Missile Launchers", "Torpedo Launchers",
                  "Energy Nosferatu", "Energy Neutralizers"},
         "mid": {"Shield Boosters", "Stasis Webifiers",
                 "Warp Scramblers & Disruptors"},
@@ -489,7 +524,12 @@ VALID_ROLES = {"unset", "hauler", "mining", "combat", "auto"}
 
 # Weapon categories that need hardpoints — unhidden when the hull has them
 TURRET_WEAPON_CATEGORIES = {"Hybrid Turrets"}
-LAUNCHER_WEAPON_CATEGORIES = {"Missile Launchers", "Rocket Launchers"}
+LAUNCHER_WEAPON_CATEGORIES = {
+    "Rocket Launchers", "Light Missile Launchers",
+    "Rapid Light Missile Launchers", "Heavy Assault Missile Launchers",
+    "Heavy Missile Launchers", "Rapid Heavy Missile Launchers",
+    "Cruise Missile Launchers", "Torpedo Launchers",
+}
 
 
 def role_hidden_categories(role, ship=None):
