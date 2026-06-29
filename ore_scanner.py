@@ -1837,6 +1837,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <option value="auto">Auto-detect</option>
       <option value="hauler">Hauler</option>
       <option value="mining">Mining</option>
+      <option value="combat">Combat</option>
       <option value="unset">Show all</option>
     </select>
   </div>
