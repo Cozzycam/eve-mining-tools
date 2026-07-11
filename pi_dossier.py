@@ -174,6 +174,10 @@ def load_pi_config():
         "pg_budget": cp.getfloat("pi", "power_per_planet", fallback=17000),
         "cpu_budget": cp.getfloat("pi", "cpu_per_planet", fallback=21315),
         "max_planets": cp.getint("pi", "max_planets", fallback=5),
+        # When true, value every final product at the Jita top buy order
+        # (instant dump) instead of the thin in-range local buy book. Matches
+        # a set-and-forget "haul to Jita and sell to buy orders" playstyle.
+        "sell_at_jita": cp.getboolean("pi", "sell_at_jita", fallback=False),
         "avoid_systems": [s.strip() for s in
                           cp.get("pi", "avoid_systems", fallback="").split(",")
                           if s.strip()],
@@ -923,10 +927,13 @@ def fetch_pi_market(pi_types, local_region_id, home_system_id, max_jumps,
             if local_buyer_jumps < 0:
                 local_buyer_jumps = 0
 
-        # Jita: history + live buy (no jump filtering — it's a destination)
+        # Jita: history + live buy + live sell (no jump filtering — it's a
+        # destination). Sell price is what you'd PAY to buy this commodity as
+        # a factory input (import-and-upgrade model).
         jita_hist = _fetch_market_history(jita_region_id, tid)
         jita_stats = _compute_history_stats(jita_hist, days=30)
         jita_live, _ = esi.fetch_best_buy(jita_region_id, tid, use_cache=True)
+        jita_sell, _ = esi.fetch_best_sell(jita_region_id, tid, use_cache=True)
 
         return tid, {
             # Buy order book within range (sorted desc by price)
@@ -949,6 +956,7 @@ def fetch_pi_market(pi_types, local_region_id, home_system_id, max_jumps,
             "jita_active_days": jita_stats["active_days"],
             "jita_order_count": jita_stats["total_order_count"],
             "jita_buy": jita_live,
+            "jita_sell": jita_sell,
         }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
@@ -2009,8 +2017,21 @@ def _compute_economics_single(vc, ectx):
     vc["jita_avg_daily_vol"] = jita_avg_daily_vol
     vc["jita_active_days"] = jita_active_days
 
-    # Gross ISK/hr uses sustained price (realistic over 30 days)
-    vc["gross_isk_hr"] = units_hr * sustained_price
+    # Effective sell price. Default = sustained realised local price (blended
+    # buy book + VWAP). When sell_at_jita is set, value output at the Jita top
+    # buy order instead — an instant dump to Jita buyers (falls back to Jita
+    # VWAP if no live buy order). Jita is deep, so no liquidity/activity penalty
+    # applies and the local buy-book flags are irrelevant.
+    sell_at_jita = bool(cfg.get("sell_at_jita"))
+    if sell_at_jita:
+        sell_price = jita_buy if jita_buy > 0 else jita_vwap
+    else:
+        sell_price = sustained_price
+    vc["sell_at_jita"] = sell_at_jita
+    vc["sell_price"] = sell_price
+
+    # Gross ISK/hr uses the effective sell price
+    vc["gross_isk_hr"] = units_hr * sell_price
 
     # Tax
     tax_per_unit = _compute_chain_tax(vc, pi_types, cfg, planet_taxes)
@@ -2023,8 +2044,12 @@ def _compute_economics_single(vc, ectx):
     # Uses sum(order_count) over the last 30 calendar days as the signal.
     # Products need ~20 trades/month for full activity score.
     # Below that, production may sit unsold waiting for a buyer.
-    activity_factor = min(local_order_count / ORDERS_FOR_FULL_ACTIVITY,
-                          1.0)
+    # Selling at Jita bypasses this: Jita buy orders absorb PI output freely.
+    if sell_at_jita:
+        activity_factor = 1.0
+    else:
+        activity_factor = min(local_order_count / ORDERS_FOR_FULL_ACTIVITY,
+                              1.0)
     vc["activity_factor"] = activity_factor
     vc["adjusted_net_isk_hr"] = vc["net_isk_hr"] * activity_factor
 
@@ -2045,23 +2070,29 @@ def _compute_economics_single(vc, ectx):
 
     # ── Flags ──
 
-    # NO LOCAL BUYER: no buy orders within jump range
-    if local_buy == 0:
-        if local_vwap > 100:
-            vc["flags"].append("NO LOCAL BUYER")
-        elif jita_vwap > 100:
-            vc["flags"].append("NO LOCAL MARKET")
+    # Local-market health flags only matter when we intend to sell locally.
+    # Selling at Jita moots them (Jita has a live buy order or it doesn't).
+    if sell_at_jita:
+        if jita_buy <= 0 and jita_vwap <= 100:
+            vc["flags"].append("NO JITA MARKET")
+    else:
+        # NO LOCAL BUYER: no buy orders within jump range
+        if local_buy == 0:
+            if local_vwap > 100:
+                vc["flags"].append("NO LOCAL BUYER")
+            elif jita_vwap > 100:
+                vc["flags"].append("NO LOCAL MARKET")
 
-    # SHALLOW BUY: real buy order depth covers less than 7 days of production
-    if real_buy_days < SHALLOW_BUY_THRESHOLD_DAYS and units_per_day > 0:
-        if real_buy_days > 0:
-            vc["flags"].append(f"SHALLOW BUY ({real_buy_days:.0f}d depth)")
-        elif local_buy > MIN_REAL_ORDER_PRICE:
-            vc["flags"].append("SHALLOW BUY (<1d depth)")
+        # SHALLOW BUY: real buy order depth covers less than 7 days of output
+        if real_buy_days < SHALLOW_BUY_THRESHOLD_DAYS and units_per_day > 0:
+            if real_buy_days > 0:
+                vc["flags"].append(f"SHALLOW BUY ({real_buy_days:.0f}d depth)")
+            elif local_buy > MIN_REAL_ORDER_PRICE:
+                vc["flags"].append("SHALLOW BUY (<1d depth)")
 
-    # Liquidity from trade frequency
-    if local_order_count < LOW_ACTIVITY_ORDER_THRESHOLD:
-        vc["flags"].append(f"LOW ACTIVITY ({local_order_count} trades/30d)")
+        # Liquidity from trade frequency
+        if local_order_count < LOW_ACTIVITY_ORDER_THRESHOLD:
+            vc["flags"].append(f"LOW ACTIVITY ({local_order_count} trades/30d)")
 
     if vc["haul_minutes_per_day"] > cfg["max_haul_minutes"]:
         vc["flags"].append("HAUL OVER BUDGET")
@@ -2073,8 +2104,9 @@ def _compute_economics_single(vc, ectx):
         if fill_hours < 24:
             vc["flags"].append(f"MUST HAUL EVERY {fill_hours:.0f}H")
 
-    # Jita spread: compare in-range buy vs Jita VWAP
-    if local_buy > 10 and jita_vwap > local_buy:
+    # Jita spread: compare in-range buy vs Jita VWAP (only informative when
+    # selling locally — it's the "you could do better at Jita" nudge).
+    if not sell_at_jita and local_buy > 10 and jita_vwap > local_buy:
         spread_pct = (jita_vwap - local_buy) / local_buy * 100
         if spread_pct > 30:
             vc["flags"].append(f"JITA +{spread_pct:.0f}%")
@@ -2377,6 +2409,16 @@ def _sell_recommendation(vc):
     depth_days = vc.get("local_real_buy_days", 0)
     jita_buy = vc.get("jita_buy_price", 0)
     jita_vwap = vc.get("jita_vwap", 0)
+
+    # Jita-dump mode: pricing is pinned to Jita, so the recommendation is
+    # simply "haul to Jita and sell to buy orders".
+    if vc.get("sell_at_jita"):
+        if jita_buy > 0:
+            return f"Haul to Jita, sell to buy orders at {jita_buy:,.0f} ISK"
+        if jita_vwap > 0:
+            return (f"Haul to Jita (~{jita_vwap:,.0f} ISK VWAP; "
+                    f"no live buy order)")
+        return "No Jita market"
 
     if local_buy <= 0 and jita_buy > 0:
         return f"Jita buy orders at {jita_buy:,.0f} ISK (no local buyers)"
@@ -3646,6 +3688,8 @@ def _chain_entry_json(vc, pg_budget, cpu_budget):
             "jita_vwap": vc.get("jita_vwap", 0),
             "jita_daily_vol": vc.get("jita_avg_daily_vol", 0),
             "sell_recommendation": vc.get("sell_recommendation", ""),
+            "sell_at_jita": vc.get("sell_at_jita", False),
+            "sell_price": vc.get("sell_price", vc.get("local_sustained", 0)),
         },
     }
 
@@ -4143,7 +4187,9 @@ def product_scaling(output_name, price_override=None):
     base_units = base.get("units_hr", 0)
     tax_per_unit = (base.get("tax_per_hr", 0) / base_units
                     if base_units > 0 else 0)
-    sustained = base.get("local_sustained", 0)
+    # Price scaled builds at the same effective sell price the optimizer used
+    # (Jita buy when sell_at_jita is on, else the sustained local price).
+    sustained = base.get("sell_price", base.get("local_sustained", 0))
     max_planets = cfg["max_planets"]
     base_count = base.get("planet_count", len(base.get("planets_used", [])))
 
@@ -4243,7 +4289,8 @@ def product_at_price(output_name, price_override=None):
         "entry": entry,
         "units_hr": units_hr,
         "tax_per_hr": tax_per_hr,
-        "market_price": vc.get("local_sustained", 0),
+        "market_price": vc.get("sell_price", vc.get("local_sustained", 0)),
+        "sell_at_jita": vc.get("sell_at_jita", False),
         "market_gross_isk_hr": vc.get("gross_isk_hr", 0),
         "market_net_isk_hr": vc.get("net_isk_hr", 0),
         "haul_minutes_per_day": vc.get("haul_minutes_per_day", 0),
@@ -4282,6 +4329,252 @@ def product_at_price(output_name, price_override=None):
     return out
 
 
+# ── Import-and-upgrade analysis ───────────────────────────────
+# Alternative to full vertical integration: BUY lower-tier PI commodities at
+# Jita (sell orders), haul them to a factory planet, process up to a higher
+# tier, and dump the finished product at Jita (buy orders). No extraction — the
+# planet is pure refinery. Compares "which product is worth making this way,
+# and from which buy-in tier" purely on Jita spread minus POCO tax.
+
+_TIER_LEVEL = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "P4": 4}
+_TIER_NAMES = {v: k for k, v in _TIER_LEVEL.items()}
+
+
+def _first_schematic(type_id, pi_types, schematics):
+    """The production schematic for a type (first listed), or None."""
+    t = pi_types.get(type_id)
+    if not t:
+        return None
+    for sid in t.get("produced_by", []):
+        sch = schematics.get(sid)
+        if sch:
+            return sch
+    return None
+
+
+def _bom_at_tier(type_id, qty, buy_level, pi_types, schematics, acc, depth=0):
+    """Accumulate into acc {type_id: units} the tier<=buy_level commodities
+    required to make `qty` units of type_id, expanding higher tiers via their
+    schematics. Fractional quantities are expected (per 1 unit of a target)."""
+    t = pi_types.get(type_id)
+    if not t or depth > 12:
+        return
+    if _TIER_LEVEL.get(t["tier"], 0) <= buy_level:
+        acc[type_id] = acc.get(type_id, 0.0) + qty
+        return
+    sch = _first_schematic(type_id, pi_types, schematics)
+    if not sch:
+        acc[type_id] = acc.get(type_id, 0.0) + qty  # unexpandable -> treat as buy
+        return
+    out_qty = sch["output"].get("quantity", 1) or 1
+    runs = qty / out_qty
+    for inp in sch["inputs"]:
+        _bom_at_tier(inp["type_id"], inp["quantity"] * runs, buy_level,
+                     pi_types, schematics, acc, depth + 1)
+
+
+def _facility_bundle(type_id, rate_hr, buy_level, pi_types, schematics,
+                     acc, depth=0):
+    """Accumulate fractional facility counts into acc ({"aif","htif"}) needed
+    to sustain rate_hr units/hr of type_id, processing every tier above
+    buy_level on-planet (tiers <= buy_level are bought, so no facility)."""
+    t = pi_types.get(type_id)
+    if not t or depth > 12:
+        return
+    tier = t["tier"]
+    if _TIER_LEVEL.get(tier, 0) <= buy_level:
+        return
+    sch = _first_schematic(type_id, pi_types, schematics)
+    if not sch:
+        return
+    out_qty = sch["output"].get("quantity", 1) or 1
+    cycle = sch.get("cycle_time", 3600) or 3600
+    per_fac_hr = out_qty * 3600.0 / cycle
+    if per_fac_hr > 0:
+        key = "htif" if tier == "P4" else "aif"
+        acc[key] = acc.get(key, 0.0) + rate_hr / per_fac_hr
+    cycles_hr = rate_hr / out_qty
+    for inp in sch["inputs"]:
+        _facility_bundle(inp["type_id"], inp["quantity"] * cycles_hr,
+                         buy_level, pi_types, schematics, acc, depth + 1)
+
+
+def _factory_units_per_planet(bundle_at_1, pg_budget, cpu_budget):
+    """Max target units/hr one factory planet sustains for a bundle sized to
+    make 1 unit/hr, after reserving one launchpad. Limited by PG and CPU."""
+    c = FACILITY_COSTS
+    pg_avail = pg_budget - c["launchpad"]["pg"]
+    cpu_avail = cpu_budget - c["launchpad"]["cpu"]
+    pg_per = (bundle_at_1.get("aif", 0) * c["aif"]["pg"]
+              + bundle_at_1.get("htif", 0) * c["htif"]["pg"])
+    cpu_per = (bundle_at_1.get("aif", 0) * c["aif"]["cpu"]
+               + bundle_at_1.get("htif", 0) * c["htif"]["cpu"])
+    if pg_per <= 0 or cpu_per <= 0:
+        return 0.0, 0.0, 0.0
+    units = max(0.0, min(pg_avail / pg_per, cpu_avail / cpu_per))
+    return units, pg_per, cpu_per
+
+
+def _import_option(chain, buy_level, market, pi_types, schematics,
+                   pg_budget, cpu_budget, tax_rate):
+    """Economics of making one target chain by importing tier<=buy_level inputs.
+
+    Everything is per one unit of finished output, then scaled to a per-planet
+    hourly figure via factory throughput. Prices: inputs at Jita sell (you buy),
+    output at Jita buy (you dump). Tax = POCO import on bought inputs + export
+    on the finished unit (single-factory-planet assumption)."""
+    tid = chain["output_type_id"]
+    out_tier = chain["tier"]
+
+    # Bill of materials at the buy-in tier (per 1 finished unit)
+    bom = {}
+    _bom_at_tier(tid, 1.0, buy_level, pi_types, schematics, bom)
+
+    flags = []
+    input_cost = 0.0
+    input_vol = 0.0
+    import_tax = 0.0
+    input_lines = []
+    for in_tid, qty in sorted(bom.items(), key=lambda kv: -kv[1]):
+        it = pi_types.get(in_tid, {})
+        prices = market.get(in_tid, {})
+        jsell = prices.get("jita_sell", 0) or 0
+        base = PI_TAX_BASE.get(it.get("tier", "P1"), 500)
+        if jsell <= 0:
+            flags.append(f"NO JITA SELL ({it.get('name', in_tid)})")
+        input_cost += qty * jsell
+        input_vol += qty * it.get("volume", 0)
+        import_tax += qty * base * 0.5 * tax_rate
+        input_lines.append({
+            "name": it.get("name", str(in_tid)),
+            "tier": it.get("tier", ""),
+            "qty_per_unit": qty,
+            "jita_sell": jsell,
+            "cost_per_unit": qty * jsell,
+        })
+
+    out_prices = market.get(tid, {})
+    revenue = out_prices.get("jita_buy", 0) or 0
+    rev_basis = "jita_buy"
+    if revenue <= 0:
+        revenue = out_prices.get("jita_vwap", 0) or 0
+        rev_basis = "jita_vwap"
+        if revenue > 0:
+            flags.append("NO JITA BUYER (VWAP est.)")
+        else:
+            flags.append("NO JITA MARKET")
+    export_tax = PI_TAX_BASE.get(out_tier, 70000) * tax_rate
+    tax_per_unit = import_tax + export_tax
+    out_vol = chain.get("volume", 0)
+
+    net_per_unit = revenue - input_cost - tax_per_unit
+    roi = (net_per_unit / input_cost) if input_cost > 0 else 0.0
+
+    # Factory throughput: facilities to make 1 unit/hr, then per-planet units/hr
+    bundle = {}
+    _facility_bundle(tid, 1.0, buy_level, pi_types, schematics, bundle)
+    units_hr, pg_per, cpu_per = _factory_units_per_planet(
+        bundle, pg_budget, cpu_budget)
+
+    net_isk_hr = net_per_unit * units_hr
+    daily_import_vol = input_vol * units_hr * 24
+    daily_export_vol = out_vol * units_hr * 24
+
+    return {
+        "buy_tier": _TIER_NAMES.get(buy_level, "P?"),
+        "buy_level": buy_level,
+        "input_cost_per_unit": input_cost,
+        "tax_per_unit": tax_per_unit,
+        "revenue_per_unit": revenue,
+        "revenue_basis": rev_basis,
+        "net_per_unit": net_per_unit,
+        "roi": roi,
+        "units_hr_per_planet": units_hr,
+        "net_isk_hr_per_planet": net_isk_hr,
+        "aif_count": round(bundle.get("aif", 0), 2),
+        "htif_count": round(bundle.get("htif", 0), 2),
+        "input_vol_per_unit": input_vol,
+        "output_vol_per_unit": out_vol,
+        "daily_import_m3": daily_import_vol,
+        "daily_export_m3": daily_export_vol,
+        "input_lines": input_lines,
+        "flags": flags,
+        "viable": units_hr > 0 and net_per_unit > 0 and not any(
+            f.startswith("NO JITA SELL") or f == "NO JITA MARKET"
+            for f in flags),
+    }
+
+
+def import_upgrade_options(min_tier="P3"):
+    """Rank products you could make by buying lower-tier PI at Jita, hauling to
+    a factory planet, and upgrading. For each target (P3/P4) it evaluates every
+    valid buy-in tier and reports the best.
+
+    Reuses the last in-memory run for pi_types/schematics/market/budgets.
+    """
+    state = _LAST_RUN.get("state")
+    if not state:
+        return {"error": "No PI run in memory — generate the dossier first."}
+    ctx = state["ctx"]
+    ectx = state["ectx"]
+    cfg = state["cfg"]
+    market = ectx["market_prices"]
+    pi_types = ctx["pi_types"]
+    schematics = ctx["schematics"]
+    chains = ctx["chains"]
+    pg_budget = state["pg_budget"]
+    cpu_budget = state["cpu_budget"]
+    tax_rate = cfg.get("tax_rate", 0.15)
+
+    min_level = _TIER_LEVEL.get(min_tier, 3)
+    # Full-integration net (per that product's optimizer layout) for reference
+    ranked = state.get("ranked") or []
+    vi_by_name = {v["chain"]["output_name"]: v for v in ranked}
+
+    products = []
+    for tid, chain in chains.items():
+        out_level = _TIER_LEVEL.get(chain["tier"], 0)
+        if out_level < min_level:
+            continue
+        options = []
+        for buy_level in range(1, out_level):  # P1..(target-1)
+            opt = _import_option(chain, buy_level, market, pi_types, schematics,
+                                 pg_budget, cpu_budget, tax_rate)
+            options.append(opt)
+        if not options:
+            continue
+        # Best = highest per-planet net ISK/hr among viable; else best net/unit
+        viable_opts = [o for o in options if o["viable"]]
+        pool = viable_opts or options
+        best = max(pool, key=lambda o: o["net_isk_hr_per_planet"])
+        vi = vi_by_name.get(chain["output_name"])
+        products.append({
+            "output_name": chain["output_name"],
+            "output_type_id": tid,
+            "tier": chain["tier"],
+            "volume": chain.get("volume", 0),
+            "best": best,
+            "options": options,
+            "full_vi_net_isk_hr": (vi.get("net_isk_hr", 0) if vi else 0),
+            "full_vi_planet_count": (
+                vi.get("planet_count", len(vi.get("planets_used", [])))
+                if vi else 0),
+            "full_vi_viable": bool(vi.get("viable")) if vi else False,
+        })
+
+    # Rank products by their best per-planet net ISK/hr
+    products.sort(key=lambda p: p["best"]["net_isk_hr_per_planet"], reverse=True)
+    return {
+        "min_tier": min_tier,
+        "tax_rate": tax_rate,
+        "pg_budget": pg_budget,
+        "cpu_budget": cpu_budget,
+        "sell_basis": "jita_buy",
+        "buy_basis": "jita_sell",
+        "products": products,
+    }
+
+
 # ── Web API entry point ───────────────────────────────────────
 
 def generate_pi_dossier_data(overrides=None):
@@ -4302,6 +4595,8 @@ def generate_pi_dossier_data(overrides=None):
         for k in ("tax_rate", "hauler_m3", "max_haul_minutes", "max_market_jumps"):
             if k in overrides:
                 cfg[k] = overrides[k]
+        if "sell_at_jita" in overrides:
+            cfg["sell_at_jita"] = bool(overrides["sell_at_jita"])
 
     # Resolve home system
     home_system_id = esi.search_system_id(cfg["home_system"])
@@ -4487,6 +4782,7 @@ def generate_pi_dossier_data(overrides=None):
             "pg_budget": cfg["pg_budget"],
             "cpu_budget": cfg["cpu_budget"],
             "max_planets": cfg["max_planets"],
+            "sell_at_jita": cfg.get("sell_at_jita", False),
         },
         "planet_inventory": planet_inv,
         "extraction_rates": extraction_rates,
@@ -5160,6 +5456,112 @@ def self_test():
           s3["units_hr"] <= s4["units_hr"] <= s5["units_hr"])
     check("product_scaling errors with no run",
           "error" in product_scaling("Anything"))
+
+    # ── Sell-at-Jita pricing mode ──
+    print("\nSell-at-Jita pricing:")
+    _sj_chain = {"output_type_id": 99001, "output_name": "SJ Test", "tier": "P1",
+                 "volume": 0.38, "inputs": [], "p0_inputs": [],
+                 "schematic": {"cycle_time": 3600, "output": {"quantity": 20},
+                               "inputs": []}}
+    _sj_prices = {99001: {"local_buy": 300, "local_book": [], "local_real_depth": 0,
+                          "local_buyer_system": "Home", "local_buyer_jumps": 0,
+                          "local_vwap": 320, "local_avg_daily_vol": 2,
+                          "local_active_days": 3, "local_order_count": 2,
+                          "jita_vwap": 500, "jita_avg_daily_vol": 5000,
+                          "jita_active_days": 30, "jita_buy": 480}}
+    def _sj_run(flag):
+        _cfg = load_pi_config()
+        _cfg["sell_at_jita"] = flag
+        _ectx = {"market_prices": _sj_prices, "cfg": _cfg, "pi_types": {},
+                 "matrix": None, "home_id": None, "system_ids": None,
+                 "planet_taxes": {}, "jita_jumps": 15}
+        _vc = {"chain": _sj_chain, "units_hr": 40.0, "volume_hr": 40.0 * 0.38,
+               "layout_type": "p1_extractor", "planets_used": [], "flags": []}
+        _compute_economics_single(_vc, _ectx)
+        return _vc
+    _sj_local, _sj_jita = _sj_run(False), _sj_run(True)
+    check("Jita mode prices at jita_buy",
+          abs(_sj_jita["sell_price"] - 480) < 1e-6,
+          f"got {_sj_jita['sell_price']}")
+    check("Jita mode gross = units x jita_buy",
+          abs(_sj_jita["gross_isk_hr"] - 40 * 480) < 1e-6)
+    check("Jita mode: no activity penalty",
+          _sj_jita["activity_factor"] == 1.0
+          and abs(_sj_jita["adjusted_net_isk_hr"] - _sj_jita["net_isk_hr"]) < 1e-6)
+    check("Jita mode suppresses local-market flags",
+          not any("LOW ACTIVITY" in f or "SHALLOW" in f or "NO LOCAL" in f
+                  for f in _sj_jita["flags"]),
+          f"flags={_sj_jita['flags']}")
+    check("Local mode still flags low activity",
+          any("LOW ACTIVITY" in f for f in _sj_local["flags"]))
+    check("Modes yield different sell prices",
+          _sj_local["sell_price"] != _sj_jita["sell_price"])
+
+    # ── Import-and-upgrade analysis ──
+    print("\nImport-and-upgrade:")
+    _iu_types = {
+        1:  {"name": "W",  "tier": "P1", "volume": 0.38, "produced_by": []},
+        2:  {"name": "B",  "tier": "P1", "volume": 0.38, "produced_by": []},
+        10: {"name": "C",  "tier": "P2", "volume": 1.5,  "produced_by": [110]},
+        20: {"name": "S",  "tier": "P3", "volume": 6.0,  "produced_by": [120]},
+        30: {"name": "WM", "tier": "P4", "volume": 100.0, "produced_by": [130]},
+    }
+    _iu_sch = {
+        110: {"inputs": [{"type_id": 1, "quantity": 40}, {"type_id": 2, "quantity": 40}],
+              "output": {"type_id": 10, "quantity": 5}, "cycle_time": 3600},
+        120: {"inputs": [{"type_id": 10, "quantity": 10}],
+              "output": {"type_id": 20, "quantity": 3}, "cycle_time": 3600},
+        130: {"inputs": [{"type_id": 20, "quantity": 6}],
+              "output": {"type_id": 30, "quantity": 1}, "cycle_time": 3600},
+    }
+    _iu_chains = {
+        20: {"output_type_id": 20, "output_name": "S", "tier": "P3", "volume": 6.0,
+             "schematic": _iu_sch[120], "inputs": [{"type_id": 10, "tier": "P2", "quantity": 10}]},
+        30: {"output_type_id": 30, "output_name": "WM", "tier": "P4", "volume": 100.0,
+             "schematic": _iu_sch[130], "inputs": [{"type_id": 20, "tier": "P3", "quantity": 6}]},
+    }
+    _iu_market = {
+        1:  {"jita_sell": 100, "jita_buy": 90}, 2: {"jita_sell": 120, "jita_buy": 100},
+        10: {"jita_sell": 12000, "jita_buy": 11000}, 20: {"jita_sell": 90000, "jita_buy": 85000},
+        30: {"jita_sell": 0, "jita_buy": 1500000},
+    }
+    _saved_run = _LAST_RUN.get("state")
+    _LAST_RUN["state"] = {
+        "ctx": {"pi_types": _iu_types, "schematics": _iu_sch, "chains": _iu_chains},
+        "ectx": {"market_prices": _iu_market},
+        "cfg": {"tax_rate": 0.10, "pg_budget": 17000, "cpu_budget": 21315},
+        "ranked": [], "pg_budget": 17000, "cpu_budget": 21315,
+    }
+    _iu = import_upgrade_options(min_tier="P3")
+    _wm = next((p for p in _iu["products"] if p["output_name"] == "WM"), None)
+    _s = next((p for p in _iu["products"] if p["output_name"] == "S"), None)
+    check("Import options built for P3 and P4", _wm is not None and _s is not None)
+    if _wm:
+        _p3 = next(o for o in _wm["options"] if o["buy_tier"] == "P3")
+        check("BOM P4<-P3 costs 6x P3 sell",
+              abs(_p3["input_cost_per_unit"] - 6 * 90000) < 1, _p3["input_cost_per_unit"])
+        _exp_tax = 6 * PI_TAX_BASE["P3"] * 0.5 * 0.10 + PI_TAX_BASE["P4"] * 0.10
+        check("Import tax = import(inputs)+export(P4)",
+              abs(_p3["tax_per_unit"] - _exp_tax) < 1, _p3["tax_per_unit"])
+        check("Revenue = Jita buy of P4",
+              abs(_p3["revenue_per_unit"] - 1500000) < 1)
+        check("P4<-P3 throughput is CPU-limited HTIF ceiling",
+              abs(_p3["units_hr_per_planet"] - (17715 / 1100)) < 0.01
+              and _p3["htif_count"] == 1.0, _p3["units_hr_per_planet"])
+        _p1 = next(o for o in _wm["options"] if o["buy_tier"] == "P1")
+        check("BOM P4<-P1 expands to 160+160 P1",
+              abs(_p1["input_cost_per_unit"] - (160 * 100 + 160 * 120)) < 1,
+              _p1["input_cost_per_unit"])
+    if _s:
+        check("P3 target only offers P1/P2 buy-in",
+              {o["buy_tier"] for o in _s["options"]} == {"P1", "P2"})
+    check("import_upgrade_options ranks best-first",
+          all(_iu["products"][i]["best"]["net_isk_hr_per_planet"]
+              >= _iu["products"][i + 1]["best"]["net_isk_hr_per_planet"]
+              for i in range(len(_iu["products"]) - 1)))
+    _LAST_RUN["state"] = _saved_run
+    check("import_upgrade_options errors with no run",
+          "error" in import_upgrade_options())
 
     print(f"\n{'='*40}")
     if errors:

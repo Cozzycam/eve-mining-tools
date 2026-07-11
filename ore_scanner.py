@@ -1864,6 +1864,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <label>Max market jumps</label>
     <input type="number" id="pi-jumps" placeholder="5" min="0" step="1" value="5" style="width:60px">
   </div>
+  <div class="cb-field" title="Value every final product at the Jita top buy order (instant dump), not the thin local buy book. Skips local liquidity penalties.">
+    <input type="checkbox" id="pi-sell-jita">
+    <label for="pi-sell-jita">Sell at Jita (buy orders)</label>
+  </div>
   <button id="pi-btn" onclick="doPi()">Generate PI Dossier</button>
 </div>
 
@@ -3197,6 +3201,7 @@ async function loadPiConfig() {
       if (data.config.hauler_m3) document.getElementById('pi-hauler').value = data.config.hauler_m3;
       if (data.config.max_haul_minutes) document.getElementById('pi-maxhaul').value = data.config.max_haul_minutes;
       if (data.config.max_market_jumps) document.getElementById('pi-jumps').value = data.config.max_market_jumps;
+      if (data.config.sell_at_jita) document.getElementById('pi-sell-jita').checked = true;
     }
     piConfigLoaded = true;
   } catch(e) { piStatus('Failed to load config: ' + e.message, true); }
@@ -3449,8 +3454,10 @@ async function doPi() {
   const hauler = parseFloat(document.getElementById('pi-hauler').value);
   const maxHaul = parseFloat(document.getElementById('pi-maxhaul').value);
   const maxJumps = parseInt(document.getElementById('pi-jumps').value);
+  const sellJita = document.getElementById('pi-sell-jita').checked;
 
   const params = new URLSearchParams({hauler_m3: hauler, max_haul_minutes: maxHaul, max_market_jumps: maxJumps});
+  if (sellJita) params.set('sell_at_jita', '1');
   try {
     const resp = await fetch('/api/pi/generate?' + params.toString());
     const data = await resp.json();
@@ -3476,6 +3483,11 @@ function renderPi(data) {
 
   // Character info
   h += '<div class="fitter-char"><strong>' + data.char_info.name + '</strong> &mdash; CCU ' + data.pi_skills.ccu + ', IC ' + data.pi_skills.ic + ', Planetology ' + data.pi_skills.planetology + '</div>';
+
+  // Pricing-basis banner
+  if (data.config && data.config.sell_at_jita) {
+    h += '<div style="margin:4px 0 8px;padding:4px 10px;border-radius:4px;background:rgba(74,170,255,0.12);border:1px solid var(--accent);font-size:0.85em;">Pricing: <strong>Jita buy orders</strong> (instant dump). Local liquidity penalties skipped; Jita delivery haul is batched, not in the daily circuit.</div>';
+  }
 
   // Density model calibration status
   const cal = data.calibration;
@@ -3574,6 +3586,18 @@ function renderPi(data) {
     h += '<div id="pi-target-result"></div>';
     h += '</div>';
   }
+
+  // Import & upgrade: buy lower-tier PI at Jita, haul to a factory planet,
+  // process up to P3/P4, dump at Jita. Ranks which product + buy-in tier pays.
+  h += '<div class="fitter-section"><h2>Import &amp; Upgrade at Jita</h2>';
+  h += '<div style="color:var(--dim);font-size:0.85em;margin-bottom:8px;">Skip extraction: <strong>buy</strong> lower-tier commodities at Jita sell price, haul them to a pure-refinery factory planet, process up to the target, and <strong>dump</strong> the finished product at Jita buy price. Ranked by net ISK/hr <em>per factory planet</em> (theoretical PG/CPU ceiling &mdash; watch the daily haul m&sup3;). Tax uses your default POCO rate, single-factory assumption.</div>';
+  h += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">';
+  h += '<label style="font-size:0.88em;">Targets <select id="pi-import-tier" style="padding:3px;"><option value="P4">P4 only</option><option value="P3" selected>P3 &amp; P4</option></select></label>';
+  h += '<button id="pi-import-btn" onclick="loadPiImportOptions()">Compare Import Options</button>';
+  h += '<span class="dim" id="pi-import-msg" style="font-size:0.85em;"></span>';
+  h += '</div>';
+  h += '<div id="pi-import-result"></div>';
+  h += '</div>';
 
   // All chains by tier
   ['P1','P2','P3','P4'].forEach(tier => {
@@ -3680,6 +3704,94 @@ async function comparePiProduct() {
 
 function fmtIskSigned(v) {
   return (v >= 0 ? '+' : '−') + fmtIsk(Math.abs(v));
+}
+
+function fmtM3(v) {
+  v = v || 0;
+  if (v >= 1e6) return (v/1e6).toFixed(1) + 'M m³';
+  if (v >= 1e3) return (v/1e3).toFixed(1) + 'k m³';
+  return Math.round(v).toLocaleString() + ' m³';
+}
+
+async function loadPiImportOptions() {
+  const btn = document.getElementById('pi-import-btn');
+  const msg = document.getElementById('pi-import-msg');
+  const out = document.getElementById('pi-import-result');
+  const tier = document.getElementById('pi-import-tier').value || 'P3';
+  btn.disabled = true; msg.textContent = 'Computing…';
+  out.innerHTML = '';
+  try {
+    const resp = await fetch('/api/pi/import-options?min_tier=' + encodeURIComponent(tier));
+    const d = await resp.json();
+    if (d.error) { msg.textContent = ''; out.innerHTML = '<span style="color:#c44">' + d.error + '</span>'; return; }
+    out.innerHTML = renderPiImportOptions(d);
+    msg.textContent = '';
+  } catch (e) {
+    msg.textContent = '';
+    out.innerHTML = '<span style="color:#c44">' + e + '</span>';
+  }
+  btn.disabled = false;
+}
+
+function renderPiImportOptions(d) {
+  const prods = d.products || [];
+  if (!prods.length) return '<span class="dim">No products to compare.</span>';
+  const rate = Math.round((d.tax_rate||0)*1000)/10;
+  let h = '<div style="color:var(--dim);font-size:0.8em;margin-bottom:6px;">Buy @ Jita sell · sell @ Jita buy · POCO ' + rate + '% · PG/CPU budget ' + (d.pg_budget||0).toLocaleString() + '/' + (d.cpu_budget||0).toLocaleString() + ' per planet. Click a row for every buy-in tier + shopping list.</div>';
+  h += '<div class="results-wrap"><table><thead><tr>';
+  h += '<th>#</th><th>Product</th><th>Buy-in</th><th class="num">Net/planet·hr</th><th class="num">Net/unit</th><th class="num">ROI</th><th class="num">Units/hr/pl</th><th>Factory</th><th class="num">Haul in / out (day)</th><th class="num">Full-extract ref</th><th>Flags</th>';
+  h += '</tr></thead><tbody>';
+  prods.forEach((p, i) => {
+    const b = p.best || {};
+    const rid = 'imp-' + i;
+    const nm = (p.output_name||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+    const fac = (b.htif_count ? b.htif_count + ' HTIF' : '') + (b.htif_count && b.aif_count ? ' + ' : '') + (b.aif_count ? b.aif_count + ' AIF' : '');
+    const viRef = p.full_vi_net_isk_hr ? fmtIsk(p.full_vi_net_isk_hr) + '/hr' + (p.full_vi_planet_count ? ' (' + p.full_vi_planet_count + 'p' + (p.full_vi_viable ? '' : ', infeasible') + ')' : '') : '—';
+    const flags = (b.flags||[]).map(f => '<span style="color:var(--yellow)">' + f + '</span>').join(' ');
+    h += '<tr style="cursor:pointer;" onclick="var x=document.getElementById(\'' + rid + '\');x.style.display=x.style.display===\'none\'?\'\':\'none\';">';
+    h += '<td>' + (i+1) + '</td>';
+    h += '<td>' + nm + ' <span class="dim">' + p.tier + '</span></td>';
+    h += '<td><strong>buy ' + (b.buy_tier||'?') + '</strong></td>';
+    h += '<td class="num" style="color:var(--accent)">' + fmtIsk(b.net_isk_hr_per_planet||0) + '</td>';
+    h += '<td class="num">' + fmtIsk(b.net_per_unit||0) + '</td>';
+    h += '<td class="num">' + ((b.roi||0)*100).toFixed(0) + '%</td>';
+    h += '<td class="num">' + (b.units_hr_per_planet||0).toFixed(2) + '</td>';
+    h += '<td style="font-size:0.85em;">' + (fac||'—') + '</td>';
+    h += '<td class="num" style="font-size:0.85em;">' + fmtM3(b.daily_import_m3) + ' / ' + fmtM3(b.daily_export_m3) + '</td>';
+    h += '<td class="num" style="font-size:0.85em;">' + viRef + '</td>';
+    h += '<td style="font-size:0.8em;">' + flags + '</td>';
+    h += '</tr>';
+    // Detail row: all buy-in tiers + shopping list for the best
+    h += '<tr id="' + rid + '" style="display:none;"><td colspan="11" style="background:rgba(255,255,255,0.02);">';
+    h += '<div style="padding:6px 10px;font-size:0.85em;">';
+    h += '<table style="width:auto;margin-bottom:8px;"><thead><tr><th>Buy-in</th><th class="num">Input cost/u</th><th class="num">Tax/u</th><th class="num">Revenue/u</th><th class="num">Net/u</th><th class="num">ROI</th><th class="num">Units/hr/pl</th><th class="num">Net/planet·hr</th></tr></thead><tbody>';
+    (p.options||[]).forEach(o => {
+      const isBest = o.buy_tier === b.buy_tier;
+      h += '<tr' + (isBest ? ' style="outline:1px solid var(--accent);"' : '') + '>';
+      h += '<td>buy ' + o.buy_tier + (isBest ? ' ★' : '') + '</td>';
+      h += '<td class="num">' + fmtIsk(o.input_cost_per_unit||0) + '</td>';
+      h += '<td class="num">' + fmtIsk(o.tax_per_unit||0) + '</td>';
+      h += '<td class="num">' + fmtIsk(o.revenue_per_unit||0) + (o.revenue_basis==='jita_vwap'?' <span class="dim">(vwap)</span>':'') + '</td>';
+      h += '<td class="num">' + fmtIsk(o.net_per_unit||0) + '</td>';
+      h += '<td class="num">' + ((o.roi||0)*100).toFixed(0) + '%</td>';
+      h += '<td class="num">' + (o.units_hr_per_planet||0).toFixed(2) + '</td>';
+      h += '<td class="num">' + fmtIsk(o.net_isk_hr_per_planet||0) + '</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table>';
+    // Shopping list for the best option
+    if ((b.input_lines||[]).length) {
+      h += '<div style="color:var(--dim);margin-bottom:2px;">Buy list for <strong>' + (b.buy_tier||'') + '</strong> route (per finished unit):</div>';
+      h += '<div style="display:flex;flex-wrap:wrap;gap:4px 14px;">';
+      b.input_lines.forEach(l => {
+        h += '<span>' + (l.qty_per_unit||0).toFixed(2) + '× ' + l.name + ' <span class="dim">@' + fmtIsk(l.jita_sell||0) + '</span></span>';
+      });
+      h += '</div>';
+    }
+    h += '</div></td></tr>';
+  });
+  h += '</tbody></table></div>';
+  return h;
 }
 
 function renderPiTarget(d) {
@@ -4043,7 +4155,21 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             self._handle_pi_product(parse_qs(parsed.query))
             return
 
+        if parsed.path == "/api/pi/import-options":
+            self._handle_pi_import_options(parse_qs(parsed.query))
+            return
+
         self.send_error(404)
+
+    def _handle_pi_import_options(self, qs):
+        import pi_dossier
+        min_tier = qs.get("min_tier", ["P3"])[0] or "P3"
+        try:
+            result = pi_dossier.import_upgrade_options(min_tier=min_tier)
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+            return
+        self._send_json(result)
 
     def _handle_pi_product(self, qs):
         import pi_dossier
@@ -4123,6 +4249,8 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
         if "max_market_jumps" in qs:
             try: overrides["max_market_jumps"] = int(qs["max_market_jumps"][0])
             except ValueError: pass
+        if "sell_at_jita" in qs:
+            overrides["sell_at_jita"] = qs["sell_at_jita"][0] in ("1", "true", "on")
 
         key = tuple(sorted(overrides.items()))
         with _PI_RUNS_LOCK:
