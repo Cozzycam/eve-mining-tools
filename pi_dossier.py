@@ -4575,6 +4575,151 @@ def import_upgrade_options(min_tier="P3"):
     }
 
 
+DEFAULT_ISK_PER_HAUL_MIN = 100000.0  # opportunity value of a minute of hauling
+
+
+def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
+    """Head-to-head: for every product, put the extract-yourself path and the
+    import-and-upgrade path on ONE consistent basis and rank them together.
+
+    Both strategies sell output at the Jita buy order, and both have their
+    hauling priced into net: daily haul minutes (extraction's local gather
+    circuit + delivery to Jita; import's Jita round-trips) times a configurable
+    ISK-per-haul-minute opportunity cost. This answers "what is the single best
+    thing to do with a PI planet, extract or import?".
+
+    Reuses the last in-memory run. Ranked by total net ISK/hr after haul.
+    """
+    state = _LAST_RUN.get("state")
+    if not state:
+        return {"error": "No PI run in memory — generate the dossier first."}
+    ctx = state["ctx"]
+    ectx = state["ectx"]
+    cfg = state["cfg"]
+    market = ectx["market_prices"]
+    pi_types = ctx["pi_types"]
+    schematics = ctx["schematics"]
+    chains = ctx["chains"]
+    pg_budget = state["pg_budget"]
+    cpu_budget = state["cpu_budget"]
+    tax_rate = cfg.get("tax_rate", 0.15)
+    hauler_m3 = cfg.get("hauler_m3", 9000) or 9000
+    jita_jumps = ectx.get("jita_jumps", 15)
+    haul = cfg.get("haul", {"sec_per_jump": 45, "sec_per_station": 180})
+    if isk_per_haul_min is None:
+        isk_per_haul_min = DEFAULT_ISK_PER_HAUL_MIN
+    jita_rt_min = (jita_jumps * 2 * haul.get("sec_per_jump", 45)
+                   + 2 * haul.get("sec_per_station", 180)) / 60.0
+
+    def _trips(m3):
+        return math.ceil(m3 / hauler_m3) if (m3 > 0 and hauler_m3 > 0) else 0
+
+    min_level = _TIER_LEVEL.get(min_tier, 1)
+    ranked = state.get("ranked") or []
+    vi_by_name = {v["chain"]["output_name"]: v for v in ranked}
+
+    plays = []
+    for tid, chain in chains.items():
+        out_level = _TIER_LEVEL.get(chain["tier"], 0)
+        if out_level < min_level:
+            continue
+        name = chain["output_name"]
+        tier = chain["tier"]
+        vol = chain.get("volume", 0)
+        out_prices = market.get(tid, {})
+        rev = out_prices.get("jita_buy", 0) or 0
+        basis = "jita_buy"
+        if rev <= 0:
+            rev = out_prices.get("jita_vwap", 0) or 0
+            basis = "jita_vwap"
+
+        options = []
+
+        # ── Extraction (full P0→ path), re-priced at Jita buy ──
+        vi = vi_by_name.get(name)
+        if vi is not None:
+            units = vi.get("units_hr", 0)
+            tax_hr = vi.get("tax_per_hr", 0)
+            planets = vi.get("planet_count", len(vi.get("planets_used", []))) or 1
+            gross_hr = units * rev
+            net_hr = gross_hr - tax_hr
+            local_min = vi.get("haul_minutes_per_day", 0)
+            deliver_min = _trips(units * 24 * vol) * jita_rt_min
+            haul_min = local_min + deliver_min
+            haul_cost_hr = haul_min * isk_per_haul_min / 24.0
+            net_after = net_hr - haul_cost_hr
+            options.append({
+                "strategy": "extract", "label": "Extract (P0→)",
+                "buy_tier": "—", "planets": planets, "units_hr": units,
+                "gross_isk_hr": gross_hr, "tax_per_hr": tax_hr,
+                "input_cost_isk_hr": 0.0, "net_isk_hr": net_hr,
+                "haul_min_per_day": haul_min, "haul_cost_isk_hr": haul_cost_hr,
+                "net_after_haul_isk_hr": net_after,
+                "net_after_haul_per_planet": net_after / planets if planets else net_after,
+                "revenue_basis": basis, "roi": None,
+                "daily_import_m3": 0.0, "daily_export_m3": units * 24 * vol,
+                "viable": bool(vi.get("viable")) and units > 0,
+                "flags": list(vi.get("flags", [])),
+            })
+
+        # ── Import-and-upgrade (best buy-in tier after haul) ──
+        if out_level >= 2:
+            best_imp = None
+            for buy_level in range(1, out_level):
+                opt = _import_option(chain, buy_level, market, pi_types,
+                                     schematics, pg_budget, cpu_budget, tax_rate)
+                imp_trips = max(_trips(opt["daily_import_m3"]),
+                                _trips(opt["daily_export_m3"]))
+                imp_min = imp_trips * jita_rt_min
+                haul_cost_hr = imp_min * isk_per_haul_min / 24.0
+                net_after = opt["net_isk_hr_per_planet"] - haul_cost_hr
+                opt["_haul_min"] = imp_min
+                opt["_haul_cost_hr"] = haul_cost_hr
+                opt["_net_after"] = net_after
+                if best_imp is None or net_after > best_imp["_net_after"]:
+                    best_imp = opt
+            if best_imp is not None:
+                u = best_imp["units_hr_per_planet"]
+                options.append({
+                    "strategy": "import",
+                    "label": f"Import {best_imp['buy_tier']}→{tier}",
+                    "buy_tier": best_imp["buy_tier"], "planets": 1, "units_hr": u,
+                    "gross_isk_hr": best_imp["revenue_per_unit"] * u,
+                    "tax_per_hr": best_imp["tax_per_unit"] * u,
+                    "input_cost_isk_hr": best_imp["input_cost_per_unit"] * u,
+                    "net_isk_hr": best_imp["net_isk_hr_per_planet"],
+                    "haul_min_per_day": best_imp["_haul_min"],
+                    "haul_cost_isk_hr": best_imp["_haul_cost_hr"],
+                    "net_after_haul_isk_hr": best_imp["_net_after"],
+                    "net_after_haul_per_planet": best_imp["_net_after"],
+                    "revenue_basis": best_imp["revenue_basis"],
+                    "roi": best_imp["roi"],
+                    "daily_import_m3": best_imp["daily_import_m3"],
+                    "daily_export_m3": best_imp["daily_export_m3"],
+                    "viable": best_imp["viable"], "flags": best_imp["flags"],
+                })
+
+        if not options:
+            continue
+        winner = max(options, key=lambda o: o["net_after_haul_isk_hr"])
+        plays.append({
+            "output_name": name, "output_type_id": tid, "tier": tier,
+            "volume": vol, "options": options,
+            "winner_strategy": winner["strategy"],
+            "best_net_after_haul_isk_hr": winner["net_after_haul_isk_hr"],
+            "best_net_after_haul_per_planet": winner["net_after_haul_per_planet"],
+        })
+
+    # Rank by total net ISK/hr after haul (per user's chosen headline metric)
+    plays.sort(key=lambda p: p["best_net_after_haul_isk_hr"], reverse=True)
+    return {
+        "min_tier": min_tier, "tax_rate": tax_rate, "hauler_m3": hauler_m3,
+        "isk_per_haul_min": isk_per_haul_min, "jita_jumps": jita_jumps,
+        "jita_round_trip_min": jita_rt_min, "sell_basis": "jita_buy",
+        "plays": plays,
+    }
+
+
 # ── Web API entry point ───────────────────────────────────────
 
 def generate_pi_dossier_data(overrides=None):
@@ -5559,9 +5704,53 @@ def self_test():
           all(_iu["products"][i]["best"]["net_isk_hr_per_planet"]
               >= _iu["products"][i + 1]["best"]["net_isk_hr_per_planet"]
               for i in range(len(_iu["products"]) - 1)))
+    # ── Best-play head-to-head (extract vs import) ──
+    print("\nBest-play head-to-head:")
+    _bp_ranked = [{
+        "chain": _iu_chains[20], "output_name": "S",
+        "units_hr": 10.0, "tax_per_hr": 20000.0, "planet_count": 3,
+        "planets_used": [1, 2, 3], "haul_minutes_per_day": 30.0,
+        "jita_buy_price": 85000, "viable": True, "flags": [],
+    }]
+    _LAST_RUN["state"] = {
+        "ctx": {"pi_types": _iu_types, "schematics": _iu_sch, "chains": _iu_chains},
+        "ectx": {"market_prices": _iu_market, "jita_jumps": 15},
+        "cfg": {"tax_rate": 0.10, "pg_budget": 17000, "cpu_budget": 21315,
+                "hauler_m3": 9000,
+                "haul": {"sec_per_jump": 45, "sec_per_station": 180}},
+        "ranked": _bp_ranked, "pg_budget": 17000, "cpu_budget": 21315,
+    }
+    _bp = best_pi_plays(isk_per_haul_min=100000, min_tier="P2")
+    _bp_s = next((p for p in _bp["plays"] if p["output_name"] == "S"), None)
+    check("Best-play built for P3 target", _bp_s is not None)
+    if _bp_s:
+        _ex = next(o for o in _bp_s["options"] if o["strategy"] == "extract")
+        _im = next(o for o in _bp_s["options"] if o["strategy"] == "import")
+        check("Extract re-priced at Jita buy (10x85k)",
+              abs(_ex["gross_isk_hr"] - 10 * 85000) < 1, _ex["gross_isk_hr"])
+        check("Extract net before haul = gross - tax",
+              abs(_ex["net_isk_hr"] - (850000 - 20000)) < 1)
+        _rt = _bp["jita_round_trip_min"]
+        check("Extract haul = local circuit + Jita delivery",
+              abs(_ex["haul_min_per_day"] - (30 + 1 * _rt)) < 0.01,
+              _ex["haul_min_per_day"])
+        check("Haul cost subtracted from net",
+              abs(_ex["net_after_haul_isk_hr"]
+                  - (830000 - (30 + _rt) * 100000 / 24)) < 1)
+        check("Both strategies present for P3", _im["strategy"] == "import")
+        check("Winner = higher net after haul",
+              _bp_s["winner_strategy"] ==
+              (_ex if _ex["net_after_haul_isk_hr"] >= _im["net_after_haul_isk_hr"]
+               else _im)["strategy"])
+    check("Best-plays ranked by total net after haul",
+          all(_bp["plays"][i]["best_net_after_haul_isk_hr"]
+              >= _bp["plays"][i + 1]["best_net_after_haul_isk_hr"]
+              for i in range(len(_bp["plays"]) - 1)))
     _LAST_RUN["state"] = _saved_run
     check("import_upgrade_options errors with no run",
           "error" in import_upgrade_options())
+    check("best_pi_plays errors with no run",
+          "error" in best_pi_plays())
 
     print(f"\n{'='*40}")
     if errors:

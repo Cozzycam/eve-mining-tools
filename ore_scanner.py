@@ -3587,6 +3587,19 @@ function renderPi(data) {
     h += '</div>';
   }
 
+  // Best PI play: head-to-head of extract-yourself vs import-and-upgrade, both
+  // sold at Jita buy with hauling priced into net. Answers "what's best?".
+  h += '<div class="fitter-section"><h2>Best PI Play &mdash; Extract vs Import</h2>';
+  h += '<div style="color:var(--dim);font-size:0.85em;margin-bottom:8px;">Every product, both ways on one basis: <strong>extract it yourself</strong> (P0→, your planets) vs <strong>buy &amp; upgrade at Jita</strong>. Both sell output at Jita buy; both have hauling priced into net (daily haul minutes &times; the ISK/min below). Ranked by total net ISK/hr after haul. Run <em>Generate PI Dossier</em> first so the extract side has your real planet layouts.</div>';
+  h += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">';
+  h += '<label style="font-size:0.88em;">Haul cost <input type="number" id="pi-best-haulcost" min="0" step="10000" value="100000" style="width:110px;"> ISK/min</label>';
+  h += '<label style="font-size:0.88em;">From tier <select id="pi-best-tier" style="padding:3px;"><option value="P1" selected>P1+</option><option value="P2">P2+</option><option value="P3">P3+</option></select></label>';
+  h += '<button id="pi-best-btn" onclick="loadPiBestPlays()">Rank Best Plays</button>';
+  h += '<span class="dim" id="pi-best-msg" style="font-size:0.85em;"></span>';
+  h += '</div>';
+  h += '<div id="pi-best-result"></div>';
+  h += '</div>';
+
   // Import & upgrade: buy lower-tier PI at Jita, haul to a factory planet,
   // process up to P3/P4, dump at Jita. Ranks which product + buy-in tier pays.
   h += '<div class="fitter-section"><h2>Import &amp; Upgrade at Jita</h2>';
@@ -3711,6 +3724,76 @@ function fmtM3(v) {
   if (v >= 1e6) return (v/1e6).toFixed(1) + 'M m³';
   if (v >= 1e3) return (v/1e3).toFixed(1) + 'k m³';
   return Math.round(v).toLocaleString() + ' m³';
+}
+
+async function loadPiBestPlays() {
+  const btn = document.getElementById('pi-best-btn');
+  const msg = document.getElementById('pi-best-msg');
+  const out = document.getElementById('pi-best-result');
+  const tier = document.getElementById('pi-best-tier').value || 'P1';
+  const haulCost = document.getElementById('pi-best-haulcost').value;
+  btn.disabled = true; msg.textContent = 'Ranking…'; out.innerHTML = '';
+  try {
+    let url = '/api/pi/best-plays?min_tier=' + encodeURIComponent(tier);
+    if (haulCost !== '' && !isNaN(parseFloat(haulCost))) url += '&isk_per_haul_min=' + parseFloat(haulCost);
+    const resp = await fetch(url);
+    const d = await resp.json();
+    if (d.error) { msg.textContent=''; out.innerHTML = '<span style="color:#c44">' + d.error + '</span>'; return; }
+    out.innerHTML = renderPiBestPlays(d);
+    msg.textContent = '';
+  } catch (e) { msg.textContent=''; out.innerHTML = '<span style="color:#c44">' + e + '</span>'; }
+  btn.disabled = false;
+}
+
+function renderPiBestPlays(d) {
+  const plays = d.plays || [];
+  if (!plays.length) return '<span class="dim">Nothing to rank. Generate the dossier first.</span>';
+  const rt = (d.jita_round_trip_min||0).toFixed(0);
+  let h = '<div style="color:var(--dim);font-size:0.8em;margin-bottom:6px;">Sell @ Jita buy · haul ' + (d.isk_per_haul_min||0).toLocaleString() + ' ISK/min · Jita round-trip ' + rt + ' min (' + (d.jita_jumps||0) + 'j) · hauler ' + (d.hauler_m3||0).toLocaleString() + ' m³. Click a row to see both strategies side by side.</div>';
+  h += '<div class="results-wrap"><table><thead><tr>';
+  h += '<th>#</th><th>Product</th><th>Best play</th><th class="num">Net/hr (after haul)</th><th class="num">Net/planet·hr</th><th class="num">Planets</th><th class="num">Haul min/day</th><th>Flags</th>';
+  h += '</tr></thead><tbody>';
+  plays.forEach((p, i) => {
+    const win = (p.options||[]).find(o => o.strategy === p.winner_strategy) || {};
+    const rid = 'best-' + i;
+    const nm = (p.output_name||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+    const tag = win.strategy === 'extract'
+      ? '<span style="color:#7c7">Extract</span>'
+      : '<span style="color:var(--accent)">' + (win.label||'Import').replace(/</g,'&lt;') + '</span>';
+    const flags = (win.flags||[]).slice(0,2).map(f => '<span style="color:var(--yellow)">' + f + '</span>').join(' ');
+    h += '<tr style="cursor:pointer;" onclick="var x=document.getElementById(\'' + rid + '\');x.style.display=x.style.display===\'none\'?\'\':\'none\';">';
+    h += '<td>' + (i+1) + '</td>';
+    h += '<td>' + nm + ' <span class="dim">' + p.tier + '</span></td>';
+    h += '<td>' + tag + '</td>';
+    h += '<td class="num" style="color:var(--accent)">' + fmtIsk(win.net_after_haul_isk_hr||0) + '</td>';
+    h += '<td class="num">' + fmtIsk(win.net_after_haul_per_planet||0) + '</td>';
+    h += '<td class="num">' + (win.planets||0) + '</td>';
+    h += '<td class="num">' + (win.haul_min_per_day||0).toFixed(0) + '</td>';
+    h += '<td style="font-size:0.8em;">' + flags + '</td>';
+    h += '</tr>';
+    // Detail: both strategies side by side
+    h += '<tr id="' + rid + '" style="display:none;"><td colspan="8" style="background:rgba(255,255,255,0.02);">';
+    h += '<div style="padding:6px 10px;font-size:0.85em;"><table style="width:auto;"><thead><tr>';
+    h += '<th>Strategy</th><th class="num">Units/hr</th><th class="num">Planets</th><th class="num">Gross/hr</th><th class="num">Inputs/hr</th><th class="num">Tax/hr</th><th class="num">Haul cost/hr</th><th class="num">Net/hr (after haul)</th><th class="num">Net/planet·hr</th><th class="num">Import m³/day</th></tr></thead><tbody>';
+    (p.options||[]).forEach(o => {
+      const isWin = o.strategy === p.winner_strategy;
+      h += '<tr' + (isWin ? ' style="outline:1px solid var(--accent);"' : '') + '>';
+      h += '<td>' + (o.label||o.strategy).replace(/</g,'&lt;') + (isWin ? ' ★' : '') + (o.viable === false ? ' <span style="color:var(--yellow)">(infeasible)</span>' : '') + '</td>';
+      h += '<td class="num">' + (o.units_hr||0).toFixed(2) + '</td>';
+      h += '<td class="num">' + (o.planets||0) + '</td>';
+      h += '<td class="num">' + fmtIsk(o.gross_isk_hr||0) + '</td>';
+      h += '<td class="num">' + (o.input_cost_isk_hr ? '−' + fmtIsk(o.input_cost_isk_hr) : '—') + '</td>';
+      h += '<td class="num">−' + fmtIsk(o.tax_per_hr||0) + '</td>';
+      h += '<td class="num">−' + fmtIsk(o.haul_cost_isk_hr||0) + '</td>';
+      h += '<td class="num" style="color:var(--accent)">' + fmtIsk(o.net_after_haul_isk_hr||0) + '</td>';
+      h += '<td class="num">' + fmtIsk(o.net_after_haul_per_planet||0) + '</td>';
+      h += '<td class="num">' + (o.daily_import_m3 ? fmtM3(o.daily_import_m3) : '—') + '</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div></td></tr>';
+  });
+  h += '</tbody></table></div>';
+  return h;
 }
 
 async function loadPiImportOptions() {
@@ -4159,6 +4242,10 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             self._handle_pi_import_options(parse_qs(parsed.query))
             return
 
+        if parsed.path == "/api/pi/best-plays":
+            self._handle_pi_best_plays(parse_qs(parsed.query))
+            return
+
         self.send_error(404)
 
     def _handle_pi_import_options(self, qs):
@@ -4166,6 +4253,23 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
         min_tier = qs.get("min_tier", ["P3"])[0] or "P3"
         try:
             result = pi_dossier.import_upgrade_options(min_tier=min_tier)
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+            return
+        self._send_json(result)
+
+    def _handle_pi_best_plays(self, qs):
+        import pi_dossier
+        min_tier = qs.get("min_tier", ["P1"])[0] or "P1"
+        isk_per_haul_min = None
+        if "isk_per_haul_min" in qs and qs["isk_per_haul_min"][0] != "":
+            try:
+                isk_per_haul_min = float(qs["isk_per_haul_min"][0])
+            except ValueError:
+                isk_per_haul_min = None
+        try:
+            result = pi_dossier.best_pi_plays(isk_per_haul_min=isk_per_haul_min,
+                                              min_tier=min_tier)
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
             return
