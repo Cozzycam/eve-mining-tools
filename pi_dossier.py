@@ -4580,8 +4580,9 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
         "units_hr_per_planet": units_hr,
         "net_isk_hr_per_planet": net_isk_hr,
         "net_isk_hr_buy_sourced": net_isk_hr_buy_sourced,
-        "aif_count": round(bundle.get("aif", 0), 2),
-        "htif_count": round(bundle.get("htif", 0), 2),
+        # Facility counts for the actual planet build (not per unit/hr)
+        "aif_count": round(bundle.get("aif", 0) * units_hr, 2),
+        "htif_count": round(bundle.get("htif", 0) * units_hr, 2),
         "input_vol_per_unit": input_vol,
         "output_vol_per_unit": out_vol,
         "daily_import_m3": daily_import_vol,
@@ -4611,6 +4612,8 @@ def _apply_poco_throttle(opt, haul_days, poco_m3):
         for k in ("units_hr_per_planet", "net_isk_hr_per_planet",
                   "daily_import_m3", "daily_export_m3"):
             opt[k] *= scale
+        for k in ("aif_count", "htif_count"):
+            opt[k] = round(opt[k] * scale, 2)
         if opt.get("net_isk_hr_buy_sourced") is not None:
             opt["net_isk_hr_buy_sourced"] *= scale
         opt["flags"].append(f"POCO BUFFER CAPS AT {scale * 100:.0f}%")
@@ -4639,6 +4642,8 @@ def import_upgrade_options(min_tier="P3"):
     tax_rate, tax_planet = _factory_tax_rate(state)
     sales_tax = cfg.get("sales_tax", 0.0)
     broker_fee = cfg.get("broker_fee")
+    haul_days = cfg.get("haul_every_days", 1) or 1
+    poco_m3 = cfg.get("poco_buffer_m3", 35000)
 
     min_level = _TIER_LEVEL.get(min_tier, 3)
     # Full-integration net (per that product's optimizer layout) for reference
@@ -4655,6 +4660,7 @@ def import_upgrade_options(min_tier="P3"):
             opt = _import_option(chain, buy_level, market, pi_types, schematics,
                                  pg_budget, cpu_budget, tax_rate, sales_tax,
                                  broker_fee)
+            _apply_poco_throttle(opt, haul_days, poco_m3)
             options.append(opt)
         if not options:
             continue
@@ -4685,6 +4691,8 @@ def import_upgrade_options(min_tier="P3"):
         "factory_tax_planet": tax_planet,
         "sales_tax": sales_tax,
         "broker_fee": broker_fee,
+        "haul_every_days": haul_days,
+        "poco_buffer_m3": poco_m3,
         "pg_budget": pg_budget,
         "cpu_budget": cpu_budget,
         "sell_basis": "jita_buy",
@@ -5839,9 +5847,11 @@ def self_test():
               abs(_p3["tax_per_unit"] - _exp_tax) < 1, _p3["tax_per_unit"])
         check("Revenue = Jita buy of P4",
               abs(_p3["revenue_per_unit"] - 1500000) < 1)
-        check("P4<-P3 throughput is CPU-limited HTIF ceiling",
-              abs(_p3["units_hr_per_planet"] - (17715 / 1100)) < 0.01
-              and _p3["htif_count"] == 1.0, _p3["units_hr_per_planet"])
+        check("P4<-P3 options POCO-capped even at daily cadence",
+              abs(_p3["units_hr_per_planet"] - 35000 / 2400) < 0.01
+              and abs(_p3["htif_count"] - _p3["units_hr_per_planet"]) < 0.02
+              and any("POCO BUFFER" in f for f in _p3["flags"]),
+              _p3["units_hr_per_planet"])
         _p1 = next(o for o in _wm["options"] if o["buy_tier"] == "P1")
         check("BOM P4<-P1 expands to 160+160 P1",
               abs(_p1["input_cost_per_unit"] - (160 * 100 + 160 * 120)) < 1,
@@ -5858,6 +5868,10 @@ def self_test():
         check("Buy-sourced net = revenue - buy cost - POCO tax",
               abs(_p3_bo["net_per_unit_buy_sourced"]
                   - (1500000 - 6 * 85000 * 1.027 - _exp_tax)) < 1)
+        check("Direct option: CPU-limited ceiling, planet-scale HTIF count",
+              abs(_p3_bo["units_hr_per_planet"] - 17715 / 1100) < 0.01
+              and abs(_p3_bo["htif_count"] - _p3_bo["units_hr_per_planet"])
+              < 0.02, _p3_bo["htif_count"])
     if _s:
         check("P3 target only offers P1/P2 buy-in",
               {o["buy_tier"] for o in _s["options"]} == {"P1", "P2"})
@@ -5912,15 +5926,18 @@ def self_test():
     print("\nHaul cadence & POCO buffer:")
     _th = {"daily_import_m3": 5000.0, "daily_export_m3": 20000.0,
            "units_hr_per_planet": 10.0, "net_isk_hr_per_planet": 1e6,
-           "net_isk_hr_buy_sourced": 2e6, "flags": []}
+           "net_isk_hr_buy_sourced": 2e6, "aif_count": 4.0,
+           "htif_count": 12.0, "flags": []}
     check("POCO throttle scales to worst leg",
           abs(_apply_poco_throttle(_th, 3, 35000) - 35000 / 60000) < 1e-9
           and abs(_th["units_hr_per_planet"] - 10 * 35000 / 60000) < 1e-9
           and abs(_th["net_isk_hr_buy_sourced"] - 2e6 * 35000 / 60000) < 1e-3
+          and abs(_th["htif_count"] - 7.0) < 0.01
           and any("POCO BUFFER" in f for f in _th["flags"]))
     _th2 = {"daily_import_m3": 5000.0, "daily_export_m3": 6000.0,
             "units_hr_per_planet": 10.0, "net_isk_hr_per_planet": 1e6,
-            "net_isk_hr_buy_sourced": None, "flags": []}
+            "net_isk_hr_buy_sourced": None, "aif_count": 4.0,
+            "htif_count": 12.0, "flags": []}
     check("POCO throttle no-op when window fits",
           _apply_poco_throttle(_th2, 3, 35000) == 1.0 and not _th2["flags"])
     _LAST_RUN["state"]["cfg"]["haul_every_days"] = 3
