@@ -190,6 +190,11 @@ def load_pi_config():
         "max_haul_minutes": cp.getfloat("pi", "max_haul_minutes_per_day", fallback=60),
         "tax_rate": cp.getfloat("pi", "default_tax_rate", fallback=0.15),
         "hauler_m3": cp.getfloat("pi", "hauler_capacity_m3", fallback=9000),
+        # Haul cadence: one collection/delivery run every N days
+        "haul_every_days": cp.getfloat("pi", "haul_every_days", fallback=1),
+        # Customs office capacity — bounds what a planet can stockpile
+        # between hauls (35,000 m3, fixed game value)
+        "poco_buffer_m3": cp.getfloat("pi", "poco_buffer_m3", fallback=35000),
         "pg_budget": cp.getfloat("pi", "power_per_planet", fallback=ccu_pg),
         "cpu_budget": cp.getfloat("pi", "cpu_per_planet", fallback=ccu_cpu),
         # Market transaction tax on every sell (buy orders and sell orders)
@@ -4589,6 +4594,29 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
     }
 
 
+def _apply_poco_throttle(opt, haul_days, poco_m3):
+    """Scale an import option so each haul-window leg fits the POCO buffer.
+
+    Between hauls, bought inputs and finished output both stage through the
+    35k m3 customs office; if either leg's window volume exceeds it, the
+    planet must run fewer facilities. Linear scale, mutates opt in place.
+    Returns the scale applied (1.0 = untouched).
+    # ponytail: ignores launchpad headroom and intra-window import/export
+    # crossover; refine if a pick is ever borderline
+    """
+    legs = [v * haul_days for v in (opt["daily_import_m3"],
+                                    opt["daily_export_m3"]) if v > 0]
+    scale = min([1.0] + [poco_m3 / v for v in legs])
+    if scale < 1.0:
+        for k in ("units_hr_per_planet", "net_isk_hr_per_planet",
+                  "daily_import_m3", "daily_export_m3"):
+            opt[k] *= scale
+        if opt.get("net_isk_hr_buy_sourced") is not None:
+            opt["net_isk_hr_buy_sourced"] *= scale
+        opt["flags"].append(f"POCO BUFFER CAPS AT {scale * 100:.0f}%")
+    return scale
+
+
 def import_upgrade_options(min_tier="P3"):
     """Rank products you could make by buying lower-tier PI at Jita, hauling to
     a factory planet, and upgrading. For each target (P3/P4) it evaluates every
@@ -4696,6 +4724,8 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
     sales_tax = cfg.get("sales_tax", 0.0)
     broker_fee = cfg.get("broker_fee")
     hauler_m3 = cfg.get("hauler_m3", 9000) or 9000
+    haul_days = cfg.get("haul_every_days", 1) or 1
+    poco_m3 = cfg.get("poco_buffer_m3", 35000)
     jita_jumps = ectx.get("jita_jumps", 15)
     haul = cfg.get("haul", {"sec_per_jump": 45, "sec_per_station": 180})
     if isk_per_haul_min is None:
@@ -4735,11 +4765,16 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
             planets = vi.get("planet_count", len(vi.get("planets_used", []))) or 1
             gross_hr = units * rev
             net_hr = gross_hr * (1.0 - sales_tax) - tax_hr
-            local_min = vi.get("haul_minutes_per_day", 0)
-            deliver_min = _trips(units * 24 * vol) * jita_rt_min
+            # One run every haul_days: local circuit + delivery amortised
+            local_min = vi.get("haul_minutes_per_day", 0) / haul_days
+            deliver_min = (_trips(units * 24 * haul_days * vol)
+                           * jita_rt_min / haul_days)
             haul_min = local_min + deliver_min
             haul_cost_hr = haul_min * isk_per_haul_min / 24.0
             net_after = net_hr - haul_cost_hr
+            ex_flags = list(vi.get("flags", []))
+            if units * 24 * haul_days * vol / planets > poco_m3:
+                ex_flags.append(f"{haul_days:g}d OUTPUT EXCEEDS POCO BUFFER")
             options.append({
                 "strategy": "extract", "label": "Extract (P0→)",
                 "buy_tier": "—", "planets": planets, "units_hr": units,
@@ -4751,7 +4786,7 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
                 "revenue_basis": basis, "roi": None,
                 "daily_import_m3": 0.0, "daily_export_m3": units * 24 * vol,
                 "viable": bool(vi.get("viable")) and units > 0,
-                "flags": list(vi.get("flags", [])),
+                "flags": ex_flags,
             })
 
         # ── Import-and-upgrade (best buy-in tier after haul) ──
@@ -4761,9 +4796,10 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
                 opt = _import_option(chain, buy_level, market, pi_types,
                                      schematics, pg_budget, cpu_budget,
                                      tax_rate, sales_tax, broker_fee)
-                imp_trips = max(_trips(opt["daily_import_m3"]),
-                                _trips(opt["daily_export_m3"]))
-                imp_min = imp_trips * jita_rt_min
+                _apply_poco_throttle(opt, haul_days, poco_m3)
+                imp_trips = max(_trips(opt["daily_import_m3"] * haul_days),
+                                _trips(opt["daily_export_m3"] * haul_days))
+                imp_min = imp_trips * jita_rt_min / haul_days
                 haul_cost_hr = imp_min * isk_per_haul_min / 24.0
                 net_after = opt["net_isk_hr_per_planet"] - haul_cost_hr
                 opt["_haul_min"] = imp_min
@@ -4809,7 +4845,8 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
     return {
         "min_tier": min_tier, "tax_rate": tax_rate,
         "factory_tax_planet": tax_planet, "sales_tax": sales_tax,
-        "hauler_m3": hauler_m3,
+        "hauler_m3": hauler_m3, "haul_every_days": haul_days,
+        "poco_buffer_m3": poco_m3,
         "isk_per_haul_min": isk_per_haul_min, "jita_jumps": jita_jumps,
         "jita_round_trip_min": jita_rt_min, "sell_basis": "jita_buy",
         "plays": plays,
@@ -5870,6 +5907,39 @@ def self_test():
           all(_bp["plays"][i]["best_net_after_haul_isk_hr"]
               >= _bp["plays"][i + 1]["best_net_after_haul_isk_hr"]
               for i in range(len(_bp["plays"]) - 1)))
+
+    # ── Haul cadence + POCO buffer ──
+    print("\nHaul cadence & POCO buffer:")
+    _th = {"daily_import_m3": 5000.0, "daily_export_m3": 20000.0,
+           "units_hr_per_planet": 10.0, "net_isk_hr_per_planet": 1e6,
+           "net_isk_hr_buy_sourced": 2e6, "flags": []}
+    check("POCO throttle scales to worst leg",
+          abs(_apply_poco_throttle(_th, 3, 35000) - 35000 / 60000) < 1e-9
+          and abs(_th["units_hr_per_planet"] - 10 * 35000 / 60000) < 1e-9
+          and abs(_th["net_isk_hr_buy_sourced"] - 2e6 * 35000 / 60000) < 1e-3
+          and any("POCO BUFFER" in f for f in _th["flags"]))
+    _th2 = {"daily_import_m3": 5000.0, "daily_export_m3": 6000.0,
+            "units_hr_per_planet": 10.0, "net_isk_hr_per_planet": 1e6,
+            "net_isk_hr_buy_sourced": None, "flags": []}
+    check("POCO throttle no-op when window fits",
+          _apply_poco_throttle(_th2, 3, 35000) == 1.0 and not _th2["flags"])
+    _LAST_RUN["state"]["cfg"]["haul_every_days"] = 3
+    _LAST_RUN["state"]["cfg"]["hauler_m3"] = 55000
+    _bp3 = best_pi_plays(isk_per_haul_min=100000, min_tier="P2")
+    check("Cadence stored in result",
+          _bp3["haul_every_days"] == 3 and _bp3["poco_buffer_m3"] == 35000)
+    _ex3 = next(o for o in next(p for p in _bp3["plays"]
+                                if p["output_name"] == "S")["options"]
+                if o["strategy"] == "extract")
+    check("Cadence: extract haul amortised over window",
+          abs(_ex3["haul_min_per_day"]
+              - (30 / 3 + _bp3["jita_round_trip_min"] / 3)) < 0.01,
+          _ex3["haul_min_per_day"])
+    _im3 = next(o for o in next(p for p in _bp3["plays"]
+                                if p["output_name"] == "WM")["options"]
+                if o["strategy"] == "import")
+    check("Cadence: P4 import throttled by POCO buffer",
+          any("POCO BUFFER" in f for f in _im3["flags"]), _im3["flags"])
     _LAST_RUN["state"] = _saved_run
     check("import_upgrade_options errors with no run",
           "error" in import_upgrade_options())
