@@ -169,20 +169,22 @@ def search_system_id(name):
 
 # ── Routes ────────────────────────────────────────────────────
 
-def get_jump_count(origin_id, dest_id, avoid=None):
+def get_jump_count(origin_id, dest_id, avoid=None, flag="shortest"):
     """Get shortest jump count between two solar systems.
 
     avoid: optional iterable of system IDs the route must not pass
     through (ESI route `avoid` param). Origin/destination are dropped
     from the avoid list automatically.
+    flag: ESI route flag — "shortest" (default) or "secure" (prefer
+    highsec; use for hauls where losing the cargo matters).
     """
     if origin_id == dest_id:
         return 0
     avoid_ids = tuple(sorted(set(avoid or ()) - {origin_id, dest_id}))
-    key = (origin_id, dest_id, avoid_ids)
+    key = (origin_id, dest_id, avoid_ids, flag)
     if key in _route_cache:
         return _route_cache[key]
-    url = f"{ESI_BASE}/route/{origin_id}/{dest_id}/?datasource=tranquility&flag=shortest"
+    url = f"{ESI_BASE}/route/{origin_id}/{dest_id}/?datasource=tranquility&flag={flag}"
     if avoid_ids:
         url += "&avoid=" + ",".join(str(i) for i in avoid_ids)
     data = esi_get(url)

@@ -155,15 +155,34 @@ def load_skills():
         "planetology": skills.get("Planetology", 0),
         "adv_planetology": skills.get("Advanced Planetology", 0),
         "remote_sensing": skills.get("Remote Sensing", 0),
+        "accounting": skills.get("Accounting", 0),
+        "broker_relations": skills.get("Broker Relations", 0),
     }
     return char_info, pi_skills
 
 
+SALES_TAX_BASE = 0.045          # market transaction tax before skills
+SALES_TAX_REDUCTION = 0.11      # Accounting: -11% per level
+BROKER_FEE_BASE = 0.03          # NPC-station order fee before skills
+BROKER_FEE_REDUCTION = 0.003    # Broker Relations: -0.3%/level
+
+
 def load_pi_config():
-    """Load pi_config.ini."""
+    """Load pi_config.ini.
+
+    pg/cpu budgets and Jita sales tax default from the trained skills in
+    skills.ini (CCU level, Accounting level) when the ini doesn't set them.
+    """
     cp = configparser.ConfigParser()
     cp.optionxform = str
     cp.read(_ini_path("pi_config.ini"), encoding="utf-8")
+
+    _, pi_skills = load_skills()
+    ccu_pg, ccu_cpu = CCU_BUDGETS.get(pi_skills["ccu"], CCU_BUDGETS[5])
+    skill_sales_tax = SALES_TAX_BASE * (
+        1 - SALES_TAX_REDUCTION * pi_skills["accounting"])
+    skill_broker_fee = (BROKER_FEE_BASE
+                        - BROKER_FEE_REDUCTION * pi_skills["broker_relations"])
 
     cfg = {
         "home_system": cp.get("pi", "home_system", fallback="Jufvitte"),
@@ -171,8 +190,12 @@ def load_pi_config():
         "max_haul_minutes": cp.getfloat("pi", "max_haul_minutes_per_day", fallback=60),
         "tax_rate": cp.getfloat("pi", "default_tax_rate", fallback=0.15),
         "hauler_m3": cp.getfloat("pi", "hauler_capacity_m3", fallback=9000),
-        "pg_budget": cp.getfloat("pi", "power_per_planet", fallback=17000),
-        "cpu_budget": cp.getfloat("pi", "cpu_per_planet", fallback=21315),
+        "pg_budget": cp.getfloat("pi", "power_per_planet", fallback=ccu_pg),
+        "cpu_budget": cp.getfloat("pi", "cpu_per_planet", fallback=ccu_cpu),
+        # Market transaction tax on every sell (buy orders and sell orders)
+        "sales_tax": cp.getfloat("pi", "sales_tax", fallback=skill_sales_tax),
+        # Order-placement fee — only paid when sourcing via own buy orders
+        "broker_fee": cp.getfloat("pi", "broker_fee", fallback=skill_broker_fee),
         "max_planets": cp.getint("pi", "max_planets", fallback=5),
         # When true, value every final product at the Jita top buy order
         # (instant dump) instead of the thin in-range local buy book. Matches
@@ -1933,8 +1956,10 @@ def _build_econ_ctx(market_prices, cfg, pi_types, matrix=None, home_id=None,
     jita_system_id = esi.search_system_id("Jita")
     jita_jumps = 0
     if home_system_id and jita_system_id:
+        # secure flag: the Jita leg carries the full cargo value, so price
+        # it at the route a hauler actually flies, not the ganky shortcut
         jita_jumps = esi.get_jump_count(home_system_id, jita_system_id,
-                                        avoid=_AVOID_IDS)
+                                        avoid=_AVOID_IDS, flag="secure")
         if jita_jumps < 0:
             jita_jumps = 15  # fallback
     return {"market_prices": market_prices, "cfg": cfg, "pi_types": pi_types,
@@ -2027,7 +2052,11 @@ def _compute_economics_single(vc, ectx):
         sell_price = jita_buy if jita_buy > 0 else jita_vwap
     else:
         sell_price = sustained_price
+    # Every market sell pays transaction tax — realise it in the price
+    sales_tax = cfg.get("sales_tax", 0.0)
+    sell_price *= (1.0 - sales_tax)
     vc["sell_at_jita"] = sell_at_jita
+    vc["sales_tax_rate"] = sales_tax
     vc["sell_price"] = sell_price
 
     # Gross ISK/hr uses the effective sell price
@@ -3458,6 +3487,8 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
                  f"Planetology {pi_skills['planetology']}, "
                  f"Adv Planetology {pi_skills['adv_planetology']}")
     lines.append(f"**Tax:** {cfg['tax_rate']*100:.0f}% (default)  |  "
+                 f"**Sales tax:** {cfg.get('sales_tax', 0)*100:.2f}% "
+                 f"(Accounting {pi_skills.get('accounting', 0)})  |  "
                  f"**Hauler:** {_fmt_num(cfg['hauler_m3'])} m3  |  "
                  f"**Max haul:** {cfg['max_haul_minutes']:.0f} min/day")
     if calibration:
@@ -4242,7 +4273,8 @@ def product_scaling(output_name, price_override=None):
             gross = svc["units_hr"] * price_override
             sp["custom_price"] = price_override
             sp["custom_gross_isk_hr"] = gross
-            sp["custom_net_isk_hr"] = gross - svc["tax_per_hr"]
+            sp["custom_net_isk_hr"] = (gross * (1.0 - cfg.get("sales_tax", 0.0))
+                                       - svc["tax_per_hr"])
         scales.append(sp)
 
     return {
@@ -4300,9 +4332,10 @@ def product_at_price(output_name, price_override=None):
 
     if price_override is not None and price_override > 0:
         gross = units_hr * price_override
+        _st = state.get("cfg", {}).get("sales_tax", 0.0)
         out["custom_price"] = price_override
         out["custom_gross_isk_hr"] = gross
-        out["custom_net_isk_hr"] = gross - tax_per_hr
+        out["custom_net_isk_hr"] = gross * (1.0 - _st) - tax_per_hr
 
     # Best = highest activity-adjusted net among viable products (the headline
     # "this is the best thing" recommendation). Falls back to top of ranked.
@@ -4415,14 +4448,43 @@ def _factory_units_per_planet(bundle_at_1, pg_budget, cpu_budget):
     return units, pg_per, cpu_per
 
 
+def _factory_tax_rate(state):
+    """POCO rate for a hypothetical import factory: the cheapest scouted
+    rate among active-inventory planets (a factory needs no extraction, so
+    tax is the only siting criterion). Falls back to cfg default when no
+    planet is scouted. Returns (rate, planet_key_or_None)."""
+    ctx = state.get("ctx") or {}
+    cfg = state.get("cfg") or {}
+    taxes = ctx.get("planet_taxes") or {}
+    best_rate, best_key = None, None
+    for system, planets in (ctx.get("inv") or {}).items():
+        for ptype, count in planets.items():
+            for i in range(int(count)):
+                key = f"{system}.{ptype}.{chr(ord('A') + i)}"
+                rate = taxes.get(key)
+                if rate is not None and (best_rate is None or rate < best_rate):
+                    best_rate, best_key = rate, key
+    if best_rate is None:
+        return cfg.get("tax_rate", 0.15), None
+    return best_rate, best_key
+
+
 def _import_option(chain, buy_level, market, pi_types, schematics,
-                   pg_budget, cpu_budget, tax_rate):
+                   pg_budget, cpu_budget, tax_rate, sales_tax=0.0,
+                   broker_fee=None):
     """Economics of making one target chain by importing tier<=buy_level inputs.
 
     Everything is per one unit of finished output, then scaled to a per-planet
     hourly figure via factory throughput. Prices: inputs at Jita sell (you buy),
     output at Jita buy (you dump). Tax = POCO import on bought inputs + export
-    on the finished unit (single-factory-planet assumption)."""
+    on the finished unit (single-factory-planet assumption), plus market
+    sales tax on the Jita dump.
+
+    When broker_fee is given, also reports a buy-order-sourced input basis:
+    acquiring inputs with your own buy orders filled at ~the Jita top buy
+    plus the broker fee (a hub buy order must roughly match Jita's to
+    attract sellers; local sellers may fill for less). Upside, not
+    guaranteed — the headline net stays on the instant sell-order basis."""
     tid = chain["output_type_id"]
     out_tier = chain["tier"]
 
@@ -4432,6 +4494,7 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
 
     flags = []
     input_cost = 0.0
+    input_cost_buy = 0.0  # buy-order sourcing basis; None if any input lacks a buy
     input_vol = 0.0
     import_tax = 0.0
     input_lines = []
@@ -4439,10 +4502,15 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
         it = pi_types.get(in_tid, {})
         prices = market.get(in_tid, {})
         jsell = prices.get("jita_sell", 0) or 0
+        jbuy = prices.get("jita_buy", 0) or 0
         base = PI_TAX_BASE.get(it.get("tier", "P1"), 500)
         if jsell <= 0:
             flags.append(f"NO JITA SELL ({it.get('name', in_tid)})")
         input_cost += qty * jsell
+        if input_cost_buy is not None and jbuy > 0:
+            input_cost_buy += qty * jbuy
+        else:
+            input_cost_buy = None
         input_vol += qty * it.get("volume", 0)
         import_tax += qty * base * 0.5 * tax_rate
         input_lines.append({
@@ -4450,6 +4518,7 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
             "tier": it.get("tier", ""),
             "qty_per_unit": qty,
             "jita_sell": jsell,
+            "jita_buy": jbuy,
             "cost_per_unit": qty * jsell,
         })
 
@@ -4465,10 +4534,19 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
             flags.append("NO JITA MARKET")
     export_tax = PI_TAX_BASE.get(out_tier, 70000) * tax_rate
     tax_per_unit = import_tax + export_tax
+    sales_tax_per_unit = revenue * sales_tax
     out_vol = chain.get("volume", 0)
 
-    net_per_unit = revenue - input_cost - tax_per_unit
+    net_per_unit = revenue - input_cost - tax_per_unit - sales_tax_per_unit
     roi = (net_per_unit / input_cost) if input_cost > 0 else 0.0
+
+    # Buy-order sourcing upside (see docstring)
+    buy_sourced_cost = None
+    net_buy_sourced = None
+    if broker_fee is not None and input_cost_buy is not None:
+        buy_sourced_cost = input_cost_buy * (1.0 + broker_fee)
+        net_buy_sourced = (revenue - buy_sourced_cost - tax_per_unit
+                           - sales_tax_per_unit)
 
     # Factory throughput: facilities to make 1 unit/hr, then per-planet units/hr
     bundle = {}
@@ -4477,6 +4555,8 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
         bundle, pg_budget, cpu_budget)
 
     net_isk_hr = net_per_unit * units_hr
+    net_isk_hr_buy_sourced = (net_buy_sourced * units_hr
+                              if net_buy_sourced is not None else None)
     daily_import_vol = input_vol * units_hr * 24
     daily_export_vol = out_vol * units_hr * 24
 
@@ -4484,13 +4564,17 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
         "buy_tier": _TIER_NAMES.get(buy_level, "P?"),
         "buy_level": buy_level,
         "input_cost_per_unit": input_cost,
+        "input_cost_buy_sourced": buy_sourced_cost,
+        "net_per_unit_buy_sourced": net_buy_sourced,
         "tax_per_unit": tax_per_unit,
+        "sales_tax_per_unit": sales_tax_per_unit,
         "revenue_per_unit": revenue,
         "revenue_basis": rev_basis,
         "net_per_unit": net_per_unit,
         "roi": roi,
         "units_hr_per_planet": units_hr,
         "net_isk_hr_per_planet": net_isk_hr,
+        "net_isk_hr_buy_sourced": net_isk_hr_buy_sourced,
         "aif_count": round(bundle.get("aif", 0), 2),
         "htif_count": round(bundle.get("htif", 0), 2),
         "input_vol_per_unit": input_vol,
@@ -4524,7 +4608,9 @@ def import_upgrade_options(min_tier="P3"):
     chains = ctx["chains"]
     pg_budget = state["pg_budget"]
     cpu_budget = state["cpu_budget"]
-    tax_rate = cfg.get("tax_rate", 0.15)
+    tax_rate, tax_planet = _factory_tax_rate(state)
+    sales_tax = cfg.get("sales_tax", 0.0)
+    broker_fee = cfg.get("broker_fee")
 
     min_level = _TIER_LEVEL.get(min_tier, 3)
     # Full-integration net (per that product's optimizer layout) for reference
@@ -4539,7 +4625,8 @@ def import_upgrade_options(min_tier="P3"):
         options = []
         for buy_level in range(1, out_level):  # P1..(target-1)
             opt = _import_option(chain, buy_level, market, pi_types, schematics,
-                                 pg_budget, cpu_budget, tax_rate)
+                                 pg_budget, cpu_budget, tax_rate, sales_tax,
+                                 broker_fee)
             options.append(opt)
         if not options:
             continue
@@ -4567,6 +4654,9 @@ def import_upgrade_options(min_tier="P3"):
     return {
         "min_tier": min_tier,
         "tax_rate": tax_rate,
+        "factory_tax_planet": tax_planet,
+        "sales_tax": sales_tax,
+        "broker_fee": broker_fee,
         "pg_budget": pg_budget,
         "cpu_budget": cpu_budget,
         "sell_basis": "jita_buy",
@@ -4602,7 +4692,9 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
     chains = ctx["chains"]
     pg_budget = state["pg_budget"]
     cpu_budget = state["cpu_budget"]
-    tax_rate = cfg.get("tax_rate", 0.15)
+    tax_rate, tax_planet = _factory_tax_rate(state)
+    sales_tax = cfg.get("sales_tax", 0.0)
+    broker_fee = cfg.get("broker_fee")
     hauler_m3 = cfg.get("hauler_m3", 9000) or 9000
     jita_jumps = ectx.get("jita_jumps", 15)
     haul = cfg.get("haul", {"sec_per_jump": 45, "sec_per_station": 180})
@@ -4642,7 +4734,7 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
             tax_hr = vi.get("tax_per_hr", 0)
             planets = vi.get("planet_count", len(vi.get("planets_used", []))) or 1
             gross_hr = units * rev
-            net_hr = gross_hr - tax_hr
+            net_hr = gross_hr * (1.0 - sales_tax) - tax_hr
             local_min = vi.get("haul_minutes_per_day", 0)
             deliver_min = _trips(units * 24 * vol) * jita_rt_min
             haul_min = local_min + deliver_min
@@ -4667,7 +4759,8 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
             best_imp = None
             for buy_level in range(1, out_level):
                 opt = _import_option(chain, buy_level, market, pi_types,
-                                     schematics, pg_budget, cpu_budget, tax_rate)
+                                     schematics, pg_budget, cpu_budget,
+                                     tax_rate, sales_tax, broker_fee)
                 imp_trips = max(_trips(opt["daily_import_m3"]),
                                 _trips(opt["daily_export_m3"]))
                 imp_min = imp_trips * jita_rt_min
@@ -4688,6 +4781,7 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
                     "tax_per_hr": best_imp["tax_per_unit"] * u,
                     "input_cost_isk_hr": best_imp["input_cost_per_unit"] * u,
                     "net_isk_hr": best_imp["net_isk_hr_per_planet"],
+                    "net_isk_hr_buy_sourced": best_imp.get("net_isk_hr_buy_sourced"),
                     "haul_min_per_day": best_imp["_haul_min"],
                     "haul_cost_isk_hr": best_imp["_haul_cost_hr"],
                     "net_after_haul_isk_hr": best_imp["_net_after"],
@@ -4713,7 +4807,9 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
     # Rank by total net ISK/hr after haul (per user's chosen headline metric)
     plays.sort(key=lambda p: p["best_net_after_haul_isk_hr"], reverse=True)
     return {
-        "min_tier": min_tier, "tax_rate": tax_rate, "hauler_m3": hauler_m3,
+        "min_tier": min_tier, "tax_rate": tax_rate,
+        "factory_tax_planet": tax_planet, "sales_tax": sales_tax,
+        "hauler_m3": hauler_m3,
         "isk_per_haul_min": isk_per_haul_min, "jita_jumps": jita_jumps,
         "jita_round_trip_min": jita_rt_min, "sell_basis": "jita_buy",
         "plays": plays,
@@ -4921,6 +5017,7 @@ def generate_pi_dossier_data(overrides=None):
         "config": {
             "home_system": cfg["home_system"],
             "tax_rate": cfg["tax_rate"],
+            "sales_tax": cfg["sales_tax"],
             "hauler_m3": cfg["hauler_m3"],
             "max_haul_minutes": cfg["max_haul_minutes"],
             "max_market_jumps": cfg["max_market_jumps"],
@@ -5625,11 +5722,16 @@ def self_test():
         _compute_economics_single(_vc, _ectx)
         return _vc
     _sj_local, _sj_jita = _sj_run(False), _sj_run(True)
-    check("Jita mode prices at jita_buy",
-          abs(_sj_jita["sell_price"] - 480) < 1e-6,
+    _sj_st = load_pi_config()["sales_tax"]
+    check("Sales tax derived from Accounting skill",
+          abs(_sj_st - SALES_TAX_BASE
+              * (1 - SALES_TAX_REDUCTION * load_skills()[1]["accounting"]))
+          < 1e-9, f"got {_sj_st}")
+    check("Jita mode prices at jita_buy net of sales tax",
+          abs(_sj_jita["sell_price"] - 480 * (1 - _sj_st)) < 1e-6,
           f"got {_sj_jita['sell_price']}")
-    check("Jita mode gross = units x jita_buy",
-          abs(_sj_jita["gross_isk_hr"] - 40 * 480) < 1e-6)
+    check("Jita mode gross = units x net jita_buy",
+          abs(_sj_jita["gross_isk_hr"] - 40 * 480 * (1 - _sj_st)) < 1e-6)
     check("Jita mode: no activity penalty",
           _sj_jita["activity_factor"] == 1.0
           and abs(_sj_jita["adjusted_net_isk_hr"] - _sj_jita["net_isk_hr"]) < 1e-6)
@@ -5677,6 +5779,16 @@ def self_test():
         "cfg": {"tax_rate": 0.10, "pg_budget": 17000, "cpu_budget": 21315},
         "ranked": [], "pg_budget": 17000, "cpu_budget": 21315,
     }
+    _ft_state = {"ctx": {"inv": {"S1": {"Gas": 2}, "S2": {"Barren": 1}},
+                         "planet_taxes": {"S1.Gas.A": 0.05, "S1.Gas.B": 0.15,
+                                          "S2.Barren.A": 0.01}},
+                 "cfg": {"tax_rate": 0.15}}
+    check("Factory tax = cheapest scouted POCO in inventory",
+          _factory_tax_rate(_ft_state) == (0.01, "S2.Barren.A"),
+          f"got {_factory_tax_rate(_ft_state)}")
+    check("Factory tax falls back to cfg default when unscouted",
+          _factory_tax_rate({"ctx": {"inv": {"S1": {"Gas": 1}}},
+                             "cfg": {"tax_rate": 0.15}}) == (0.15, None))
     _iu = import_upgrade_options(min_tier="P3")
     _wm = next((p for p in _iu["products"] if p["output_name"] == "WM"), None)
     _s = next((p for p in _iu["products"] if p["output_name"] == "S"), None)
@@ -5697,6 +5809,18 @@ def self_test():
         check("BOM P4<-P1 expands to 160+160 P1",
               abs(_p1["input_cost_per_unit"] - (160 * 100 + 160 * 120)) < 1,
               _p1["input_cost_per_unit"])
+        _p3_st = _import_option(_iu_chains[30], 3, _iu_market, _iu_types,
+                                _iu_sch, 17000, 21315, 0.10, sales_tax=0.02)
+        check("Import sales tax deducted from net",
+              abs((_p3["net_per_unit"] - _p3_st["net_per_unit"])
+                  - 1500000 * 0.02) < 1)
+        _p3_bo = _import_option(_iu_chains[30], 3, _iu_market, _iu_types,
+                                _iu_sch, 17000, 21315, 0.10, broker_fee=0.027)
+        check("Buy-order sourcing priced at jita_buy + broker fee",
+              abs(_p3_bo["input_cost_buy_sourced"] - 6 * 85000 * 1.027) < 1)
+        check("Buy-sourced net = revenue - buy cost - POCO tax",
+              abs(_p3_bo["net_per_unit_buy_sourced"]
+                  - (1500000 - 6 * 85000 * 1.027 - _exp_tax)) < 1)
     if _s:
         check("P3 target only offers P1/P2 buy-in",
               {o["buy_tier"] for o in _s["options"]} == {"P1", "P2"})
