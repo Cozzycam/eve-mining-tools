@@ -1,5 +1,71 @@
 # EVE Mining Tools — Handover Notes
 
+## PI Dossier — 2026-07-26 — Order-book depth, on-planet storage, Run Plan
+
+Three gaps stopped the dossier answering "will this setup actually work and
+keep working": it priced Jita off a single order, it never modelled on-planet
+storage, and it never emitted a concrete build/buy/drop sheet.
+
+**1. Jita order-book depth (both legs).** `_import_option` used to take the
+top Jita buy order as revenue and the lowest sell order as input cost. A haul
+is one big trade, so it walks the book instead:
+
+- `_fetch_jita_book(type_id, buy)` — Jita-*system*-filtered book from the same
+  cached market URL the top-of-book lookup already hit, so depth is free.
+  Region-wide orders are dropped: an instant dump means orders reaching 4-4.
+  `jita_buy` / `jita_sell` are now derived from these books (the
+  `esi.fetch_best_buy/sell` calls are gone).
+- `_walk_book(book, qty)` → (avg fill price, filled qty). `_jita_fill(prices,
+  qty, selling, window_days)` walks one haul window's quantity and prices any
+  unfillable remainder at 30d Jita VWAP. Also reports `slippage` (always
+  signed "worse than top of book" for both sides) and `book_share` — the haul
+  as a fraction of Jita's 30d throughput, which is the actual sustainability
+  signal since the book refills between runs.
+- `_depth_flags` surfaces NO JITA BOOK / BOOK ONLY FILLS x% / SLIPPAGE x% /
+  IS x% OF 30d VOLUME. Wired into the import path, `best_pi_plays`' extraction
+  leg, and `_compute_economics_single` when `sell_at_jita` is on (that path
+  previously assumed "Jita is deep, no penalty applies").
+
+**2. On-planet storage now costs PG/CPU.** `_factory_units_per_planet`
+reserved one launchpad and zero storage, so its factory counts assumed inputs
+could be staged from nowhere. New `FACILITY_M3` (launchpad 10,000, storage
+12,000) and a `buffer_days` model: the planet must physically hold
+`buffer_days` of input+output flow, Storage Facilities buy that capacity out
+of the same budget the factories want, and every storage count is tried so the
+best resulting throughput wins. Returns `storage_count`. New config
+`on_planet_buffer_days` (default 1 = daily login, POCO↔planet shuffled daily
+even though the hauler comes every `haul_every_days`).
+
+`_apply_poco_throttle` is **deleted** — the customs-office cap folded into
+`_import_option`, which now settles throughput (PG/CPU → storage → POCO)
+*before* pricing. The old order scaled a price-derived net linearly, which was
+only correct while price was constant; with depth pricing it wasn't.
+
+The extraction path's cosmetic `MUST HAUL EVERY XH` flag (hardcoded 24h) is now
+`LAUNCHPAD FILLS IN XH (needs N storage for Xd)` against the real cadence.
+
+**3. `pi_run_plan()` + `/api/pi/run-plan` + "Run Plan" panel.** Fills planet
+slots greedily, one at a time; each candidate is re-priced at the portfolio
+size under consideration (`_import_option(..., n_planets=n)`), so the second
+planet on a product sees the book its first planet ate through and a thin
+product stops winning slots. Emits per-planet facility counts (AIF/HTIF/
+launchpad/storage), per-run and per-day input drops, an aggregated Jita
+shopping list with slippage, cargo m³ each way, hauler trips, and the best
+extraction alternative for comparison.
+
+Known ceilings (marked `ponytail:` in source): the run plan allocates
+import/factory planets only — extraction layouts need specific planets from
+the allocator, so the best extraction play is reported alongside rather than
+competing for slots. Greedy is slightly suboptimal under integer hauler trips
+(a planet riding an already-paid trip has a *higher* marginal than the one
+that bought it; the self-test asserts monotonicity within one trip's cost).
+
+Self-test extended (+22 checks: book walk, slippage both directions, VWAP
+remainder, book share, storage/factory tradeoff, POCO ordering, portfolio
+mixing under a thin book). All pass. Verified live: 5 slots → 3× Sterile
+Conduits + 2× Self-Harmonizing Power Core, and the new flags correctly call
+out that buying 12,600 Vaccines every 3 days is 60% of Jita's 30d volume.
+
 ## PI Dossier — 2026-06-20 — Editable build sheet (manual BIF/AIF override)
 
 The optimizer can't model power-grid cost of links, so its per-planet BIF

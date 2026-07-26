@@ -3587,6 +3587,18 @@ function renderPi(data) {
     h += '</div>';
   }
 
+  // Run plan: the actual build + shopping + stocking sheet for one haul run.
+  h += '<div class="fitter-section"><h2>Run Plan &mdash; Build, Buy, Drop, Return</h2>';
+  h += '<div style="color:var(--dim);font-size:0.85em;margin-bottom:8px;">Fills your planet slots one at a time. Each slot is re-priced by <strong>walking the live Jita order books</strong> for the quantity that many planets would actually move, so a thin product stops winning slots and the runner-up takes over &mdash; that is what makes the answer a mix. Factory counts are what fits <em>after</em> reserving the launchpad and the Storage Facilities the buffer needs. Everything is quoted per haul run.</div>';
+  h += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">';
+  h += '<label style="font-size:0.88em;">Haul cost <input type="number" id="pi-run-haulcost" min="0" step="10000" value="100000" style="width:110px;"> ISK/min</label>';
+  h += '<label style="font-size:0.88em;">Planet slots <input type="number" id="pi-run-planets" min="1" max="6" step="1" style="width:60px;" placeholder="cfg"></label>';
+  h += '<button id="pi-run-btn" onclick="loadPiRunPlan()">Build Run Plan</button>';
+  h += '<span class="dim" id="pi-run-msg" style="font-size:0.85em;"></span>';
+  h += '</div>';
+  h += '<div id="pi-run-result"></div>';
+  h += '</div>';
+
   // Best PI play: head-to-head of extract-yourself vs import-and-upgrade, both
   // sold at Jita buy with hauling priced into net. Answers "what's best?".
   h += '<div class="fitter-section"><h2>Best PI Play &mdash; Extract vs Import</h2>';
@@ -3724,6 +3736,123 @@ function fmtM3(v) {
   if (v >= 1e6) return (v/1e6).toFixed(1) + 'M m³';
   if (v >= 1e3) return (v/1e3).toFixed(1) + 'k m³';
   return Math.round(v).toLocaleString() + ' m³';
+}
+
+async function loadPiRunPlan() {
+  const btn = document.getElementById('pi-run-btn');
+  const msg = document.getElementById('pi-run-msg');
+  const out = document.getElementById('pi-run-result');
+  const haulCost = document.getElementById('pi-run-haulcost').value;
+  const slots = document.getElementById('pi-run-planets').value;
+  btn.disabled = true; msg.textContent = 'Walking Jita books…'; out.innerHTML = '';
+  try {
+    let url = '/api/pi/run-plan?';
+    if (haulCost !== '' && !isNaN(parseFloat(haulCost))) url += 'isk_per_haul_min=' + parseFloat(haulCost) + '&';
+    if (slots !== '' && !isNaN(parseInt(slots))) url += 'max_planets=' + parseInt(slots);
+    const resp = await fetch(url);
+    const d = await resp.json();
+    if (d.error) { msg.textContent=''; out.innerHTML = '<span style="color:#c44">' + d.error + '</span>'; return; }
+    out.innerHTML = renderPiRunPlan(d);
+    msg.textContent = '';
+  } catch (e) { msg.textContent=''; out.innerHTML = '<span style="color:#c44">' + e + '</span>'; }
+  btn.disabled = false;
+}
+
+function renderPiRunPlan(d) {
+  const planets = d.planets || [];
+  if (!planets.length) return '<span class="dim">No profitable import planet found. Generate the dossier first, or check the flags in Best PI Play.</span>';
+  const days = d.haul_every_days || 1;
+  const runLbl = days === 1 ? 'per day' : 'every ' + (+days).toFixed(0) + 'd';
+
+  let h = '<div style="color:var(--dim);font-size:0.8em;margin-bottom:8px;">';
+  h += 'Haul ' + runLbl + ' · hauler ' + (d.hauler_m3||0).toLocaleString() + ' m³ · Jita ' + (d.jita_jumps||0) + 'j (' + (d.jita_round_trip_min||0).toFixed(0) + ' min round trip)';
+  h += ' · on-planet buffer ' + (+d.on_planet_buffer_days).toFixed(0) + 'd · POCO ' + (d.poco_buffer_m3||0).toLocaleString() + ' m³';
+  h += ' · POCO tax ' + ((d.tax_rate||0)*100).toFixed(1) + '%' + (d.factory_tax_planet ? ' @ ' + d.factory_tax_planet : '');
+  h += ' · sales tax ' + ((d.sales_tax||0)*100).toFixed(2) + '%</div>';
+
+  // Headline
+  h += '<div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:10px;padding:8px;background:rgba(255,255,255,0.03);border-radius:4px;">';
+  h += '<div><div class="dim" style="font-size:0.75em;">NET / HR</div><div style="font-size:1.15em;color:var(--green)">' + fmtIsk(d.total_net_isk_hr) + '</div></div>';
+  h += '<div><div class="dim" style="font-size:0.75em;">SPEND ' + runLbl.toUpperCase() + '</div><div style="font-size:1.15em;">' + fmtIsk(d.spend_per_run) + '</div></div>';
+  h += '<div><div class="dim" style="font-size:0.75em;">RETURN ' + runLbl.toUpperCase() + '</div><div style="font-size:1.15em;">' + fmtIsk(d.revenue_per_run) + '</div></div>';
+  h += '<div><div class="dim" style="font-size:0.75em;">SLOTS</div><div style="font-size:1.15em;">' + d.slots_used + ' / ' + d.slots + '</div></div>';
+  h += '<div><div class="dim" style="font-size:0.75em;">HAULER TRIPS</div><div style="font-size:1.15em;">' + d.trips_per_run + '</div></div>';
+  h += '<div><div class="dim" style="font-size:0.75em;">CARGO ' + runLbl.toUpperCase() + '</div><div style="font-size:1.15em;">' + fmtM3(d.import_m3_per_run) + ' out / ' + fmtM3(d.export_m3_per_run) + ' back</div></div>';
+  h += '</div>';
+
+  // 1. Shopping list
+  h += '<h3 style="margin:12px 0 4px;">1. Buy at Jita &mdash; ' + runLbl + '</h3>';
+  h += '<div class="results-wrap"><table><thead><tr><th>Commodity</th><th>Tier</th><th class="num">Units</th><th class="num">Volume</th><th class="num">Avg price</th><th class="num">Slippage</th><th class="num">ISK</th></tr></thead><tbody>';
+  (d.shopping_list||[]).forEach(s => {
+    const slip = (s.slippage||0) * 100;
+    h += '<tr><td>' + s.name + '</td><td class="dim">' + s.tier + '</td>';
+    h += '<td class="num">' + Math.ceil(s.units).toLocaleString() + '</td>';
+    h += '<td class="num">' + fmtM3(s.m3) + '</td>';
+    h += '<td class="num">' + fmtIsk(s.jita_sell) + '</td>';
+    h += '<td class="num"' + (slip > 3 ? ' style="color:var(--yellow)"' : '') + '>' + slip.toFixed(1) + '%</td>';
+    h += '<td class="num">' + fmtIsk(s.isk) + '</td></tr>';
+  });
+  h += '<tr style="font-weight:bold;border-top:1px solid var(--dim)"><td colspan="3">Total</td><td class="num">' + fmtM3(d.import_m3_per_run) + '</td><td></td><td></td><td class="num">' + fmtIsk(d.spend_per_run) + '</td></tr>';
+  h += '</tbody></table></div>';
+
+  // 2. Per-planet build + stocking
+  h += '<h3 style="margin:14px 0 4px;">2. Build &amp; stock each planet</h3>';
+  planets.forEach(p => {
+    const f = p.facilities || {};
+    const facs = [];
+    if (f.aif) facs.push(Math.round(f.aif) + ' &times; Advanced Industry Facility');
+    if (f.htif) facs.push(Math.round(f.htif) + ' &times; High-Tech Industry Facility');
+    facs.push('1 &times; Launchpad');
+    if (f.storage) facs.push(f.storage + ' &times; Storage Facility');
+    h += '<div style="margin:10px 0;padding:8px;border-left:3px solid var(--green);background:rgba(255,255,255,0.02)">';
+    h += '<div style="font-size:1.02em;margin-bottom:3px;"><strong>' + p.planet_count + ' &times; ' + p.output_name + '</strong> <span class="dim">(' + p.tier + ', buy in at ' + p.buy_tier + ')</span> &mdash; ' + fmtIsk(p.net_isk_hr_per_planet) + '/hr per planet</div>';
+    h += '<div style="font-size:0.88em;margin-bottom:4px;">Each planet: ' + facs.join(' &middot; ') + '</div>';
+    h += '<div class="dim" style="font-size:0.82em;margin-bottom:5px;">Produces ' + p.units_hr_per_planet.toFixed(2) + '/hr = ' + Math.floor(p.units_per_planet_per_run).toLocaleString() + ' ' + runLbl + ' · on-planet stock ' + fmtM3(p.on_planet_m3) + ' of ' + fmtM3(p.on_planet_capacity_m3) + ' capacity';
+    if (p.poco_scale < 0.999) h += ' · <span style="color:var(--yellow)">throttled to ' + (p.poco_scale*100).toFixed(0) + '% by the POCO</span>';
+    h += '</div>';
+    h += '<table style="font-size:0.85em;"><thead><tr><th>Import onto each planet</th><th class="num">' + runLbl + '</th><th class="num">per day</th><th class="num">Volume</th></tr></thead><tbody>';
+    (p.inputs||[]).forEach(i => {
+      h += '<tr><td>' + i.name + ' <span class="dim">' + i.tier + '</span></td>';
+      h += '<td class="num">' + Math.ceil(i.units_per_planet_per_run).toLocaleString() + '</td>';
+      h += '<td class="num">' + Math.ceil(i.units_per_planet_per_day).toLocaleString() + '</td>';
+      h += '<td class="num">' + fmtM3(i.m3_per_planet_per_run) + '</td></tr>';
+    });
+    h += '</tbody></table>';
+    const slip = (p.revenue_slippage||0) * 100;
+    h += '<div class="dim" style="font-size:0.82em;margin-top:5px;">Sells at ' + fmtIsk(p.revenue_per_unit) + '/unit';
+    if (slip > 0.05) h += ' (top of book ' + fmtIsk(p.revenue_top_of_book) + ', <span style="color:var(--yellow)">' + slip.toFixed(1) + '% slippage dumping ' + runLbl + '</span>)';
+    if (p.sell_book_share > 0) h += ' · one run = ' + (p.sell_book_share*100).toFixed(0) + '% of Jita 30d volume';
+    h += ' · ROI ' + ((p.roi||0)*100).toFixed(0) + '%</div>';
+    h += '</div>';
+  });
+
+  // 3. Bring back
+  h += '<h3 style="margin:14px 0 4px;">3. Bring back &amp; sell &mdash; ' + runLbl + '</h3>';
+  h += '<div class="results-wrap"><table><thead><tr><th>Product</th><th class="num">Units</th><th class="num">Volume</th><th class="num">Sell price</th><th class="num">Gross</th></tr></thead><tbody>';
+  planets.forEach(p => {
+    h += '<tr><td>' + p.output_name + ' <span class="dim">' + p.tier + '</span></td>';
+    h += '<td class="num">' + Math.floor(p.units_per_run).toLocaleString() + '</td>';
+    h += '<td class="num">' + fmtM3(p.export_m3_per_run) + '</td>';
+    h += '<td class="num">' + fmtIsk(p.revenue_per_unit) + '</td>';
+    h += '<td class="num">' + fmtIsk(p.units_per_run * p.revenue_per_unit) + '</td></tr>';
+  });
+  h += '<tr style="font-weight:bold;border-top:1px solid var(--dim)"><td>Net ' + runLbl + '</td><td></td><td class="num">' + fmtM3(d.export_m3_per_run) + '</td><td></td><td class="num" style="color:var(--green)">' + fmtIsk(d.net_per_run) + '</td></tr>';
+  h += '</tbody></table></div>';
+
+  // Slot-by-slot marginals
+  if ((d.marginals||[]).length) {
+    h += '<div class="dim" style="font-size:0.82em;margin-top:10px;">Slot order: ' + d.marginals.map(m => m.slot + '. ' + m.output_name + ' (' + fmtIsk(m.marginal_net_isk_hr) + '/hr)').join(' · ') + '</div>';
+  }
+  if (d.extraction_alternative) {
+    const e = d.extraction_alternative;
+    h += '<div class="dim" style="font-size:0.82em;margin-top:4px;">Best extraction alternative: <strong>' + e.output_name + '</strong> on ' + e.planets + ' planets = ' + fmtIsk(e.net_after_haul_per_planet) + '/hr per planet after haul.</div>';
+  }
+  if ((d.warnings||[]).length) {
+    h += '<div style="margin-top:10px;padding:6px;border-left:3px solid var(--yellow);font-size:0.83em;"><strong>Watch:</strong><ul style="margin:4px 0 0 16px;padding:0;">';
+    d.warnings.slice(0, 20).forEach(w => { h += '<li>' + w + '</li>'; });
+    h += '</ul></div>';
+  }
+  return h;
 }
 
 async function loadPiBestPlays() {
@@ -4246,6 +4375,10 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
             self._handle_pi_best_plays(parse_qs(parsed.query))
             return
 
+        if parsed.path == "/api/pi/run-plan":
+            self._handle_pi_run_plan(parse_qs(parsed.query))
+            return
+
         self.send_error(404)
 
     def _handle_pi_import_options(self, qs):
@@ -4270,6 +4403,26 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
         try:
             result = pi_dossier.best_pi_plays(isk_per_haul_min=isk_per_haul_min,
                                               min_tier=min_tier)
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+            return
+        self._send_json(result)
+
+    def _handle_pi_run_plan(self, qs):
+        import pi_dossier
+
+        def _num(key):
+            raw = qs.get(key, [""])[0]
+            try:
+                return float(raw) if raw != "" else None
+            except ValueError:
+                return None
+
+        planets = _num("max_planets")
+        try:
+            result = pi_dossier.pi_run_plan(
+                isk_per_haul_min=_num("isk_per_haul_min"),
+                max_planets=int(planets) if planets else None)
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
             return

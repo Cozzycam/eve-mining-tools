@@ -93,6 +93,11 @@ FACILITY_COSTS = {
     "htif":         {"pg": 400,  "cpu": 1100},  # High-Tech Industry Facility (P4)
 }
 
+# On-planet holding capacity (m3). Goods sitting in the customs office can't
+# feed a factory — they have to be imported onto the planet first, so a planet
+# left running unattended must physically hold its own input buffer.
+FACILITY_M3 = {"launchpad": 10000, "storage": 12000}
+
 DEFAULT_ECU_HEADS = 10
 DEFAULT_EXTRACTION_RATE = 8000  # P0/hr per 10-head ECU (conservative)
 
@@ -195,6 +200,12 @@ def load_pi_config():
         # Customs office capacity — bounds what a planet can stockpile
         # between hauls (35,000 m3, fixed game value)
         "poco_buffer_m3": cp.getfloat("pi", "poco_buffer_m3", fallback=35000),
+        # Days a planet must run on its own on-planet stock between visits.
+        # 1 = you log in daily to move POCO<->planet even though the hauler
+        # only comes every haul_every_days. Set = haul_every_days if you only
+        # touch PI on haul day (needs far more Storage Facilities).
+        "on_planet_buffer_days": cp.getfloat("pi", "on_planet_buffer_days",
+                                             fallback=1.0),
         "pg_budget": cp.getfloat("pi", "power_per_planet", fallback=ccu_pg),
         "cpu_budget": cp.getfloat("pi", "cpu_per_planet", fallback=ccu_cpu),
         # Market transaction tax on every sell (buy orders and sell orders)
@@ -819,6 +830,14 @@ MIN_REAL_ORDER_PRICE = 2         # orders at <= this price are treated as stubs
 LOW_ACTIVITY_ORDER_THRESHOLD = 10  # flag if fewer trades than this in 30d
 ORDERS_FOR_FULL_ACTIVITY = 20     # this many orders/30d = activity_factor 1.0
 
+# Jita instant-dump modelling. A haul arrives with one window's production and
+# sells it in one go, so the price that matters is the average fill across the
+# book — not the top order. Region-wide orders are filtered to the Jita system:
+# an instant dump means orders that actually reach Jita 4-4.
+JITA_SYSTEM_ID = 30000142
+SLIPPAGE_WARN = 0.03        # flag when book-walk fill is this far below top
+BOOK_SHARE_WARN = 0.25      # flag when one haul is this share of 30d throughput
+
 
 def _fetch_buy_orders_in_range(region_id, type_id, home_system_id, max_jumps):
     """Fetch buy orders filtered to stations within max_jumps of home system.
@@ -915,6 +934,105 @@ def _compute_sustained_price(book, units_per_day, vwap, days=SUSTAINED_PRICE_WIN
     return sustained, real_buy_days
 
 
+def _fetch_jita_book(type_id, buy):
+    """Jita-system order book as [(price, volume), ...], best price first.
+
+    buy=True gives the buy orders you dump output into; buy=False the sell
+    orders you lift to source factory inputs. Same cached URL the top-of-book
+    lookup used, so depth costs no extra request.
+    """
+    side = "buy" if buy else "sell"
+    url = (f"{esi.ESI_BASE}/markets/{esi.REGIONS['jita']['id']}/orders/"
+           f"?datasource=tranquility&order_type={side}&type_id={type_id}")
+    orders = esi.esi_get_cached(url, esi.CACHE_TTL_MARKET) or []
+    book = [(o["price"], o.get("volume_remain", 0)) for o in orders
+            if bool(o.get("is_buy_order", False)) == buy
+            and o.get("system_id") == JITA_SYSTEM_ID
+            and o.get("volume_remain", 0) > 0
+            and o.get("price", 0) > MIN_REAL_ORDER_PRICE]
+    book.sort(key=lambda pv: -pv[0] if buy else pv[0])
+    return book
+
+
+def _walk_book(book, qty):
+    """Fill qty units against a price-sorted book.
+
+    Returns (avg_fill_price, filled_qty). filled_qty < qty means the book ran
+    out — the caller decides what the remainder is worth.
+    """
+    if not book or qty <= 0:
+        return 0.0, 0.0
+    filled = 0.0
+    value = 0.0
+    for price, vol in book:
+        take = min(vol, qty - filled)
+        value += take * price
+        filled += take
+        if filled >= qty:
+            break
+    return (value / filled if filled > 0 else 0.0), filled
+
+
+def _jita_fill(prices, qty, selling, window_days=1.0):
+    """Realised per-unit price for pushing `qty` units through Jita in one go.
+
+    selling=True  -> dumping output into buy orders (walks down the book)
+    selling=False -> sourcing inputs from sell orders (walks up the book)
+
+    Whatever the live book can't absorb is priced at the 30-day Jita VWAP —
+    that quantity isn't an instant trade, you'd have to work the order in.
+    `window_days` is only used to express the haul as a share of the market's
+    normal throughput, which is the real "is this sustainable" signal: a book
+    refills between hauls, so a deep 30d history matters more than one snapshot.
+
+    Returns {price, top, filled_frac, slippage, book_share, depth_units, vwap}.
+    """
+    book = prices.get("jita_buy_book" if selling else "jita_sell_book", [])
+    vwap = prices.get("jita_vwap", 0) or 0
+    top = book[0][0] if book else 0.0
+    depth = sum(v for _, v in book)
+    if qty <= 0:
+        return {"price": top or vwap, "top": top, "filled_frac": 1.0,
+                "slippage": 0.0, "book_share": 0.0, "depth_units": depth,
+                "vwap": vwap}
+
+    avg, filled = _walk_book(book, qty)
+    remainder = max(0.0, qty - filled)
+    if filled > 0:
+        price = (avg * filled + vwap * remainder) / qty
+    else:
+        price = vwap
+    # Positive slippage always means "worse than top of book" for both sides.
+    slippage = ((top - price) / top if selling else (price - top) / top) \
+        if top > 0 else 0.0
+    daily_vol = prices.get("jita_avg_daily_vol", 0) or 0
+    normal_throughput = daily_vol * max(window_days, 1e-9)
+    return {
+        "price": price,
+        "top": top,
+        "filled_frac": min(1.0, filled / qty),
+        "slippage": slippage,
+        "book_share": (qty / normal_throughput) if normal_throughput > 0 else 0.0,
+        "depth_units": depth,
+        "vwap": vwap,
+    }
+
+
+def _depth_flags(fill, label):
+    """Human-readable warnings for a Jita book walk (empty list = clean)."""
+    out = []
+    if fill["top"] <= 0:
+        out.append(f"NO JITA BOOK ({label})")
+        return out
+    if fill["filled_frac"] < 1.0:
+        out.append(f"{label} BOOK ONLY FILLS {fill['filled_frac'] * 100:.0f}%")
+    if fill["slippage"] > SLIPPAGE_WARN:
+        out.append(f"{label} SLIPPAGE {fill['slippage'] * 100:.0f}%")
+    if fill["book_share"] > BOOK_SHARE_WARN:
+        out.append(f"{label} IS {fill['book_share'] * 100:.0f}% OF 30d VOLUME")
+    return out
+
+
 def fetch_pi_market(pi_types, local_region_id, home_system_id, max_jumps,
                     progress=False):
     """Fetch market data for all PI products.
@@ -960,8 +1078,12 @@ def fetch_pi_market(pi_types, local_region_id, home_system_id, max_jumps,
         # a factory input (import-and-upgrade model).
         jita_hist = _fetch_market_history(jita_region_id, tid)
         jita_stats = _compute_history_stats(jita_hist, days=30)
-        jita_live, _ = esi.fetch_best_buy(jita_region_id, tid, use_cache=True)
-        jita_sell, _ = esi.fetch_best_sell(jita_region_id, tid, use_cache=True)
+        # Full Jita-system books, not just top of book — a haul is one big
+        # trade and walks the book down (or up, when buying inputs).
+        jita_buy_book = _fetch_jita_book(tid, True)
+        jita_sell_book = _fetch_jita_book(tid, False)
+        jita_live = jita_buy_book[0][0] if jita_buy_book else 0
+        jita_sell = jita_sell_book[0][0] if jita_sell_book else 0
 
         return tid, {
             # Buy order book within range (sorted desc by price)
@@ -985,6 +1107,8 @@ def fetch_pi_market(pi_types, local_region_id, home_system_id, max_jumps,
             "jita_order_count": jita_stats["total_order_count"],
             "jita_buy": jita_live,
             "jita_sell": jita_sell,
+            "jita_buy_book": jita_buy_book,
+            "jita_sell_book": jita_sell_book,
         }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
@@ -2048,13 +2172,16 @@ def _compute_economics_single(vc, ectx):
     vc["jita_active_days"] = jita_active_days
 
     # Effective sell price. Default = sustained realised local price (blended
-    # buy book + VWAP). When sell_at_jita is set, value output at the Jita top
-    # buy order instead — an instant dump to Jita buyers (falls back to Jita
-    # VWAP if no live buy order). Jita is deep, so no liquidity/activity penalty
-    # applies and the local buy-book flags are irrelevant.
+    # buy book + VWAP). When sell_at_jita is set, value output at Jita instead —
+    # but as an instant dump of one haul window's production, which walks the
+    # buy book down rather than all clearing at the top order. Anything the
+    # book can't absorb prices at Jita VWAP.
     sell_at_jita = bool(cfg.get("sell_at_jita"))
+    haul_days = cfg.get("haul_every_days", 1) or 1
+    jita_fill = _jita_fill(prices, units_per_day * haul_days, True, haul_days)
+    vc["jita_fill"] = jita_fill
     if sell_at_jita:
-        sell_price = jita_buy if jita_buy > 0 else jita_vwap
+        sell_price = jita_fill["price"]
     else:
         sell_price = sustained_price
     # Every market sell pays transaction tax — realise it in the price
@@ -2109,6 +2236,8 @@ def _compute_economics_single(vc, ectx):
     if sell_at_jita:
         if jita_buy <= 0 and jita_vwap <= 100:
             vc["flags"].append("NO JITA MARKET")
+        else:
+            vc["flags"].extend(_depth_flags(jita_fill, "SELL"))
     else:
         # NO LOCAL BUYER: no buy orders within jump range
         if local_buy == 0:
@@ -2131,12 +2260,18 @@ def _compute_economics_single(vc, ectx):
     if vc["haul_minutes_per_day"] > cfg["max_haul_minutes"]:
         vc["flags"].append("HAUL OVER BUDGET")
 
-    # Launchpad fill time check
+    # Output-buffer check: the launchpad on the planet that makes the final
+    # product has to hold everything produced between two visits.
+    buffer_days = min(cfg.get("on_planet_buffer_days", 1.0), haul_days)
     if units_hr > 0 and chain["volume"] > 0:
-        lp_capacity = 10000  # m³
-        fill_hours = lp_capacity / (units_hr * chain["volume"])
-        if fill_hours < 24:
-            vc["flags"].append(f"MUST HAUL EVERY {fill_hours:.0f}H")
+        fill_hours = FACILITY_M3["launchpad"] / (units_hr * chain["volume"])
+        vc["output_fill_hours"] = fill_hours
+        need_hours = buffer_days * 24
+        if fill_hours < need_hours:
+            extra = _storage_for(units_hr * chain["volume"] * need_hours)
+            vc["flags"].append(
+                f"LAUNCHPAD FILLS IN {fill_hours:.0f}H "
+                f"(needs {extra} storage for {buffer_days:g}d)")
 
     # Jita spread: compare in-range buy vs Jita VWAP (only informative when
     # selling locally — it's the "you could do better at Jita" nudge).
@@ -3643,7 +3778,9 @@ def render_markdown(layouts, ranked_by_tier, cfg, char_info, pi_skills,
     lines.append("- **HAUL OVER BUDGET**: daily haul exceeds max_haul_minutes_per_day")
     lines.append("- **POWER LIMIT**: layout pushes against PG or CPU ceiling")
     lines.append("- **NO [PLANET TYPE]**: chain needs a planet type not in your inventory")
-    lines.append("- **MUST HAUL EVERY XH**: launchpad fills before 24h")
+    lines.append("- **LAUNCHPAD FILLS IN XH**: output outruns the 10k m3 launchpad before the next visit — add Storage Facilities")
+    lines.append("- **SELL SLIPPAGE X%**: dumping one haul walks the Jita buy book down this far below the top order")
+    lines.append("- **SELL IS X% OF 30d VOLUME**: one haul is this share of Jita's normal throughput — the book may not refill between runs")
     lines.append("- **EXCEEDS 5 PLANETS**: chain needs more planet slots than available")
     lines.append("- **JITA +X%**: Jita VWAP significantly higher than local buy")
     lines.append("")
@@ -4437,20 +4574,53 @@ def _facility_bundle(type_id, rate_hr, buy_level, pi_types, schematics,
                          buy_level, pi_types, schematics, acc, depth + 1)
 
 
-def _factory_units_per_planet(bundle_at_1, pg_budget, cpu_budget):
+def _storage_for(m3_needed):
+    """Storage Facilities required beyond the one launchpad, to hold m3_needed."""
+    over = m3_needed - FACILITY_M3["launchpad"]
+    return max(0, math.ceil(over / FACILITY_M3["storage"])) if over > 0 else 0
+
+
+def _factory_units_per_planet(bundle_at_1, pg_budget, cpu_budget,
+                              m3_per_unit=0.0, buffer_days=0.0):
     """Max target units/hr one factory planet sustains for a bundle sized to
-    make 1 unit/hr, after reserving one launchpad. Limited by PG and CPU."""
+    make 1 unit/hr, after reserving one launchpad.
+
+    Limited by PG and CPU, and — when buffer_days is set — by what the planet
+    can physically hold. `m3_per_unit` is the input + output volume per
+    finished unit; the planet must stage `buffer_days` of that flow on-planet
+    between visits. Storage Facilities buy capacity out of the same PG/CPU
+    budget the factories want, so every storage count is tried and the best
+    resulting throughput wins.
+
+    Returns (units_hr, pg_per_unit, cpu_per_unit, storage_count).
+    """
     c = FACILITY_COSTS
-    pg_avail = pg_budget - c["launchpad"]["pg"]
-    cpu_avail = cpu_budget - c["launchpad"]["cpu"]
     pg_per = (bundle_at_1.get("aif", 0) * c["aif"]["pg"]
               + bundle_at_1.get("htif", 0) * c["htif"]["pg"])
     cpu_per = (bundle_at_1.get("aif", 0) * c["aif"]["cpu"]
                + bundle_at_1.get("htif", 0) * c["htif"]["cpu"])
     if pg_per <= 0 or cpu_per <= 0:
-        return 0.0, 0.0, 0.0
-    units = max(0.0, min(pg_avail / pg_per, cpu_avail / cpu_per))
-    return units, pg_per, cpu_per
+        return 0.0, 0.0, 0.0, 0
+    flow_per_unit_hr = m3_per_unit * 24 * buffer_days  # m3 held per unit/hr
+    best_units, best_storage = 0.0, 0
+    n = 0
+    while True:
+        pg_avail = pg_budget - c["launchpad"]["pg"] - n * c["storage"]["pg"]
+        cpu_avail = cpu_budget - c["launchpad"]["cpu"] - n * c["storage"]["cpu"]
+        if pg_avail < pg_per or cpu_avail < cpu_per:
+            break
+        units = min(pg_avail / pg_per, cpu_avail / cpu_per)
+        if flow_per_unit_hr > 0:
+            hold = FACILITY_M3["launchpad"] + n * FACILITY_M3["storage"]
+            units = min(units, hold / flow_per_unit_hr)
+        if units > best_units:
+            best_units, best_storage = units, n
+        n += 1
+    # Report only the storage the winning throughput actually needs — the
+    # search may have peaked at a count with spare capacity.
+    if best_units > 0 and flow_per_unit_hr > 0:
+        best_storage = _storage_for(best_units * flow_per_unit_hr)
+    return best_units, pg_per, cpu_per, best_storage
 
 
 def _factory_tax_rate(state):
@@ -4474,16 +4644,41 @@ def _factory_tax_rate(state):
     return best_rate, best_key
 
 
+DEFAULT_CADENCE = {"haul_days": 1.0, "poco_m3": 35000.0, "buffer_days": 1.0}
+
+
+def _cadence_from_cfg(cfg):
+    """Haul-cadence knobs an import planet has to live within."""
+    haul_days = cfg.get("haul_every_days", 1) or 1
+    return {
+        "haul_days": haul_days,
+        "poco_m3": cfg.get("poco_buffer_m3", 35000),
+        # How long the planet runs on its own stock between visits. With a
+        # daily login you top the planet up from the POCO every day even
+        # though the hauler only comes every haul_days.
+        "buffer_days": min(cfg.get("on_planet_buffer_days", 1.0), haul_days),
+    }
+
+
 def _import_option(chain, buy_level, market, pi_types, schematics,
                    pg_budget, cpu_budget, tax_rate, sales_tax=0.0,
-                   broker_fee=None):
+                   broker_fee=None, cadence=None, n_planets=1):
     """Economics of making one target chain by importing tier<=buy_level inputs.
 
     Everything is per one unit of finished output, then scaled to a per-planet
-    hourly figure via factory throughput. Prices: inputs at Jita sell (you buy),
-    output at Jita buy (you dump). Tax = POCO import on bought inputs + export
-    on the finished unit (single-factory-planet assumption), plus market
+    hourly figure via factory throughput. Tax = POCO import on bought inputs +
+    export on the finished unit (single-factory-planet assumption), plus market
     sales tax on the Jita dump.
+
+    Throughput is settled BEFORE pricing, because price depends on how much you
+    move per haul but throughput doesn't depend on price:
+
+      1. PG/CPU, minus a launchpad and enough Storage Facilities to stage
+         `buffer_days` of input+output flow on-planet.
+      2. The customs office — each haul-window leg has to fit in 35k m3.
+      3. Only then are both Jita legs priced by walking the actual order books
+         for one window's quantity (x n_planets, so a portfolio's later planets
+         correctly see the price its earlier planets already moved).
 
     When broker_fee is given, also reports a buy-order-sourced input basis:
     acquiring inputs with your own buy orders filled at ~the Jita top buy
@@ -4492,55 +4687,92 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
     guaranteed — the headline net stays on the instant sell-order basis."""
     tid = chain["output_type_id"]
     out_tier = chain["tier"]
+    cad = cadence or DEFAULT_CADENCE
+    haul_days = cad["haul_days"]
+    out_vol = chain.get("volume", 0)
 
     # Bill of materials at the buy-in tier (per 1 finished unit)
     bom = {}
     _bom_at_tier(tid, 1.0, buy_level, pi_types, schematics, bom)
 
     flags = []
-    input_cost = 0.0
-    input_cost_buy = 0.0  # buy-order sourcing basis; None if any input lacks a buy
     input_vol = 0.0
     import_tax = 0.0
+    for in_tid, qty in bom.items():
+        it = pi_types.get(in_tid, {})
+        input_vol += qty * it.get("volume", 0)
+        import_tax += qty * PI_TAX_BASE.get(it.get("tier", "P1"), 500) * 0.5 * tax_rate
+
+    # ── 1. Throughput: PG/CPU after a launchpad + the storage the buffer needs
+    bundle = {}
+    _facility_bundle(tid, 1.0, buy_level, pi_types, schematics, bundle)
+    units_hr, pg_per, cpu_per, storage_count = _factory_units_per_planet(
+        bundle, pg_budget, cpu_budget, input_vol + out_vol, cad["buffer_days"])
+
+    # ── 2. Customs office: each window leg has to fit through the POCO
+    poco_scale = 1.0
+    legs = [v * units_hr * 24 * haul_days for v in (input_vol, out_vol) if v > 0]
+    if units_hr > 0 and legs:
+        poco_scale = min([1.0] + [cad["poco_m3"] / v for v in legs if v > 0])
+    if poco_scale < 1.0:
+        units_hr *= poco_scale
+        flags.append(f"POCO BUFFER CAPS AT {poco_scale * 100:.0f}%")
+    if cad["buffer_days"] > 0 and units_hr > 0:
+        storage_count = _storage_for(
+            (input_vol + out_vol) * units_hr * 24 * cad["buffer_days"])
+    else:
+        storage_count = 0
+
+    # ── 3. Price both legs by walking the book for one haul window
+    window_out = units_hr * 24 * haul_days * max(n_planets, 1)
+
+    input_cost = 0.0
+    input_cost_buy = 0.0  # buy-order sourcing basis; None if any input lacks a buy
     input_lines = []
     for in_tid, qty in sorted(bom.items(), key=lambda kv: -kv[1]):
         it = pi_types.get(in_tid, {})
         prices = market.get(in_tid, {})
-        jsell = prices.get("jita_sell", 0) or 0
+        fill = _jita_fill(prices, qty * window_out, False, haul_days)
+        jsell = fill["price"]
         jbuy = prices.get("jita_buy", 0) or 0
-        base = PI_TAX_BASE.get(it.get("tier", "P1"), 500)
-        if jsell <= 0:
+        if fill["top"] <= 0:
             flags.append(f"NO JITA SELL ({it.get('name', in_tid)})")
+        flags.extend(_depth_flags(fill, f"BUY {it.get('name', in_tid)}"))
         input_cost += qty * jsell
         if input_cost_buy is not None and jbuy > 0:
             input_cost_buy += qty * jbuy
         else:
             input_cost_buy = None
-        input_vol += qty * it.get("volume", 0)
-        import_tax += qty * base * 0.5 * tax_rate
         input_lines.append({
             "name": it.get("name", str(in_tid)),
+            "type_id": in_tid,
             "tier": it.get("tier", ""),
+            "volume": it.get("volume", 0),
             "qty_per_unit": qty,
+            "qty_per_window": qty * window_out,
             "jita_sell": jsell,
+            "jita_sell_top": fill["top"],
             "jita_buy": jbuy,
+            "slippage": fill["slippage"],
+            "book_share": fill["book_share"],
             "cost_per_unit": qty * jsell,
         })
 
     out_prices = market.get(tid, {})
-    revenue = out_prices.get("jita_buy", 0) or 0
-    rev_basis = "jita_buy"
-    if revenue <= 0:
-        revenue = out_prices.get("jita_vwap", 0) or 0
-        rev_basis = "jita_vwap"
-        if revenue > 0:
-            flags.append("NO JITA BUYER (VWAP est.)")
-        else:
-            flags.append("NO JITA MARKET")
+    sell_fill = _jita_fill(out_prices, window_out, True, haul_days)
+    revenue = sell_fill["price"]
+    if sell_fill["top"] <= 0:
+        rev_basis = "jita_vwap" if revenue > 0 else "none"
+        flags.append("NO JITA BUYER (VWAP est.)" if revenue > 0 else "NO JITA MARKET")
+    elif sell_fill["filled_frac"] >= 1.0:
+        rev_basis = "jita_buy"
+    else:
+        rev_basis = "jita_buy+vwap"
+    flags.extend(_depth_flags(sell_fill, "SELL"))
+
     export_tax = PI_TAX_BASE.get(out_tier, 70000) * tax_rate
     tax_per_unit = import_tax + export_tax
     sales_tax_per_unit = revenue * sales_tax
-    out_vol = chain.get("volume", 0)
 
     net_per_unit = revenue - input_cost - tax_per_unit - sales_tax_per_unit
     roi = (net_per_unit / input_cost) if input_cost > 0 else 0.0
@@ -4553,17 +4785,12 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
         net_buy_sourced = (revenue - buy_sourced_cost - tax_per_unit
                            - sales_tax_per_unit)
 
-    # Factory throughput: facilities to make 1 unit/hr, then per-planet units/hr
-    bundle = {}
-    _facility_bundle(tid, 1.0, buy_level, pi_types, schematics, bundle)
-    units_hr, pg_per, cpu_per = _factory_units_per_planet(
-        bundle, pg_budget, cpu_budget)
-
     net_isk_hr = net_per_unit * units_hr
     net_isk_hr_buy_sourced = (net_buy_sourced * units_hr
                               if net_buy_sourced is not None else None)
     daily_import_vol = input_vol * units_hr * 24
     daily_export_vol = out_vol * units_hr * 24
+    on_planet_m3 = (input_vol + out_vol) * units_hr * 24 * cad["buffer_days"]
 
     return {
         "buy_tier": _TIER_NAMES.get(buy_level, "P?"),
@@ -4574,6 +4801,10 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
         "tax_per_unit": tax_per_unit,
         "sales_tax_per_unit": sales_tax_per_unit,
         "revenue_per_unit": revenue,
+        "revenue_top_of_book": sell_fill["top"],
+        "revenue_slippage": sell_fill["slippage"],
+        "sell_book_share": sell_fill["book_share"],
+        "sell_filled_frac": sell_fill["filled_frac"],
         "revenue_basis": rev_basis,
         "net_per_unit": net_per_unit,
         "roi": roi,
@@ -4583,41 +4814,24 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
         # Facility counts for the actual planet build (not per unit/hr)
         "aif_count": round(bundle.get("aif", 0) * units_hr, 2),
         "htif_count": round(bundle.get("htif", 0) * units_hr, 2),
+        "storage_count": storage_count,
+        "launchpad_count": 1,
+        "on_planet_m3": on_planet_m3,
+        "on_planet_capacity_m3": (FACILITY_M3["launchpad"]
+                                  + storage_count * FACILITY_M3["storage"]),
+        "buffer_days": cad["buffer_days"],
+        "poco_scale": poco_scale,
         "input_vol_per_unit": input_vol,
         "output_vol_per_unit": out_vol,
         "daily_import_m3": daily_import_vol,
         "daily_export_m3": daily_export_vol,
+        "window_units": units_hr * 24 * haul_days,
         "input_lines": input_lines,
         "flags": flags,
         "viable": units_hr > 0 and net_per_unit > 0 and not any(
             f.startswith("NO JITA SELL") or f == "NO JITA MARKET"
             for f in flags),
     }
-
-
-def _apply_poco_throttle(opt, haul_days, poco_m3):
-    """Scale an import option so each haul-window leg fits the POCO buffer.
-
-    Between hauls, bought inputs and finished output both stage through the
-    35k m3 customs office; if either leg's window volume exceeds it, the
-    planet must run fewer facilities. Linear scale, mutates opt in place.
-    Returns the scale applied (1.0 = untouched).
-    # ponytail: ignores launchpad headroom and intra-window import/export
-    # crossover; refine if a pick is ever borderline
-    """
-    legs = [v * haul_days for v in (opt["daily_import_m3"],
-                                    opt["daily_export_m3"]) if v > 0]
-    scale = min([1.0] + [poco_m3 / v for v in legs])
-    if scale < 1.0:
-        for k in ("units_hr_per_planet", "net_isk_hr_per_planet",
-                  "daily_import_m3", "daily_export_m3"):
-            opt[k] *= scale
-        for k in ("aif_count", "htif_count"):
-            opt[k] = round(opt[k] * scale, 2)
-        if opt.get("net_isk_hr_buy_sourced") is not None:
-            opt["net_isk_hr_buy_sourced"] *= scale
-        opt["flags"].append(f"POCO BUFFER CAPS AT {scale * 100:.0f}%")
-    return scale
 
 
 def import_upgrade_options(min_tier="P3"):
@@ -4642,8 +4856,8 @@ def import_upgrade_options(min_tier="P3"):
     tax_rate, tax_planet = _factory_tax_rate(state)
     sales_tax = cfg.get("sales_tax", 0.0)
     broker_fee = cfg.get("broker_fee")
-    haul_days = cfg.get("haul_every_days", 1) or 1
-    poco_m3 = cfg.get("poco_buffer_m3", 35000)
+    cad = _cadence_from_cfg(cfg)
+    haul_days, poco_m3 = cad["haul_days"], cad["poco_m3"]
 
     min_level = _TIER_LEVEL.get(min_tier, 3)
     # Full-integration net (per that product's optimizer layout) for reference
@@ -4659,8 +4873,7 @@ def import_upgrade_options(min_tier="P3"):
         for buy_level in range(1, out_level):  # P1..(target-1)
             opt = _import_option(chain, buy_level, market, pi_types, schematics,
                                  pg_budget, cpu_budget, tax_rate, sales_tax,
-                                 broker_fee)
-            _apply_poco_throttle(opt, haul_days, poco_m3)
+                                 broker_fee, cad)
             options.append(opt)
         if not options:
             continue
@@ -4693,6 +4906,7 @@ def import_upgrade_options(min_tier="P3"):
         "broker_fee": broker_fee,
         "haul_every_days": haul_days,
         "poco_buffer_m3": poco_m3,
+        "on_planet_buffer_days": cad["buffer_days"],
         "pg_budget": pg_budget,
         "cpu_budget": cpu_budget,
         "sell_basis": "jita_buy",
@@ -4732,8 +4946,8 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
     sales_tax = cfg.get("sales_tax", 0.0)
     broker_fee = cfg.get("broker_fee")
     hauler_m3 = cfg.get("hauler_m3", 9000) or 9000
-    haul_days = cfg.get("haul_every_days", 1) or 1
-    poco_m3 = cfg.get("poco_buffer_m3", 35000)
+    cad = _cadence_from_cfg(cfg)
+    haul_days, poco_m3 = cad["haul_days"], cad["poco_m3"]
     jita_jumps = ectx.get("jita_jumps", 15)
     haul = cfg.get("haul", {"sec_per_jump": 45, "sec_per_station": 180})
     if isk_per_haul_min is None:
@@ -4757,11 +4971,6 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
         tier = chain["tier"]
         vol = chain.get("volume", 0)
         out_prices = market.get(tid, {})
-        rev = out_prices.get("jita_buy", 0) or 0
-        basis = "jita_buy"
-        if rev <= 0:
-            rev = out_prices.get("jita_vwap", 0) or 0
-            basis = "jita_vwap"
 
         options = []
 
@@ -4771,6 +4980,12 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
             units = vi.get("units_hr", 0)
             tax_hr = vi.get("tax_per_hr", 0)
             planets = vi.get("planet_count", len(vi.get("planets_used", []))) or 1
+            # One haul dumps a whole window's production at once — walk the
+            # book for that quantity instead of trusting the top order.
+            fill = _jita_fill(out_prices, units * 24 * haul_days, True, haul_days)
+            rev = fill["price"]
+            basis = ("jita_buy" if fill["top"] > 0 and fill["filled_frac"] >= 1.0
+                     else "jita_buy+vwap" if fill["top"] > 0 else "jita_vwap")
             gross_hr = units * rev
             net_hr = gross_hr * (1.0 - sales_tax) - tax_hr
             # One run every haul_days: local circuit + delivery amortised
@@ -4781,6 +4996,7 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
             haul_cost_hr = haul_min * isk_per_haul_min / 24.0
             net_after = net_hr - haul_cost_hr
             ex_flags = list(vi.get("flags", []))
+            ex_flags.extend(_depth_flags(fill, "SELL"))
             if units * 24 * haul_days * vol / planets > poco_m3:
                 ex_flags.append(f"{haul_days:g}d OUTPUT EXCEEDS POCO BUFFER")
             options.append({
@@ -4803,8 +5019,7 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
             for buy_level in range(1, out_level):
                 opt = _import_option(chain, buy_level, market, pi_types,
                                      schematics, pg_budget, cpu_budget,
-                                     tax_rate, sales_tax, broker_fee)
-                _apply_poco_throttle(opt, haul_days, poco_m3)
+                                     tax_rate, sales_tax, broker_fee, cad)
                 imp_trips = max(_trips(opt["daily_import_m3"] * haul_days),
                                 _trips(opt["daily_export_m3"] * haul_days))
                 imp_min = imp_trips * jita_rt_min / haul_days
@@ -4834,6 +5049,14 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
                     "roi": best_imp["roi"],
                     "daily_import_m3": best_imp["daily_import_m3"],
                     "daily_export_m3": best_imp["daily_export_m3"],
+                    "storage_count": best_imp["storage_count"],
+                    "aif_count": best_imp["aif_count"],
+                    "htif_count": best_imp["htif_count"],
+                    "on_planet_m3": best_imp["on_planet_m3"],
+                    "on_planet_capacity_m3": best_imp["on_planet_capacity_m3"],
+                    "sell_book_share": best_imp["sell_book_share"],
+                    "revenue_slippage": best_imp["revenue_slippage"],
+                    "buy_level": best_imp["buy_level"],
                     "viable": best_imp["viable"], "flags": best_imp["flags"],
                 })
 
@@ -4855,9 +5078,228 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
         "factory_tax_planet": tax_planet, "sales_tax": sales_tax,
         "hauler_m3": hauler_m3, "haul_every_days": haul_days,
         "poco_buffer_m3": poco_m3,
+        "on_planet_buffer_days": cad["buffer_days"],
         "isk_per_haul_min": isk_per_haul_min, "jita_jumps": jita_jumps,
         "jita_round_trip_min": jita_rt_min, "sell_basis": "jita_buy",
         "plays": plays,
+    }
+
+
+def pi_run_plan(isk_per_haul_min=None, max_planets=None):
+    """The do-this-tonight sheet: what to build, buy, drop, and bring back.
+
+    Fills your planet slots greedily, one at a time. Each candidate is re-priced
+    for the portfolio size being considered, so the second planet on a product
+    sees the Jita book its first planet already ate through — a thin product
+    stops winning slots and the runner-up takes over. That's what makes the
+    result a mix rather than five copies of whatever ranked first.
+
+    Everything is quoted per haul run (haul_every_days) because that's the unit
+    of work you actually do.
+
+    # ponytail: allocates import/factory planets only. Extraction layouts need
+    # specific planets from the allocator, so the best extraction play is
+    # reported alongside for comparison rather than competing for slots.
+    """
+    state = _LAST_RUN.get("state")
+    if not state:
+        return {"error": "No PI run in memory — generate the dossier first."}
+    ctx, ectx, cfg = state["ctx"], state["ectx"], state["cfg"]
+    market = ectx["market_prices"]
+    pi_types = ctx["pi_types"]
+    schematics = ctx["schematics"]
+    chains = ctx["chains"]
+    pg_budget, cpu_budget = state["pg_budget"], state["cpu_budget"]
+    tax_rate, tax_planet = _factory_tax_rate(state)
+    sales_tax = cfg.get("sales_tax", 0.0)
+    broker_fee = cfg.get("broker_fee")
+    cad = _cadence_from_cfg(cfg)
+    haul_days = cad["haul_days"]
+    hauler_m3 = cfg.get("hauler_m3", 9000) or 9000
+    slots = int(max_planets or cfg.get("max_planets", 5))
+    jita_jumps = ectx.get("jita_jumps", 15)
+    haul = cfg.get("haul", {"sec_per_jump": 45, "sec_per_station": 180})
+    if isk_per_haul_min is None:
+        isk_per_haul_min = DEFAULT_ISK_PER_HAUL_MIN
+    jita_rt_min = (jita_jumps * 2 * haul.get("sec_per_jump", 45)
+                   + 2 * haul.get("sec_per_station", 180)) / 60.0
+
+    def _trips(m3):
+        return math.ceil(m3 / hauler_m3) if (m3 > 0 and hauler_m3 > 0) else 0
+
+    def _best_option(chain, n):
+        """Best buy-in tier for running n planets of this product, after haul."""
+        best = None
+        for lvl in range(1, _TIER_LEVEL.get(chain["tier"], 0)):
+            o = _import_option(chain, lvl, market, pi_types, schematics,
+                               pg_budget, cpu_budget, tax_rate, sales_tax,
+                               broker_fee, cad, n_planets=n)
+            trips = max(_trips(o["daily_import_m3"] * haul_days * n),
+                        _trips(o["daily_export_m3"] * haul_days * n))
+            o["_haul_min_per_day"] = trips * jita_rt_min / haul_days
+            o["_trips"] = trips
+            o["_total_net_isk_hr"] = (o["net_isk_hr_per_planet"] * n
+                                      - o["_haul_min_per_day"] * isk_per_haul_min / 24.0)
+            if best is None or o["_total_net_isk_hr"] > best["_total_net_isk_hr"]:
+                best = o
+        return best
+
+    candidates = {tid: c for tid, c in chains.items()
+                  if _TIER_LEVEL.get(c["tier"], 0) >= 2}
+
+    counts, running_net, chosen = {}, {}, {}
+    marginals = []
+    for slot in range(slots):
+        pick_tid, pick_marginal, pick_opt = None, 0.0, None
+        for tid, chain in candidates.items():
+            n = counts.get(tid, 0) + 1
+            opt = _best_option(chain, n)
+            if opt is None or not opt["viable"]:
+                continue
+            marginal = opt["_total_net_isk_hr"] - running_net.get(tid, 0.0)
+            if marginal > pick_marginal:
+                pick_tid, pick_marginal, pick_opt = tid, marginal, opt
+        if pick_tid is None:
+            break
+        counts[pick_tid] = counts.get(pick_tid, 0) + 1
+        running_net[pick_tid] = pick_opt["_total_net_isk_hr"]
+        chosen[pick_tid] = pick_opt
+        marginals.append({
+            "slot": slot + 1,
+            "output_name": chains[pick_tid]["output_name"],
+            "marginal_net_isk_hr": pick_marginal,
+        })
+
+    # ── Build the per-planet + shopping output ──
+    shopping = {}
+    planets, warnings = [], []
+    import_m3 = export_m3 = 0.0
+    spend_per_run = revenue_per_run = 0.0
+    total_net_isk_hr = 0.0
+
+    for tid, opt in sorted(chosen.items(),
+                           key=lambda kv: -kv[1]["_total_net_isk_hr"]):
+        chain = chains[tid]
+        n = counts[tid]
+        per_planet_units = opt["window_units"]          # units per haul run
+        run_units = per_planet_units * n
+
+        inputs = []
+        for line in opt["input_lines"]:
+            it_units = line["qty_per_unit"] * per_planet_units
+            vol_each = line["volume"]
+            inputs.append({
+                "name": line["name"],
+                "tier": line["tier"],
+                "units_per_planet_per_run": it_units,
+                "units_per_planet_per_day": it_units / haul_days,
+                "m3_per_planet_per_run": it_units * vol_each,
+                "isk_per_planet_per_run": it_units * line["jita_sell"],
+                "jita_sell": line["jita_sell"],
+                "slippage": line["slippage"],
+            })
+            agg = shopping.setdefault(line["name"], {
+                "name": line["name"], "tier": line["tier"], "units": 0.0,
+                "m3": 0.0, "isk": 0.0, "jita_sell": line["jita_sell"],
+                "slippage": line["slippage"], "book_share": line["book_share"],
+            })
+            agg["units"] += it_units * n
+            agg["m3"] += it_units * vol_each * n
+            agg["isk"] += it_units * line["jita_sell"] * n
+
+        p_import_m3 = opt["daily_import_m3"] * haul_days * n
+        p_export_m3 = opt["daily_export_m3"] * haul_days * n
+        import_m3 += p_import_m3
+        export_m3 += p_export_m3
+        spend_per_run += opt["input_cost_per_unit"] * run_units
+        revenue_per_run += opt["revenue_per_unit"] * run_units
+        total_net_isk_hr += opt["_total_net_isk_hr"]
+
+        if opt["on_planet_m3"] > opt["on_planet_capacity_m3"] + 1e-6:
+            warnings.append(f"{chain['output_name']}: on-planet buffer "
+                            f"{opt['on_planet_m3']:.0f} m3 exceeds built capacity")
+        for f in opt["flags"]:
+            warnings.append(f"{chain['output_name']}: {f}")
+
+        planets.append({
+            "output_name": chain["output_name"],
+            "output_type_id": tid,
+            "tier": chain["tier"],
+            "buy_tier": opt["buy_tier"],
+            "planet_count": n,
+            "facilities": {
+                "aif": opt["aif_count"], "htif": opt["htif_count"],
+                "launchpad": 1, "storage": opt["storage_count"],
+            },
+            "units_hr_per_planet": opt["units_hr_per_planet"],
+            "units_per_planet_per_run": per_planet_units,
+            "units_per_run": run_units,
+            "inputs": inputs,
+            "on_planet_m3": opt["on_planet_m3"],
+            "on_planet_capacity_m3": opt["on_planet_capacity_m3"],
+            "import_m3_per_run": p_import_m3,
+            "export_m3_per_run": p_export_m3,
+            "net_isk_hr_per_planet": opt["net_isk_hr_per_planet"],
+            "total_net_isk_hr": opt["_total_net_isk_hr"],
+            "net_per_unit": opt["net_per_unit"],
+            "roi": opt["roi"],
+            "revenue_per_unit": opt["revenue_per_unit"],
+            "revenue_top_of_book": opt["revenue_top_of_book"],
+            "revenue_slippage": opt["revenue_slippage"],
+            "sell_book_share": opt["sell_book_share"],
+            "poco_scale": opt["poco_scale"],
+            "flags": opt["flags"],
+        })
+
+    trips = max(_trips(import_m3), _trips(export_m3))
+    if trips > 1:
+        warnings.append(f"One run needs {trips} hauler trips "
+                        f"({max(import_m3, export_m3):,.0f} m3 vs "
+                        f"{hauler_m3:,.0f} m3 hold)")
+
+    # Reference: the best extraction play, for the extract-vs-import sanity check
+    bp = best_pi_plays(isk_per_haul_min=isk_per_haul_min, min_tier="P1")
+    extraction_alt = None
+    for play in bp.get("plays", []):
+        for o in play["options"]:
+            if o["strategy"] == "extract" and o["viable"]:
+                extraction_alt = {
+                    "output_name": play["output_name"], "tier": play["tier"],
+                    "planets": o["planets"],
+                    "net_after_haul_isk_hr": o["net_after_haul_isk_hr"],
+                    "net_after_haul_per_planet": o["net_after_haul_per_planet"],
+                }
+                break
+        if extraction_alt:
+            break
+
+    return {
+        "haul_every_days": haul_days,
+        "on_planet_buffer_days": cad["buffer_days"],
+        "poco_buffer_m3": cad["poco_m3"],
+        "hauler_m3": hauler_m3,
+        "jita_jumps": jita_jumps,
+        "jita_round_trip_min": jita_rt_min,
+        "isk_per_haul_min": isk_per_haul_min,
+        "tax_rate": tax_rate,
+        "factory_tax_planet": tax_planet,
+        "sales_tax": sales_tax,
+        "pg_budget": pg_budget,
+        "cpu_budget": cpu_budget,
+        "slots": slots,
+        "slots_used": sum(counts.values()),
+        "planets": planets,
+        "marginals": marginals,
+        "shopping_list": sorted(shopping.values(), key=lambda s: -s["isk"]),
+        "spend_per_run": spend_per_run,
+        "revenue_per_run": revenue_per_run,
+        "net_per_run": revenue_per_run - spend_per_run,
+        "total_net_isk_hr": total_net_isk_hr,
+        "import_m3_per_run": import_m3,
+        "export_m3_per_run": export_m3,
+        "trips_per_run": trips,
+        "extraction_alternative": extraction_alt,
+        "warnings": warnings,
     }
 
 
@@ -5755,7 +6197,9 @@ def self_test():
                           "local_vwap": 320, "local_avg_daily_vol": 2,
                           "local_active_days": 3, "local_order_count": 2,
                           "jita_vwap": 500, "jita_avg_daily_vol": 5000,
-                          "jita_active_days": 30, "jita_buy": 480}}
+                          "jita_active_days": 30, "jita_buy": 480,
+                          "jita_buy_book": [(480, 10 ** 9)],
+                          "jita_sell_book": [(520, 10 ** 9)]}}
     def _sj_run(flag):
         _cfg = load_pi_config()
         _cfg["sell_at_jita"] = flag
@@ -5812,10 +6256,16 @@ def self_test():
         30: {"output_type_id": 30, "output_name": "WM", "tier": "P4", "volume": 100.0,
              "schematic": _iu_sch[130], "inputs": [{"type_id": 20, "tier": "P3", "quantity": 6}]},
     }
+    def _deep(sell, buy):
+        """Market entry with books deep enough that walking them never slips."""
+        return {"jita_sell": sell, "jita_buy": buy, "jita_vwap": buy,
+                "jita_avg_daily_vol": 0,
+                "jita_sell_book": [(sell, 10 ** 9)] if sell else [],
+                "jita_buy_book": [(buy, 10 ** 9)] if buy else []}
     _iu_market = {
-        1:  {"jita_sell": 100, "jita_buy": 90}, 2: {"jita_sell": 120, "jita_buy": 100},
-        10: {"jita_sell": 12000, "jita_buy": 11000}, 20: {"jita_sell": 90000, "jita_buy": 85000},
-        30: {"jita_sell": 0, "jita_buy": 1500000},
+        1: _deep(100, 90), 2: _deep(120, 100),
+        10: _deep(12000, 11000), 20: _deep(90000, 85000),
+        30: _deep(0, 1500000),
     }
     _saved_run = _LAST_RUN.get("state")
     _LAST_RUN["state"] = {
@@ -5847,11 +6297,18 @@ def self_test():
               abs(_p3["tax_per_unit"] - _exp_tax) < 1, _p3["tax_per_unit"])
         check("Revenue = Jita buy of P4",
               abs(_p3["revenue_per_unit"] - 1500000) < 1)
-        check("P4<-P3 options POCO-capped even at daily cadence",
-              abs(_p3["units_hr_per_planet"] - 35000 / 2400) < 0.01
+        # 4 Storage Facilities leave 21315-3600-2000 CPU for HTIFs at 1100 each.
+        # That ceiling (14.29/hr) sits under the daily POCO cap, so storage —
+        # not the customs office — is what binds at a 1-day buffer.
+        check("P4<-P3 sized by storage-adjusted CPU ceiling",
+              abs(_p3["units_hr_per_planet"] - 15715 / 1100) < 0.01
+              and _p3["storage_count"] == 4
               and abs(_p3["htif_count"] - _p3["units_hr_per_planet"]) < 0.02
-              and any("POCO BUFFER" in f for f in _p3["flags"]),
-              _p3["units_hr_per_planet"])
+              and not any("POCO BUFFER" in f for f in _p3["flags"]),
+              f"{_p3['units_hr_per_planet']} storage={_p3['storage_count']}")
+        check("On-planet buffer fits the storage that was built",
+              _p3["on_planet_m3"] <= _p3["on_planet_capacity_m3"] + 1e-6,
+              f"{_p3['on_planet_m3']:.0f} > {_p3['on_planet_capacity_m3']}")
         _p1 = next(o for o in _wm["options"] if o["buy_tier"] == "P1")
         check("BOM P4<-P1 expands to 160+160 P1",
               abs(_p1["input_cost_per_unit"] - (160 * 100 + 160 * 120)) < 1,
@@ -5869,7 +6326,7 @@ def self_test():
               abs(_p3_bo["net_per_unit_buy_sourced"]
                   - (1500000 - 6 * 85000 * 1.027 - _exp_tax)) < 1)
         check("Direct option: CPU-limited ceiling, planet-scale HTIF count",
-              abs(_p3_bo["units_hr_per_planet"] - 17715 / 1100) < 0.01
+              abs(_p3_bo["units_hr_per_planet"] - 15715 / 1100) < 0.01
               and abs(_p3_bo["htif_count"] - _p3_bo["units_hr_per_planet"])
               < 0.02, _p3_bo["htif_count"])
     if _s:
@@ -5924,22 +6381,77 @@ def self_test():
 
     # ── Haul cadence + POCO buffer ──
     print("\nHaul cadence & POCO buffer:")
-    _th = {"daily_import_m3": 5000.0, "daily_export_m3": 20000.0,
-           "units_hr_per_planet": 10.0, "net_isk_hr_per_planet": 1e6,
-           "net_isk_hr_buy_sourced": 2e6, "aif_count": 4.0,
-           "htif_count": 12.0, "flags": []}
-    check("POCO throttle scales to worst leg",
-          abs(_apply_poco_throttle(_th, 3, 35000) - 35000 / 60000) < 1e-9
-          and abs(_th["units_hr_per_planet"] - 10 * 35000 / 60000) < 1e-9
-          and abs(_th["net_isk_hr_buy_sourced"] - 2e6 * 35000 / 60000) < 1e-3
-          and abs(_th["htif_count"] - 7.0) < 0.01
-          and any("POCO BUFFER" in f for f in _th["flags"]))
-    _th2 = {"daily_import_m3": 5000.0, "daily_export_m3": 6000.0,
-            "units_hr_per_planet": 10.0, "net_isk_hr_per_planet": 1e6,
-            "net_isk_hr_buy_sourced": None, "aif_count": 4.0,
-            "htif_count": 12.0, "flags": []}
-    check("POCO throttle no-op when window fits",
-          _apply_poco_throttle(_th2, 3, 35000) == 1.0 and not _th2["flags"])
+    _th = _import_option(_iu_chains[30], 3, _iu_market, _iu_types, _iu_sch,
+                         17000, 21315, 0.10,
+                         cadence={"haul_days": 3, "poco_m3": 35000,
+                                  "buffer_days": 1})
+    # 3d window: export leg 100 m3/unit x 24h x 3d is the binding one
+    _th_uncapped = 15715 / 1100
+    check("POCO throttle scales to the worst window leg",
+          abs(_th["poco_scale"] - 35000 / (100 * _th_uncapped * 24 * 3)) < 1e-6
+          and abs(_th["units_hr_per_planet"]
+                  - _th_uncapped * _th["poco_scale"]) < 1e-6
+          and any("POCO BUFFER" in f for f in _th["flags"]),
+          f"scale={_th['poco_scale']}")
+    check("POCO throttle shrinks the storage the planet needs",
+          _th["storage_count"] < 4 and _th["on_planet_m3"]
+          <= _th["on_planet_capacity_m3"] + 1e-6,
+          f"storage={_th['storage_count']}")
+    _th2 = _import_option(_iu_chains[20], 2, _iu_market, _iu_types, _iu_sch,
+                          17000, 21315, 0.10,
+                          cadence={"haul_days": 1, "poco_m3": 35000,
+                                   "buffer_days": 1})
+    check("POCO throttle no-op when the window fits",
+          _th2["poco_scale"] == 1.0
+          and not any("POCO BUFFER" in f for f in _th2["flags"]))
+
+    # ── Jita book depth ──
+    print("\nJita book depth:")
+    _bk = [(100.0, 10), (90.0, 10), (50.0, 1000)]
+    check("Book walk fills top-down",
+          _walk_book(_bk, 20) == (95.0, 20.0))
+    check("Book walk reports short fill",
+          _walk_book([(100.0, 5)], 20) == (100.0, 5.0))
+    check("Book walk on empty book is zero", _walk_book([], 10) == (0.0, 0.0))
+    _dp = {"jita_buy_book": _bk, "jita_vwap": 60, "jita_avg_daily_vol": 100}
+    _f_small = _jita_fill(_dp, 10, True, 1)
+    _f_big = _jita_fill(_dp, 20, True, 1)
+    check("Small dump clears at top of book",
+          _f_small["price"] == 100.0 and _f_small["slippage"] == 0.0)
+    check("Bigger dump walks the book down and reports slippage",
+          _f_big["price"] == 95.0 and abs(_f_big["slippage"] - 0.05) < 1e-9)
+    _f_over = _jita_fill(_dp, 2040, True, 1)
+    check("Unfillable remainder prices at VWAP",
+          abs(_f_over["price"] - (100 * 10 + 90 * 10 + 50 * 1000
+                                  + 60 * 1020) / 2040) < 1e-9
+          and _f_over["filled_frac"] < 1.0)
+    check("Book share measures the haul against 30d throughput",
+          abs(_jita_fill(_dp, 300, True, 3)["book_share"] - 1.0) < 1e-9)
+    _f_buy = _jita_fill({"jita_sell_book": [(10.0, 5), (12.0, 100)],
+                         "jita_vwap": 11}, 10, False, 1)
+    check("Buying walks the sell book up (positive slippage)",
+          _f_buy["price"] == 11.0 and abs(_f_buy["slippage"] - 0.1) < 1e-9)
+    check("Empty book flagged", _depth_flags(_jita_fill({}, 5, True), "SELL")
+          == ["NO JITA BOOK (SELL)"])
+
+    # ── Storage vs factories ──
+    print("\nOn-planet storage sizing:")
+    _su, _, _, _ss = _factory_units_per_planet({"aif": 1.0}, 17000, 21315)
+    check("No buffer requested -> no storage, PG/CPU ceiling only",
+          _ss == 0 and abs(_su - min((17000 - 700) / 700,
+                                     (21315 - 3600) / 500)) < 1e-9)
+    _su2, _, _, _ss2 = _factory_units_per_planet({"aif": 1.0}, 17000, 21315,
+                                                 m3_per_unit=100,
+                                                 buffer_days=1)
+    check("Buffer forces storage and cuts throughput",
+          _ss2 > 0 and _su2 < _su
+          and _su2 * 100 * 24 <= 10000 + _ss2 * 12000 + 1e-6,
+          f"units={_su2:.2f} storage={_ss2}")
+    check("Absurd buffer is capacity-bound, not silently ignored",
+          _factory_units_per_planet({"aif": 1.0}, 17000, 21315,
+                                    m3_per_unit=10000, buffer_days=3)[0]
+          < _su2)
+
     _LAST_RUN["state"]["cfg"]["haul_every_days"] = 3
     _LAST_RUN["state"]["cfg"]["hauler_m3"] = 55000
     _bp3 = best_pi_plays(isk_per_haul_min=100000, min_tier="P2")
@@ -5957,6 +6469,64 @@ def self_test():
                 if o["strategy"] == "import")
     check("Cadence: P4 import throttled by POCO buffer",
           any("POCO BUFFER" in f for f in _im3["flags"]), _im3["flags"])
+
+    # ── Run plan (portfolio + shopping list) ──
+    print("\nRun plan:")
+    _LAST_RUN["state"]["cfg"]["max_planets"] = 5
+    _rp = pi_run_plan(isk_per_haul_min=100000)
+    check("Run plan fills every planet slot",
+          _rp["slots_used"] == 5
+          and sum(p["planet_count"] for p in _rp["planets"]) == 5)
+    check("Deep books -> all slots on the single best product",
+          len(_rp["planets"]) == 1 and _rp["planets"][0]["output_name"] == "WM",
+          [p["output_name"] for p in _rp["planets"]])
+    _rp_wm = _rp["planets"][0]
+    _in0 = _rp_wm["inputs"][0]
+    check("Shopping list = per-planet input x planet count",
+          len(_rp["shopping_list"]) == 1
+          and abs(_rp["shopping_list"][0]["units"]
+                  - _in0["units_per_planet_per_run"] * _rp_wm["planet_count"])
+          < 1e-6, _rp["shopping_list"][0]["units"])
+    check("Shopping list ISK = units x walked Jita sell price",
+          abs(_rp["shopping_list"][0]["isk"]
+              - _rp["shopping_list"][0]["units"] * _in0["jita_sell"]) < 1)
+    check("Daily drop = run quantity / haul cadence",
+          abs(_in0["units_per_planet_per_day"] * 3
+              - _in0["units_per_planet_per_run"]) < 1e-6)
+    # Hauler trips are integral, so a planet that rides along in an
+    # already-paid trip really is worth more than the one that bought it.
+    _trip_cost = _rp["jita_round_trip_min"] / 3 * 100000 / 24
+    check("Marginal value non-increasing, bar whole-trip lumpiness",
+          all(_rp["marginals"][i]["marginal_net_isk_hr"]
+              >= _rp["marginals"][i + 1]["marginal_net_isk_hr"]
+              - _trip_cost - 1e-6
+              for i in range(len(_rp["marginals"]) - 1)),
+          [round(m["marginal_net_isk_hr"]) for m in _rp["marginals"]])
+    check("Trips sized against the hauler hold",
+          _rp["trips_per_run"] == max(
+              math.ceil(_rp["import_m3_per_run"] / 55000),
+              math.ceil(_rp["export_m3_per_run"] / 55000)))
+    check("Every built planet holds its own buffer",
+          all(p["on_planet_m3"] <= p["on_planet_capacity_m3"] + 1e-6
+              for p in _rp["planets"]))
+    _shallow = dict(_iu_market)
+    _shallow[30] = {**_iu_market[30], "jita_buy_book": [(1500000, 400)],
+                    "jita_vwap": 200000}
+    _LAST_RUN["state"]["ectx"]["market_prices"] = _shallow
+    _rp2 = pi_run_plan(isk_per_haul_min=100000)
+    check("Thin buy book pushes later slots onto another product",
+          len(_rp2["planets"]) > 1,
+          [(p["output_name"], p["planet_count"]) for p in _rp2["planets"]])
+    check("Depth degradation shows up as a falling marginal",
+          _rp2["marginals"][0]["marginal_net_isk_hr"]
+          > _rp2["marginals"][-1]["marginal_net_isk_hr"],
+          [round(m["marginal_net_isk_hr"]) for m in _rp2["marginals"]])
+    _LAST_RUN["state"]["ectx"]["market_prices"] = _iu_market
+    _rp_state = _LAST_RUN["state"]
+    _LAST_RUN["state"] = None
+    check("pi_run_plan errors with no run", "error" in pi_run_plan())
+    _LAST_RUN["state"] = _rp_state
+
     _LAST_RUN["state"] = _saved_run
     check("import_upgrade_options errors with no run",
           "error" in import_upgrade_options())
