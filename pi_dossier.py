@@ -101,6 +101,13 @@ FACILITY_COSTS = {
 # left running unattended must physically hold its own input buffer.
 FACILITY_M3 = {"launchpad": 10000, "storage": 12000}
 
+# P4 needs a High-Tech Production Plant, and that facility only exists for two
+# planet types. Verified 2026-07-26 against ESI group 1028 (Processors): 18
+# types = Basic + Advanced Industry Facility for all 8 planet types, plus
+# exactly "Barren High-Tech Production Plant" and "Temperate High-Tech
+# Production Plant". Basic/Advanced are unrestricted, so P1-P3 sites anywhere.
+HTIF_PLANET_TYPES = {"Barren", "Temperate"}
+
 DEFAULT_ECU_HEADS = 10
 DEFAULT_EXTRACTION_RATE = 8000  # P0/hr per 10-head ECU (conservative)
 
@@ -5201,12 +5208,13 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
 
 
 def _factory_sites(state, limit):
-    """The cheapest scouted POCOs, cheapest first — where factories should go.
+    """Candidate POCOs for factory planets, cheapest first.
 
-    A factory planet extracts nothing, so tax is the only siting criterion.
-    Rates vary a lot (1% vs 5% is a 5x difference on a P4 export), so the
-    planner assigns real planets rather than assuming every slot gets the one
-    cheapest customs office.
+    A factory extracts nothing, so tax is the only siting criterion — but P4
+    needs a High-Tech Production Plant, which only exists on Barren and
+    Temperate planets. The pool therefore carries the cheapest `limit` planets
+    overall AND the cheapest `limit` that can host P4, because the cheapest
+    planet in the system may well be a Gas one that no P4 can use.
     """
     ctx = state.get("ctx") or {}
     cfg = state.get("cfg") or {}
@@ -5219,13 +5227,74 @@ def _factory_sites(state, limit):
                 rate = taxes.get(key)
                 if rate is not None:
                     sites.append({"key": key, "system": system, "type": ptype,
-                                  "tax_rate": rate})
+                                  "tax_rate": rate,
+                                  "htif_ok": ptype in HTIF_PLANET_TYPES})
     sites.sort(key=lambda s: s["tax_rate"])
-    if not sites:  # nothing scouted — fall back to the configured default
-        rate = cfg.get("tax_rate", 0.15)
-        sites = [{"key": None, "system": "", "type": "", "tax_rate": rate}
-                 for _ in range(max(limit, 1))]
-    return sites[:limit]
+    pool = sites[:limit] + [s for s in sites if s["htif_ok"]][:limit]
+    seen, out = set(), []
+    for s in pool:
+        if s["key"] not in seen:
+            seen.add(s["key"])
+            out.append(s)
+    # Nothing scouted (or too few) — fall back to the configured default rate.
+    # Assume such a planet can host P4 so the search is not blocked by a gap
+    # in scouting; the rate is the pessimistic part.
+    while len(out) < limit:
+        out.append({"key": None, "system": "", "type": "",
+                    "tax_rate": cfg.get("tax_rate", 0.15), "htif_ok": True})
+    return sorted(out, key=lambda s: s["tax_rate"])
+
+
+def _assign_sites(planets, sites):
+    """Cheapest total POCO tax for these planets, and the site each one gets.
+
+    planets: [(tax_isk_hr_per_unit_of_rate, needs_htif)]
+    Restricted (P4) planets can only take Barren/Temperate sites, so this is a
+    small constrained assignment, not a plain sort — the cheapest office may be
+    a planet type the build cannot use. Exact: at most a handful of splits, and
+    within each group cheap rates pair with big tax bills (rearrangement).
+
+    Returns (total_tax_isk_hr, {planet_index: site}) or None if it cannot fit.
+    """
+    capable = sorted([s for s in sites if s["htif_ok"]],
+                     key=lambda s: s["tax_rate"])
+    other = sorted([s for s in sites if not s["htif_ok"]],
+                   key=lambda s: s["tax_rate"])
+    restricted = sorted([(sens, i) for i, (sens, need) in enumerate(planets)
+                         if need], reverse=True)
+    free = sorted([(sens, i) for i, (sens, need) in enumerate(planets)
+                   if not need], reverse=True)
+    if len(restricted) > len(capable):
+        return None
+    if len(planets) > len(capable) + len(other):
+        return None
+
+    best = None
+    max_extra = min(len(free), len(capable) - len(restricted))
+    for j in range(max_extra + 1):
+        if len(free) - j > len(other):
+            continue  # not enough non-capable sites for the rest
+        cap_used = capable[:len(restricted) + j]
+        oth_used = other[:len(free) - j]
+        for combo in itertools.combinations(range(len(cap_used)),
+                                            len(restricted)):
+            taken = set(combo)
+            r_sites = sorted((cap_used[i] for i in taken),
+                             key=lambda s: s["tax_rate"])
+            u_sites = sorted([cap_used[i] for i in range(len(cap_used))
+                              if i not in taken] + list(oth_used),
+                             key=lambda s: s["tax_rate"])
+            cost = 0.0
+            picked = {}
+            for (sens, idx), site in zip(restricted, r_sites):
+                cost += sens * site["tax_rate"]
+                picked[idx] = site
+            for (sens, idx), site in zip(free, u_sites):
+                cost += sens * site["tax_rate"]
+                picked[idx] = site
+            if best is None or cost < best[0]:
+                best = (cost, picked)
+    return best
 
 
 # Candidate lines kept per ranking criterion (net, net per ISK, net per m3).
@@ -5274,11 +5343,6 @@ def pi_run_plan(isk_per_haul_min=None, max_planets=None,
                    + 2 * haul.get("sec_per_station", 180)) / 60.0
 
     sites = _factory_sites(state, slots)
-    # Pad with the configured default so a slot without a scouted planet is
-    # taxed pessimistically rather than dropping out of the zip untaxed.
-    while len(sites) < slots:
-        sites.append({"key": None, "system": "", "type": "",
-                      "tax_rate": cfg.get("tax_rate", 0.15)})
     site_rates = sorted(s["tax_rate"] for s in sites)
     ref_rate = site_rates[0] if site_rates else tax_rate
 
@@ -5329,30 +5393,33 @@ def pi_run_plan(isk_per_haul_min=None, max_planets=None,
     def _score(alloc):
         """Exact net ISK/hr after haul for an allocation [(line, count), ...].
 
-        Cheap customs offices go to whichever planets pay the most tax per
-        hour, which is optimal by the rearrangement inequality.
+        Returns None when the allocation cannot be built at all — over budget,
+        over the trip limit, or needing more P4-capable planets than exist.
         """
         spend = imp_m3 = exp_m3 = pretax = 0.0
-        sensitivities = []
+        demand = []  # (tax per unit of POCO rate, needs a Barren/Temperate)
         for line, n in alloc:
             o = line["opts"][n]
             spend += o["input_cost_per_unit"] * o["window_units"] * n
             imp_m3 += o["daily_import_m3"] * haul_days * n
             exp_m3 += o["daily_export_m3"] * haul_days * n
             pretax += o["pretax_net_per_unit"] * o["units_hr_per_planet"] * n
-            sensitivities += [o["tax_unit_per_rate"]
-                              * o["units_hr_per_planet"]] * n
+            demand += [(o["tax_unit_per_rate"] * o["units_hr_per_planet"],
+                        o["htif_count"] > 0)] * n
         if capital is not None and spend > capital:
             return None
         trips = max(_trips(imp_m3), _trips(exp_m3))
         if max_trips is not None and trips > max_trips:
             return None
-        sensitivities.sort(reverse=True)
-        tax_hr = sum(s * r for s, r in zip(sensitivities, site_rates))
+        placed = _assign_sites(demand, sites)
+        if placed is None:
+            return None  # not enough Barren/Temperate planets for the P4s
+        tax_hr, picked = placed
         haul_cost = trips * jita_rt_min / haul_days * isk_per_haul_min / 24.0
         return {"net": pretax - tax_hr - haul_cost, "spend": spend,
                 "import_m3": imp_m3, "export_m3": exp_m3, "trips": trips,
-                "tax_isk_hr": tax_hr, "haul_cost_isk_hr": haul_cost}
+                "tax_isk_hr": tax_hr, "haul_cost_isk_hr": haul_cost,
+                "placed": picked, "demand": demand}
 
     # ── Exhaustive search over allocations. Spend and cargo only ever grow as
     # planets are added, so an infeasible prefix prunes its whole subtree —
@@ -5383,17 +5450,17 @@ def pi_run_plan(isk_per_haul_min=None, max_planets=None,
     counts = {line["tid"]: n for line, n in best_alloc}
     chosen = {line["tid"]: line["opts"][n] for line, n in best_alloc}
 
-    # Assign real planets: cheapest customs office to the biggest tax bill.
-    assign = []
-    for line, n in best_alloc:
-        o = line["opts"][n]
-        for _ in range(n):
-            assign.append((o["tax_unit_per_rate"] * o["units_hr_per_planet"],
-                           line["tid"]))
-    assign.sort(key=lambda x: -x[0])
+    # Real planets, in the same order _score built its demand list, so the
+    # reported siting is exactly the one the winning score was computed from.
     sites_for = {}
-    for (_, tid), site in zip(assign, sites):
-        sites_for.setdefault(tid, []).append(site)
+    if best_score:
+        order = [line["tid"] for line, n in best_alloc for _ in range(n)]
+        for idx, tid in enumerate(order):
+            site = best_score["placed"].get(idx)
+            if site:
+                sites_for.setdefault(tid, []).append(site)
+        for tid in sites_for:
+            sites_for[tid].sort(key=lambda s: s["tax_rate"])
 
     # ── Build the per-planet + shopping output ──
     shopping = {}
@@ -6627,9 +6694,11 @@ def self_test():
         "jita_buy_price": 85000, "viable": True, "flags": [],
     }]
     # Two cheap customs offices, then pricier ones — enough spread that the
-    # planner has to assign real planets rather than assume one rate.
-    _rp_inv = {"Cheapville": {"Gas": 2}, "Pricyton": {"Barren": 4}}
-    _rp_taxes = {"Cheapville.Gas.A": 0.01, "Cheapville.Gas.B": 0.01,
+    # planner has to assign real planets rather than assume one rate. All
+    # Barren/Temperate so P4 can use any of them (the restriction gets its own
+    # test below).
+    _rp_inv = {"Cheapville": {"Temperate": 2}, "Pricyton": {"Barren": 4}}
+    _rp_taxes = {"Cheapville.Temperate.A": 0.01, "Cheapville.Temperate.B": 0.01,
                  "Pricyton.Barren.A": 0.10, "Pricyton.Barren.B": 0.10,
                  "Pricyton.Barren.C": 0.10, "Pricyton.Barren.D": 0.10}
     _LAST_RUN["state"] = {
@@ -6858,6 +6927,37 @@ def self_test():
     check("Unconstrained plan is at least as good as any constrained one",
           _rp["total_net_isk_hr"] >= _rp_cap["total_net_isk_hr"] - 1e-6
           and _rp["total_net_isk_hr"] >= _rp_trip["total_net_isk_hr"] - 1e-6)
+    # ── P4 needs a Barren/Temperate planet ──
+    print("\nHigh-Tech Production Plant siting:")
+    check("HTIF exists only for Barren and Temperate",
+          HTIF_PLANET_TYPES == {"Barren", "Temperate"})
+    _ctx_rp = _LAST_RUN["state"]["ctx"]
+    _inv_before, _tax_before = _ctx_rp["inv"], _ctx_rp["planet_taxes"]
+    # The cheapest planets are now Gas, which cannot host a High-Tech plant.
+    _ctx_rp["inv"] = {"Gasville": {"Gas": 4}, "Rockton": {"Barren": 2}}
+    _ctx_rp["planet_taxes"] = {"Gasville.Gas.A": 0.01, "Gasville.Gas.B": 0.01,
+                               "Gasville.Gas.C": 0.01, "Gasville.Gas.D": 0.01,
+                               "Rockton.Barren.A": 0.10,
+                               "Rockton.Barren.B": 0.10}
+    _rp_g = pi_run_plan(isk_per_haul_min=100000)
+    _p4s = [p for p in _rp_g["planets"] if p["tier"] == "P4"]
+    check("P4 never sited on a planet that cannot host an HTIF",
+          all(s["type"] in HTIF_PLANET_TYPES for p in _p4s for s in p["sites"]),
+          [(p["output_name"], [s["planet"] for s in p["sites"]]) for p in _p4s])
+    check("P4 planet count capped by Barren/Temperate availability",
+          sum(p["planet_count"] for p in _p4s) <= 2,
+          sum(p["planet_count"] for p in _p4s))
+    check("Non-P4 products may still use the cheap Gas planets",
+          all(s["tax_rate"] <= 0.10 for p in _rp_g["planets"]
+              for s in p["sites"]))
+    _ctx_rp["inv"] = {"Gasville": {"Gas": 6}}
+    _ctx_rp["planet_taxes"] = {f"Gasville.Gas.{c}": 0.01 for c in "ABCDEF"}
+    _rp_nog = pi_run_plan(isk_per_haul_min=100000)
+    check("No Barren/Temperate at all -> no P4 in the plan",
+          not any(p["tier"] == "P4" for p in _rp_nog["planets"]),
+          [p["output_name"] for p in _rp_nog["planets"]])
+    _ctx_rp["inv"], _ctx_rp["planet_taxes"] = _inv_before, _tax_before
+
     _rp_state = _LAST_RUN["state"]
     _LAST_RUN["state"] = None
     check("pi_run_plan errors with no run", "error" in pi_run_plan())

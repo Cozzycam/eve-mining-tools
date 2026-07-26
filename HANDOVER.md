@@ -1,5 +1,39 @@
 # EVE Mining Tools — Handover Notes
 
+## PI Dossier — 2026-07-27 — P4 can only be built on Barren/Temperate
+
+Reported by the player: the Run Plan sited Sterile Conduits (P4) on
+Ouelletta.Gas.A, which cannot be built. Confirmed against ESI group 1028
+(Processors): 18 types = Basic + Advanced Industry Facility for all 8 planet
+types, plus exactly **Barren High-Tech Production Plant** and **Temperate
+High-Tech Production Plant**. P4 needs an HTIF, so P4 is Barren/Temperate only.
+P1–P3 use Basic/Advanced facilities and remain unrestricted.
+
+- New `HTIF_PLANET_TYPES = {"Barren", "Temperate"}`; sites carry `htif_ok`.
+- `_factory_sites` now returns the cheapest `limit` planets **and** the
+  cheapest `limit` P4-capable ones. The pool has to hold both, because the
+  cheapest planet in a system is often a Gas one no P4 can use.
+- Site allocation moved from a plain rearrangement sort to `_assign_sites`, a
+  small exact constrained assignment: P4 planets draw only from capable sites,
+  everything else from what is left, and within each group cheap customs
+  offices pair with the biggest tax bills. Plain "cheapest rate to biggest tax
+  bill" is *not* optimal once eligibility differs — worked counter-examples
+  drove this. It enumerates how many unrestricted planets sit on capable sites
+  and which capable sites the P4s take; at most a few dozen evaluations.
+- `_score` returns None when an allocation needs more Barren/Temperate planets
+  than exist, so those allocations are pruned rather than silently mis-sited.
+- The winning plan's reported siting is now read straight out of the score that
+  won, so the sheet and the number can never disagree.
+
+Impact on the live account: only **one** 1% POCO is P4-capable
+(Ouelletta.Temperate.B). Ouelletta.Gas.A is also 1% but Gas, and the next
+P4-capable planets are 5% (Agoze.Barren.*). A second P4 planet therefore pays
+5x the export tax the old plan assumed.
+
+Self-test +5 checks (restriction constant, never sited on an incapable planet,
+P4 count capped by availability, non-P4 still uses cheap Gas, no
+Barren/Temperate at all -> no P4 in the plan).
+
 ## PI Dossier — 2026-07-26 — Two wrong SDE constants, ceilings, real planets
 
 Audit pass. Two of the numbers everything else is built on were wrong, both
