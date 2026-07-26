@@ -3468,6 +3468,8 @@ async function doPi() {
       renderPi(data);
       const ts = new Date();
       piStatus('Generated at ' + ts.getHours().toString().padStart(2,'0') + ':' + ts.getMinutes().toString().padStart(2,'0'));
+      // The plan is the point of the page — show it without a second click.
+      loadPiRunPlan();
     }
   } catch(e) {
     piStatus('Request failed: ' + e.message, true);
@@ -3501,6 +3503,27 @@ function renderPi(data) {
     h += '<div style="color:var(--dim);font-size:0.85em;margin:2px 0 6px 0;">' + calStr + '</div>';
   }
 
+  // ── The planner. This is the answer; everything below it is the working.
+  const cf = data.config || {};
+  h += '<div class="fitter-section" style="border-color:var(--green);">';
+  h += '<h2>Planner &mdash; what to build, buy, drop and bring back</h2>';
+  h += '<div style="color:var(--dim);font-size:0.85em;margin-bottom:10px;">Set the four things that actually constrain you and hit Plan. Everything else on this page is supporting detail.</div>';
+  h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:10px;">';
+  h += '<label style="font-size:0.85em;">Capital to invest<br><input type="number" id="pi-run-capital" min="0" step="50" style="width:100%;" placeholder="any"> <span class="dim">M ISK</span></label>';
+  h += '<label style="font-size:0.85em;">Hauler hold<br><input type="number" id="pi-run-hold" min="100" step="500" style="width:100%;" value="' + Math.round(cf.hauler_m3 || 9000) + '"> <span class="dim">m&sup3;</span></label>';
+  h += '<label style="font-size:0.85em;">Haul to Jita every<br><input type="number" id="pi-run-days" min="1" max="14" step="1" style="width:100%;" value="' + (cf.haul_every_days || 1) + '"> <span class="dim">days</span></label>';
+  h += '<label style="font-size:0.85em;">Max trips per run<br><input type="number" id="pi-run-trips" min="1" max="10" step="1" style="width:100%;" placeholder="any"></label>';
+  h += '<label style="font-size:0.85em;">Planet slots<br><input type="number" id="pi-run-planets" min="1" max="6" step="1" style="width:100%;" placeholder="' + (cf.max_planets || 5) + '"></label>';
+  h += '<label style="font-size:0.85em;">Your time is worth<br><input type="number" id="pi-run-haulcost" min="0" step="10000" value="100000" style="width:100%;"> <span class="dim">ISK/haul-min</span></label>';
+  h += '</div>';
+  h += '<button id="pi-run-btn" onclick="loadPiRunPlan()" style="font-size:1.02em;padding:5px 14px;">Plan my run</button>';
+  h += '<span class="dim" id="pi-run-msg" style="font-size:0.85em;margin-left:8px;"></span>';
+  h += '<div id="pi-run-result" style="margin-top:10px;"></div>';
+  h += '</div>';
+
+  // ── Everything below is the working behind the plan. Collapsed by default.
+  h += '<details style="margin:14px 0;"><summary style="cursor:pointer;font-size:0.95em;color:var(--dim);">Extraction analysis &mdash; map, routes and per-planet build sheets (mine it yourself)</summary><div style="margin-top:10px;">';
+
   // System map SVG — per-layout route layers, switchable
   if (data.system_map_svg) {
     h += '<div id="pi-map" style="margin:12px 0;text-align:center;">' + data.system_map_svg;
@@ -3522,7 +3545,7 @@ function renderPi(data) {
     const labels = ['Best', 'Second-best', 'Third-best'];
     layouts.forEach((layout, li) => {
       const label = labels[li] || '#' + (li+1);
-      h += '<div class="fitter-section"><h2 style="cursor:pointer;" title="Show this route on the map" onclick="showPiRoute(' + li + ')">' + label + ' Layout</h2>';
+      h += '<div class="fitter-section" id="pi-layout-sec-' + li + '"><h2 style="cursor:pointer;" title="Show this route on the map" onclick="showPiRoute(' + li + ')">' + label + ' Layout</h2>';
       const rt = layout.route || {};
       h += '<p id="pi-summary-' + li + '">' + piSummaryInner(layout) + '</p>';
       if (rt.systems_ordered && rt.systems_ordered.length) {
@@ -3558,6 +3581,10 @@ function renderPi(data) {
     });
   }
 
+  h += '</div></details>';  // end extraction analysis
+
+  h += '<details style="margin:14px 0;"><summary style="cursor:pointer;font-size:0.95em;color:var(--dim);">Compare &amp; explore &mdash; target a product, extract vs import, import options</summary><div style="margin-top:10px;">';
+
   // Target-a-product what-if: pick any product + your sell price, see its
   // full setup and ISK/hr at that price vs the best.
   if ((data.chains||[]).length) {
@@ -3587,20 +3614,6 @@ function renderPi(data) {
     h += '</div>';
   }
 
-  // Run plan: the actual build + shopping + stocking sheet for one haul run.
-  h += '<div class="fitter-section"><h2>Run Plan &mdash; Build, Buy, Drop, Return</h2>';
-  h += '<div style="color:var(--dim);font-size:0.85em;margin-bottom:8px;">Fills your planet slots one at a time. Each slot is re-priced by <strong>walking the live Jita order books</strong> for the quantity that many planets would actually move, so a thin product stops winning slots and the runner-up takes over &mdash; that is what makes the answer a mix. Factory counts are what fits <em>after</em> reserving the launchpad and the Storage Facilities the buffer needs. Everything is quoted per haul run.</div>';
-  h += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">';
-  h += '<label style="font-size:0.88em;">Working capital <input type="number" id="pi-run-capital" min="0" step="100" style="width:90px;" placeholder="any"> M ISK</label>';
-  h += '<label style="font-size:0.88em;">Max hauler trips <input type="number" id="pi-run-trips" min="1" max="10" step="1" style="width:60px;" placeholder="any"></label>';
-  h += '<label style="font-size:0.88em;">Haul cost <input type="number" id="pi-run-haulcost" min="0" step="10000" value="100000" style="width:110px;"> ISK/min</label>';
-  h += '<label style="font-size:0.88em;">Planet slots <input type="number" id="pi-run-planets" min="1" max="6" step="1" style="width:60px;" placeholder="cfg"></label>';
-  h += '<button id="pi-run-btn" onclick="loadPiRunPlan()">Build Run Plan</button>';
-  h += '<span class="dim" id="pi-run-msg" style="font-size:0.85em;"></span>';
-  h += '</div>';
-  h += '<div id="pi-run-result"></div>';
-  h += '</div>';
-
   // Best PI play: head-to-head of extract-yourself vs import-and-upgrade, both
   // sold at Jita buy with hauling priced into net. Answers "what's best?".
   h += '<div class="fitter-section"><h2>Best PI Play &mdash; Extract vs Import</h2>';
@@ -3625,6 +3638,10 @@ function renderPi(data) {
   h += '</div>';
   h += '<div id="pi-import-result"></div>';
   h += '</div>';
+
+  h += '</div></details>';  // end compare & explore
+
+  h += '<details style="margin:14px 0;"><summary style="cursor:pointer;font-size:0.95em;color:var(--dim);">Every chain by tier, and skill projections</summary><div style="margin-top:10px;">';
 
   // All chains by tier
   ['P1','P2','P3','P4'].forEach(tier => {
@@ -3651,6 +3668,8 @@ function renderPi(data) {
     h += '</ul></div>';
   }
 
+  h += '</div></details>';  // end chains by tier
+
   // Copy markdown button
   h += '<button id="copy-pi-md-btn" onclick="copyPiMarkdown()" style="margin-top:12px;">Copy Markdown to Clipboard</button>';
 
@@ -3660,7 +3679,7 @@ function renderPi(data) {
   // Interactive SVG highlighting: clicking a layout section highlights its systems
   if (data.system_map_svg && layouts.length) {
     layouts.forEach((layout, li) => {
-      const section = el.querySelectorAll('.fitter-section')[li];
+      const section = el.querySelector('#pi-layout-sec-' + li);
       if (!section) return;
       const sysList = new Set();
       (layout.allocated||[]).forEach(a => {
@@ -3748,6 +3767,8 @@ async function loadPiRunPlan() {
   const slots = document.getElementById('pi-run-planets').value;
   const capitalM = document.getElementById('pi-run-capital').value;
   const trips = document.getElementById('pi-run-trips').value;
+  const hold = document.getElementById('pi-run-hold').value;
+  const days = document.getElementById('pi-run-days').value;
   btn.disabled = true; msg.textContent = 'Walking Jita books…'; out.innerHTML = '';
   try {
     const p = new URLSearchParams();
@@ -3755,6 +3776,8 @@ async function loadPiRunPlan() {
     if (slots !== '' && !isNaN(parseInt(slots))) p.set('max_planets', parseInt(slots));
     if (capitalM !== '' && !isNaN(parseFloat(capitalM))) p.set('capital', parseFloat(capitalM) * 1e6);
     if (trips !== '' && !isNaN(parseInt(trips))) p.set('max_trips', parseInt(trips));
+    if (hold !== '' && !isNaN(parseFloat(hold))) p.set('hauler_m3', parseFloat(hold));
+    if (days !== '' && !isNaN(parseFloat(days))) p.set('haul_every_days', parseFloat(days));
     const url = '/api/pi/run-plan?' + p.toString();
     const resp = await fetch(url);
     const d = await resp.json();
@@ -4435,7 +4458,9 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
                 isk_per_haul_min=_num("isk_per_haul_min"),
                 max_planets=int(planets) if planets else None,
                 capital=_num("capital"),
-                max_trips=int(trips) if trips else None)
+                max_trips=int(trips) if trips else None,
+                hauler_m3=_num("hauler_m3"),
+                haul_every_days=_num("haul_every_days"))
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
             return

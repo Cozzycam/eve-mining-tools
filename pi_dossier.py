@@ -5303,7 +5303,8 @@ RUN_PLAN_MAX_LINES = 8
 
 
 def pi_run_plan(isk_per_haul_min=None, max_planets=None,
-                capital=None, max_trips=None):
+                capital=None, max_trips=None, hauler_m3=None,
+                haul_every_days=None):
     """The do-this-tonight sheet: what to build, buy, drop, and bring back.
 
     Fills your planet slots greedily, one at a time. Each candidate is re-priced
@@ -5332,8 +5333,14 @@ def pi_run_plan(isk_per_haul_min=None, max_planets=None,
     sales_tax = cfg.get("sales_tax", 0.0)
     broker_fee = cfg.get("broker_fee")
     cad = _cadence_from_cfg(cfg)
+    if haul_every_days:
+        # Cadence is the single biggest lever (the customs office buffer is per
+        # window), so it is an argument, not just an ini setting.
+        cad["haul_days"] = float(haul_every_days)
+        cad["buffer_days"] = min(cfg.get("on_planet_buffer_days", 1.0),
+                                 cad["haul_days"])
     haul_days = cad["haul_days"]
-    hauler_m3 = cfg.get("hauler_m3", 9000) or 9000
+    hauler_m3 = hauler_m3 or cfg.get("hauler_m3", 9000) or 9000
     slots = int(max_planets or cfg.get("max_planets", 5))
     jita_jumps = ectx.get("jita_jumps", 15)
     haul = cfg.get("haul", {"sec_per_jump": 45, "sec_per_station": 180})
@@ -5835,6 +5842,9 @@ def generate_pi_dossier_data(overrides=None):
             "cpu_budget": cfg["cpu_budget"],
             "max_planets": cfg["max_planets"],
             "sell_at_jita": cfg.get("sell_at_jita", False),
+            "haul_every_days": cfg.get("haul_every_days", 1),
+            "on_planet_buffer_days": cfg.get("on_planet_buffer_days", 1),
+            "poco_buffer_m3": cfg.get("poco_buffer_m3", 35000),
         },
         "planet_inventory": planet_inv,
         "extraction_rates": extraction_rates,

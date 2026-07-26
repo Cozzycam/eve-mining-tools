@@ -1,5 +1,36 @@
 # EVE Mining Tools — Handover Notes
 
+## PI Dossier — 2026-07-27 — PI tab reorganised around a planner
+
+The tab had grown into a wall of panels with the answer buried in the middle:
+`renderPi` emitted the system map, three extraction layouts and all their build
+sheets *before* the Run Plan — i.e. the losing strategy first, at length. Haul
+cadence, the single biggest lever, was not in the UI at all; it could only be
+changed by editing `pi_config.ini`.
+
+- **Planner section moved to the top**, directly under the character line, in a
+  green-bordered block. It carries the six inputs that actually constrain the
+  answer as one labelled grid: capital to invest (M ISK), hauler hold (m³),
+  haul-to-Jita cadence (days), max trips per run, planet slots, and ISK per
+  haul-minute. Hold and cadence prefill from the dossier config.
+- **`pi_run_plan` gained `hauler_m3=` and `haul_every_days=`** so both are per-
+  request rather than ini-only, threaded through `/api/pi/run-plan`.
+  `generate_pi_dossier_data` now returns `haul_every_days`,
+  `on_planet_buffer_days` and `poco_buffer_m3` in `config` for the prefill.
+- **Everything else collapsed into three `<details>` groups**: "Extraction
+  analysis" (map, routes, build sheets), "Compare & explore" (target a product,
+  extract vs import, import options), "Every chain by tier". Available, not
+  shouting.
+- Generate now calls `loadPiRunPlan()` on completion, so the plan appears
+  without a second click.
+- Layout sections got stable `id="pi-layout-sec-N"` anchors; the SVG
+  highlighting hook used `querySelectorAll('.fitter-section')[li]`, which
+  positional lookup the reorder would have silently broken.
+
+Checked with a node harness (`render_pi_check.js` pattern): `<details>` opens
+and closes balance, planner renders before all collapsed groups, every input id
+is present, and hold/cadence prefill from config.
+
 ## PI Dossier — 2026-07-27 — P4 can only be built on Barren/Temperate
 
 Reported by the player: the Run Plan sited Sterile Conduits (P4) on
