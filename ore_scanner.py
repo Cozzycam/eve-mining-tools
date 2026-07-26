@@ -3591,6 +3591,8 @@ function renderPi(data) {
   h += '<div class="fitter-section"><h2>Run Plan &mdash; Build, Buy, Drop, Return</h2>';
   h += '<div style="color:var(--dim);font-size:0.85em;margin-bottom:8px;">Fills your planet slots one at a time. Each slot is re-priced by <strong>walking the live Jita order books</strong> for the quantity that many planets would actually move, so a thin product stops winning slots and the runner-up takes over &mdash; that is what makes the answer a mix. Factory counts are what fits <em>after</em> reserving the launchpad and the Storage Facilities the buffer needs. Everything is quoted per haul run.</div>';
   h += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">';
+  h += '<label style="font-size:0.88em;">Working capital <input type="number" id="pi-run-capital" min="0" step="100" style="width:90px;" placeholder="any"> M ISK</label>';
+  h += '<label style="font-size:0.88em;">Max hauler trips <input type="number" id="pi-run-trips" min="1" max="10" step="1" style="width:60px;" placeholder="any"></label>';
   h += '<label style="font-size:0.88em;">Haul cost <input type="number" id="pi-run-haulcost" min="0" step="10000" value="100000" style="width:110px;"> ISK/min</label>';
   h += '<label style="font-size:0.88em;">Planet slots <input type="number" id="pi-run-planets" min="1" max="6" step="1" style="width:60px;" placeholder="cfg"></label>';
   h += '<button id="pi-run-btn" onclick="loadPiRunPlan()">Build Run Plan</button>';
@@ -3615,7 +3617,7 @@ function renderPi(data) {
   // Import & upgrade: buy lower-tier PI at Jita, haul to a factory planet,
   // process up to P3/P4, dump at Jita. Ranks which product + buy-in tier pays.
   h += '<div class="fitter-section"><h2>Import &amp; Upgrade at Jita</h2>';
-  h += '<div style="color:var(--dim);font-size:0.85em;margin-bottom:8px;">Skip extraction: <strong>buy</strong> lower-tier commodities at Jita sell price, haul them to a pure-refinery factory planet, process up to the target, and <strong>dump</strong> the finished product at Jita buy price. Ranked by net ISK/hr <em>per factory planet</em> (theoretical PG/CPU ceiling &mdash; watch the daily haul m&sup3;). Tax uses your default POCO rate, single-factory assumption.</div>';
+  h += '<div style="color:var(--dim);font-size:0.85em;margin-bottom:8px;">Skip extraction: <strong>buy</strong> lower-tier commodities at Jita sell price, haul them to a pure-refinery factory planet, process up to the target, and <strong>dump</strong> the finished product at Jita buy price. Ranked by net ISK/hr <em>per factory planet</em>, sized after reserving the launchpad and buffer storage. Tax uses your <em>cheapest scouted</em> POCO &mdash; fair for one planet, since a refinery can be sited anywhere; the Run Plan above assigns real planets when you want more than one.</div>';
   h += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">';
   h += '<label style="font-size:0.88em;">Targets <select id="pi-import-tier" style="padding:3px;"><option value="P4">P4 only</option><option value="P3" selected>P3 &amp; P4</option></select></label>';
   h += '<button id="pi-import-btn" onclick="loadPiImportOptions()">Compare Import Options</button>';
@@ -3744,11 +3746,16 @@ async function loadPiRunPlan() {
   const out = document.getElementById('pi-run-result');
   const haulCost = document.getElementById('pi-run-haulcost').value;
   const slots = document.getElementById('pi-run-planets').value;
+  const capitalM = document.getElementById('pi-run-capital').value;
+  const trips = document.getElementById('pi-run-trips').value;
   btn.disabled = true; msg.textContent = 'Walking Jita books…'; out.innerHTML = '';
   try {
-    let url = '/api/pi/run-plan?';
-    if (haulCost !== '' && !isNaN(parseFloat(haulCost))) url += 'isk_per_haul_min=' + parseFloat(haulCost) + '&';
-    if (slots !== '' && !isNaN(parseInt(slots))) url += 'max_planets=' + parseInt(slots);
+    const p = new URLSearchParams();
+    if (haulCost !== '' && !isNaN(parseFloat(haulCost))) p.set('isk_per_haul_min', parseFloat(haulCost));
+    if (slots !== '' && !isNaN(parseInt(slots))) p.set('max_planets', parseInt(slots));
+    if (capitalM !== '' && !isNaN(parseFloat(capitalM))) p.set('capital', parseFloat(capitalM) * 1e6);
+    if (trips !== '' && !isNaN(parseInt(trips))) p.set('max_trips', parseInt(trips));
+    const url = '/api/pi/run-plan?' + p.toString();
     const resp = await fetch(url);
     const d = await resp.json();
     if (d.error) { msg.textContent=''; out.innerHTML = '<span style="color:#c44">' + d.error + '</span>'; return; }
@@ -3767,8 +3774,10 @@ function renderPiRunPlan(d) {
   let h = '<div style="color:var(--dim);font-size:0.8em;margin-bottom:8px;">';
   h += 'Haul ' + runLbl + ' · hauler ' + (d.hauler_m3||0).toLocaleString() + ' m³ · Jita ' + (d.jita_jumps||0) + 'j (' + (d.jita_round_trip_min||0).toFixed(0) + ' min round trip)';
   h += ' · on-planet buffer ' + (+d.on_planet_buffer_days).toFixed(0) + 'd · POCO ' + (d.poco_buffer_m3||0).toLocaleString() + ' m³';
-  h += ' · POCO tax ' + ((d.tax_rate||0)*100).toFixed(1) + '%' + (d.factory_tax_planet ? ' @ ' + d.factory_tax_planet : '');
-  h += ' · sales tax ' + ((d.sales_tax||0)*100).toFixed(2) + '%</div>';
+  h += ' · sales tax ' + ((d.sales_tax||0)*100).toFixed(2) + '%';
+  if (d.capital) h += ' · budget ' + fmtIsk(d.capital);
+  if (d.max_trips) h += ' · max ' + d.max_trips + ' trip' + (d.max_trips>1?'s':'');
+  h += '</div>';
 
   // Headline
   h += '<div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:10px;padding:8px;background:rgba(255,255,255,0.03);border-radius:4px;">';
@@ -3806,8 +3815,12 @@ function renderPiRunPlan(d) {
     if (f.storage) facs.push(f.storage + ' &times; Storage Facility');
     h += '<div style="margin:10px 0;padding:8px;border-left:3px solid var(--green);background:rgba(255,255,255,0.02)">';
     h += '<div style="font-size:1.02em;margin-bottom:3px;"><strong>' + p.planet_count + ' &times; ' + p.output_name + '</strong> <span class="dim">(' + p.tier + ', buy in at ' + p.buy_tier + ')</span> &mdash; ' + fmtIsk(p.net_isk_hr_per_planet) + '/hr per planet</div>';
+    if ((p.sites||[]).length) {
+      h += '<div style="font-size:0.86em;margin-bottom:4px;">On: ' + p.sites.map(s => (s.planet || 'unscouted') + ' <span class="dim">(' + (s.tax_rate*100).toFixed(1) + '% POCO)</span>').join(', ') + '</div>';
+    }
     h += '<div style="font-size:0.88em;margin-bottom:4px;">Each planet: ' + facs.join(' &middot; ') + '</div>';
-    h += '<div class="dim" style="font-size:0.82em;margin-bottom:5px;">Produces ' + p.units_hr_per_planet.toFixed(2) + '/hr = ' + Math.floor(p.units_per_planet_per_run).toLocaleString() + ' ' + runLbl + ' · on-planet stock ' + fmtM3(p.on_planet_m3) + ' of ' + fmtM3(p.on_planet_capacity_m3) + ' capacity';
+    h += '<div class="dim" style="font-size:0.82em;margin-bottom:5px;">Produces ' + p.units_hr_per_planet.toFixed(2) + '/hr = ' + Math.floor(p.units_per_planet_per_run).toLocaleString() + ' ' + runLbl + ' · uses ' + Math.round(p.pg_used).toLocaleString() + '/' + Math.round(p.pg_budget).toLocaleString() + ' PG, ' + Math.round(p.cpu_used).toLocaleString() + '/' + Math.round(p.cpu_budget).toLocaleString() + ' CPU · on-planet stock ' + fmtM3(p.on_planet_m3) + ' of ' + fmtM3(p.on_planet_capacity_m3) + ' capacity';
+    if (p.duty_cycle && p.duty_cycle < 0.995) h += ' · factories idle ' + ((1-p.duty_cycle)*100).toFixed(0) + '% of the time';
     if (p.poco_scale < 0.999) h += ' · <span style="color:var(--yellow)">throttled to ' + (p.poco_scale*100).toFixed(0) + '% by the POCO</span>';
     h += '</div>';
     h += '<table style="font-size:0.85em;"><thead><tr><th>Import onto each planet</th><th class="num">' + runLbl + '</th><th class="num">per day</th><th class="num">Volume</th></tr></thead><tbody>';
@@ -3839,10 +3852,7 @@ function renderPiRunPlan(d) {
   h += '<tr style="font-weight:bold;border-top:1px solid var(--dim)"><td>Net ' + runLbl + '</td><td></td><td class="num">' + fmtM3(d.export_m3_per_run) + '</td><td></td><td class="num" style="color:var(--green)">' + fmtIsk(d.net_per_run) + '</td></tr>';
   h += '</tbody></table></div>';
 
-  // Slot-by-slot marginals
-  if ((d.marginals||[]).length) {
-    h += '<div class="dim" style="font-size:0.82em;margin-top:10px;">Slot order: ' + d.marginals.map(m => m.slot + '. ' + m.output_name + ' (' + fmtIsk(m.marginal_net_isk_hr) + '/hr)').join(' · ') + '</div>';
-  }
+  h += '<div class="dim" style="font-size:0.82em;margin-top:10px;">Haul cost of ' + d.trips_per_run + ' trip' + (d.trips_per_run===1?'':'s') + ': ' + fmtIsk(d.haul_cost_isk_hr) + '/hr (already subtracted). Facility counts exclude the power drawn by planetary <em>links</em>, which depends on where the facilities land on the surface &mdash; budget for one fewer factory if a build comes up short in game.</div>';
   if (d.extraction_alternative) {
     const e = d.extraction_alternative;
     h += '<div class="dim" style="font-size:0.82em;margin-top:4px;">Best extraction alternative: <strong>' + e.output_name + '</strong> on ' + e.planets + ' planets = ' + fmtIsk(e.net_after_haul_per_planet) + '/hr per planet after haul.</div>';
@@ -4419,10 +4429,13 @@ class ScanHandler(http.server.BaseHTTPRequestHandler):
                 return None
 
         planets = _num("max_planets")
+        trips = _num("max_trips")
         try:
             result = pi_dossier.pi_run_plan(
                 isk_per_haul_min=_num("isk_per_haul_min"),
-                max_planets=int(planets) if planets else None)
+                max_planets=int(planets) if planets else None,
+                capital=_num("capital"),
+                max_trips=int(trips) if trips else None)
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
             return

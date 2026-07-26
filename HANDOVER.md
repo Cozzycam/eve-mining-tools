@@ -1,5 +1,68 @@
 # EVE Mining Tools — Handover Notes
 
+## PI Dossier — 2026-07-26 — Two wrong SDE constants, ceilings, real planets
+
+Audit pass. Two of the numbers everything else is built on were wrong, both
+verified against live ESI dogma rather than memory.
+
+**1. `CCU_BUDGETS` was shifted one level down.** Every type in ESI group 1027
+carries attr 277 (required Command Center Upgrades level) with attr 11 / 48 as
+its PG / CPU output. The real ladder is 0:(6000,1675) 1:(9000,7057)
+2:(12000,12136) 3:(15000,17215) 4:(17000,21315) 5:(19000,25415) — the table
+mapped skill N to level N-1 and had no entry for level 5 at all. At CCU 4 the
+tool was using 15,000/17,215 against a real 17,000/21,315, so **every factory
+count in every dossier to date was understated** (~13% PG, ~24% CPU).
+
+**2. `FACILITY_COSTS["ecu_base"]` was 400 PG / 200 CPU; the SDE says 2,600 /
+400** (attr 15 powerLoad / attr 49 cpuLoad on group 1030). Per-head 550/110
+was already right (attrs 1691/1690). A 10-head ECU is 8,100 PG, not 5,900.
+Storage (700/500, 12,000 m³), launchpad (700/3,600, 10,000 m³), BIF (800/200),
+AIF (700/500) and HTIF (400/1,100) all checked out unchanged.
+
+Consequence: two 10-head ECUs are 16,200 PG on their own, so a self-contained
+P2 planet genuinely cannot be built at full heads. Rather than declare the
+layout impossible, `compute_p1_layout` and `compute_p2_selfcontained_layout`
+now **search the head count** (rate is calibrated at 10 heads and scales
+linearly), which is what a player actually does on a tight planet. The chosen
+count is reported as `ecu_heads`. Both are `lru_cache`d — the allocator calls
+them ~117k times per run and the search made them hot.
+
+**3. Run-plan ceilings.** `pi_run_plan(capital=, max_trips=)`, exposed in the
+API and UI. Greedy was replaced with an exhaustive search over candidate
+lines, because under a binding budget greedy is provably bad (it takes one
+880M planet at 1.4M/hr over five 100M planets at 0.5M/hr each).
+
+Two bugs found and fixed while building it, both caught by a monotonicity
+check rather than by inspection:
+- The candidate-line cut ran *after* the ceiling filters, so the candidate set
+  changed as the ceiling moved and a **tighter budget could return a better
+  plan than a loose one**. Ceilings now live only in `_score`, where they can
+  only shrink the feasible region. Lines are ranked by net, net-per-ISK and
+  net-per-m³ (whichever ceiling binds), and the union is searched.
+- Haul was charged per product, so three products each needing 0.4 of a trip
+  were billed three trips. Trips are now computed on the portfolio.
+
+**4. Real planets, real tax rates.** `_factory_tax_rate` returned the single
+cheapest POCO and every planet was priced at it. The actual spread is 1% on
+two planets and 5% on the rest — a 5× difference, and on a P4 export that is
+~54k ISK/unit. `_factory_sites` now hands out the N cheapest scouted planets
+by name, and since POCO tax is linear in the rate, `_import_option` returns
+`tax_unit_per_rate` so each planet re-prices at its own customs office for
+free. Cheap offices go to the biggest tax bills (rearrangement inequality).
+
+**5. Whole facilities.** Counts were fractional ("9.72 HTIF"). `_snap_facilities`
+rounds up so nothing starves, falls back to rounding down when that no longer
+fits the command centre, and reports the throughput the integer build actually
+supports plus a duty cycle. Rounding down moves less cargo, which can free a
+Storage Facility, so storage is re-derived afterwards.
+
+Not modelled: the PG drawn by planetary **links**, which depends on facility
+placement on the surface and is in no API. Flagged in the UI rather than
+faked with a made-up reserve.
+
+Self-test +26 checks including the ceiling-monotonicity invariants and
+"headline equals the parts". All pass.
+
 ## PI Dossier — 2026-07-26 — Order-book depth, on-planet storage, Run Plan
 
 Three gaps stopped the dossier answering "will this setup actually work and

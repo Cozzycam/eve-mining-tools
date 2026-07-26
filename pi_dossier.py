@@ -14,6 +14,7 @@ import configparser
 import concurrent.futures
 import copy
 import datetime
+import functools
 import itertools
 import math
 import os
@@ -82,9 +83,11 @@ PI_TAX_BASE = {
     "P4": 1350000,
 }
 
-# PI facility power/CPU costs (from SDE, extremely stable)
+# PI facility power/CPU costs. Verified 2026-07-26 against ESI dogma
+# (category 41 Planetary Industry): attr 15 powerLoad, attr 49 cpuLoad,
+# attr 1691 ecuExtractorHeadPower, attr 1690 ecuExtractorHeadCPU.
 FACILITY_COSTS = {
-    "ecu_base":     {"pg": 400,  "cpu": 200},
+    "ecu_base":     {"pg": 2600, "cpu": 400},
     "ecu_per_head": {"pg": 550,  "cpu": 110},
     "bif":          {"pg": 800,  "cpu": 200},
     "aif":          {"pg": 700,  "cpu": 500},
@@ -121,14 +124,17 @@ DENSITY_YIELD_PER_HEAD = {
     (35, 101): 2200,   # exceptional
 }
 
-# CCU level → (powergrid, cpu) budgets (from EVE SDE)
+# Command Center Upgrades level → (powergrid, cpu) budget.
+# Verified 2026-07-26 against ESI: every type in group 1027 carries attr 277
+# (required CCU level) with attr 11 / attr 48 as its PG / CPU output. The
+# table used to be shifted one level down, understating every budget.
 CCU_BUDGETS = {
     0: (6000, 1675),
-    1: (6000, 1675),
-    2: (9000, 7057),
-    3: (12000, 12136),
-    4: (15000, 17215),
-    5: (17000, 21315),
+    1: (9000, 7057),
+    2: (12000, 12136),
+    3: (15000, 17215),
+    4: (17000, 21315),
+    5: (19000, 25415),
 }
 
 
@@ -1128,14 +1134,15 @@ def _ecu_pg_cpu(heads=DEFAULT_ECU_HEADS):
     return pg, cpu
 
 
-def _planet_budget_remaining(pg_budget, cpu_budget, facilities):
+def _planet_budget_remaining(pg_budget, cpu_budget, facilities,
+                             heads=DEFAULT_ECU_HEADS):
     """Calculate remaining PG/CPU after placing facilities."""
     pg_used = 0
     cpu_used = 0
     c = FACILITY_COSTS
     for f, count in facilities.items():
         if f == "ecu":
-            epg, ecpu = _ecu_pg_cpu()
+            epg, ecpu = _ecu_pg_cpu(heads)
             pg_used += epg * count
             cpu_used += ecpu * count
         elif f in c:
@@ -1159,36 +1166,67 @@ def _bif_p1_output(p0_per_hr, num_bifs):
     return num_bifs * bif_full_output * utilization
 
 
+def _copy_layout(layout):
+    """Detached copy of a cached layout — callers mutate these in place."""
+    if layout is None:
+        return None
+    out = dict(layout)
+    out["facilities"] = dict(layout["facilities"])
+    for k in ("p0_consumed_hr", "bif_split"):
+        if isinstance(out.get(k), list):
+            out[k] = list(out[k])
+    return out
+
+
 def compute_p1_layout(chain, extraction_rate, pg_budget, cpu_budget):
     """Compute layout for a P1 extraction planet.
 
+    Head count is searched, not assumed: an ECU costs 2,600 PG plus 550 per
+    head, so on a tight planet a real player drops heads to free power for
+    BIFs. Extraction rate is calibrated at DEFAULT_ECU_HEADS and scaled
+    linearly with the head count actually placed.
+
     Returns: {facilities, units_hr, volume_hr, pg_used, cpu_used} or None
     """
-    p0_per_hr = extraction_rate
+    return _copy_layout(_p1_layout_cached(
+        chain["volume"], extraction_rate, pg_budget, cpu_budget))
+
+
+# The allocator re-evaluates the same (rate, budget) pairs tens of thousands of
+# times; the head-count search made that hot loop far too slow uncached.
+@functools.lru_cache(maxsize=200000)
+def _p1_layout_cached(volume, extraction_rate, pg_budget, cpu_budget):
     bif_input_rate = 6000
+    best = None
 
-    # How many full BIFs can the extraction rate support?
-    # Always place at least 1 BIF (it runs at partial capacity if underfed)
-    max_bifs = max(1, int(p0_per_hr / bif_input_rate))
-
-    for num_bifs in range(max_bifs, 0, -1):
-        facilities = {"ecu": 1, "bif": num_bifs, "launchpad": 1}
-        pg_rem, cpu_rem = _planet_budget_remaining(pg_budget, cpu_budget, facilities)
-        if pg_rem >= 0 and cpu_rem >= 0:
+    for heads in range(DEFAULT_ECU_HEADS, 0, -1):
+        p0_per_hr = extraction_rate * heads / DEFAULT_ECU_HEADS
+        # How many full BIFs can this extraction rate support?
+        # Always place at least 1 BIF (it runs at partial capacity if underfed)
+        max_bifs = max(1, int(p0_per_hr / bif_input_rate))
+        for num_bifs in range(max_bifs, 0, -1):
+            facilities = {"ecu": 1, "bif": num_bifs, "launchpad": 1}
+            pg_rem, cpu_rem = _planet_budget_remaining(
+                pg_budget, cpu_budget, facilities, heads)
+            if pg_rem < 0 or cpu_rem < 0:
+                continue
             # Actual P1 output accounts for partial BIF feeding
             units_hr = _bif_p1_output(p0_per_hr, num_bifs)
-            volume_hr = units_hr * chain["volume"]
-            return {
-                "facilities": facilities,
-                "units_hr": units_hr,
-                "volume_hr": volume_hr,
-                "pg_used": pg_budget - pg_rem,
-                "cpu_used": cpu_budget - cpu_rem,
-                "role": "extractor",
-                "p0_consumed_hr": min(p0_per_hr, num_bifs * bif_input_rate),
-            }
+            if best is None or units_hr > best["units_hr"]:
+                best = {
+                    "facilities": facilities,
+                    "units_hr": units_hr,
+                    "volume_hr": units_hr * volume,
+                    "pg_used": pg_budget - pg_rem,
+                    "cpu_used": cpu_budget - cpu_rem,
+                    "role": "extractor",
+                    "ecu_heads": heads,
+                    "p0_consumed_hr": min(p0_per_hr,
+                                          num_bifs * bif_input_rate),
+                }
+            break  # more BIFs never helps at this head count
 
-    return None
+    return best
 
 
 def compute_p2_selfcontained_layout(chain, extraction_rates, pg_budget, cpu_budget):
@@ -1197,45 +1235,62 @@ def compute_p2_selfcontained_layout(chain, extraction_rates, pg_budget, cpu_budg
     extraction_rates: list of 2 P0 extraction rates for the planet.
     Returns layout dict or None.
     """
+    return _copy_layout(_p2sc_layout_cached(
+        chain["volume"], tuple(extraction_rates), pg_budget, cpu_budget))
+
+
+@functools.lru_cache(maxsize=200000)
+def _p2sc_layout_cached(volume, extraction_rates, pg_budget, cpu_budget):
     bif_input_rate = 6000
     aif_p1_input_rate = 40  # P1/hr each type per AIF
     aif_output_rate = 5     # P2/hr per AIF
+    best = None
 
-    # Each P0 line: 1+ BIFs, actual P1 output depends on extraction rate
-    bifs_per_p0 = []
-    p1_outputs = []
-    for rate in extraction_rates:
-        num_bifs = max(1, int(rate / bif_input_rate))
-        bifs_per_p0.append(num_bifs)
-        p1_outputs.append(_bif_p1_output(rate, num_bifs))
+    # Two ECUs at 10 heads is 16,200 PG on its own — more than a level-5
+    # command centre can spare once BIFs, an AIF and a launchpad are placed.
+    # Search head counts so this layout is judged the way a player would build
+    # it (fewer heads, still self-contained) rather than declared impossible.
+    for heads in range(DEFAULT_ECU_HEADS, 0, -1):
+        rates = [r * heads / DEFAULT_ECU_HEADS for r in extraction_rates]
+        # Each P0 line: 1+ BIFs, actual P1 output depends on extraction rate
+        bifs_per_p0 = []
+        p1_outputs = []
+        for rate in rates:
+            num_bifs = max(1, int(rate / bif_input_rate))
+            bifs_per_p0.append(num_bifs)
+            p1_outputs.append(_bif_p1_output(rate, num_bifs))
 
-    # AIF throughput limited by the slower P1 line
-    min_p1 = min(p1_outputs)
-    # Each AIF needs 40 P1/hr from each input; fractional throughput allowed
-    max_aifs_by_p1 = min_p1 / aif_p1_input_rate  # may be < 1.0
+        # AIF throughput limited by the slower P1 line
+        min_p1 = min(p1_outputs)
+        # Each AIF needs 40 P1/hr from each input; fractional throughput allowed
+        max_aifs_by_p1 = min_p1 / aif_p1_input_rate  # may be < 1.0
 
-    # Try fitting AIFs (at least 1) within PG/CPU budget
-    total_bifs = sum(bifs_per_p0)
-    for num_aifs in range(max(1, int(max_aifs_by_p1)), 0, -1):
-        facilities = {"ecu": 2, "bif": total_bifs, "aif": num_aifs, "launchpad": 1}
-        pg_rem, cpu_rem = _planet_budget_remaining(pg_budget, cpu_budget, facilities)
-        if pg_rem >= 0 and cpu_rem >= 0:
+        total_bifs = sum(bifs_per_p0)
+        for num_aifs in range(max(1, int(max_aifs_by_p1)), 0, -1):
+            facilities = {"ecu": 2, "bif": total_bifs, "aif": num_aifs,
+                          "launchpad": 1}
+            pg_rem, cpu_rem = _planet_budget_remaining(
+                pg_budget, cpu_budget, facilities, heads)
+            if pg_rem < 0 or cpu_rem < 0:
+                continue
             # Actual output: limited by slower P1 line and AIF count
-            effective_aif_throughput = min(num_aifs, max_aifs_by_p1)
-            units_hr = effective_aif_throughput * aif_output_rate
-            volume_hr = units_hr * chain["volume"]
-            return {
-                "facilities": facilities,
-                "units_hr": units_hr,
-                "volume_hr": volume_hr,
-                "pg_used": pg_budget - pg_rem,
-                "cpu_used": cpu_budget - cpu_rem,
-                "role": "self-contained",
-                "p0_consumed_hr": [min(r, b * bif_input_rate) for r, b in zip(extraction_rates, bifs_per_p0)],
-                "bif_split": list(bifs_per_p0),
-            }
+            units_hr = min(num_aifs, max_aifs_by_p1) * aif_output_rate
+            if best is None or units_hr > best["units_hr"]:
+                best = {
+                    "facilities": facilities,
+                    "units_hr": units_hr,
+                    "volume_hr": units_hr * volume,
+                    "pg_used": pg_budget - pg_rem,
+                    "cpu_used": cpu_budget - cpu_rem,
+                    "role": "self-contained",
+                    "ecu_heads": heads,
+                    "p0_consumed_hr": [min(r, b * bif_input_rate)
+                                       for r, b in zip(rates, bifs_per_p0)],
+                    "bif_split": list(bifs_per_p0),
+                }
+            break  # fewer AIFs never helps at this head count
 
-    return None
+    return best
 
 
 def compute_factory_layout(chain, pg_budget, cpu_budget):
@@ -3811,7 +3866,8 @@ def _planet_detail_json(p, pg_budget, cpu_budget):
         "type": p.get("type", ""),
         "role": p.get("role", ""),
         "facilities": fac,
-        "ecu_heads": DEFAULT_ECU_HEADS if fac.get("ecu", 0) > 0 else 0,
+        "ecu_heads": (pl.get("ecu_heads", DEFAULT_ECU_HEADS)
+                      if fac.get("ecu", 0) > 0 else 0),
         "p0_consumed_hr": p0_consumed,
         "units_hr": pl.get("units_hr", 0),
         "volume_hr": pl.get("volume_hr", 0),
@@ -3923,7 +3979,8 @@ def _recompute_chain(vc, ctx, aif_overrides=None):
     def refresh_power(p):
         lay = p.get("layout") or {}
         fac = lay.get("facilities", {})
-        pg_rem, cpu_rem = _planet_budget_remaining(pgb, cpub, fac)
+        pg_rem, cpu_rem = _planet_budget_remaining(
+            pgb, cpub, fac, lay.get("ecu_heads", DEFAULT_ECU_HEADS))
         lay["pg_used"] = pgb - pg_rem
         lay["cpu_used"] = cpub - cpu_rem
         lay["over_budget"] = (pg_rem < 0) or (cpu_rem < 0)
@@ -4623,6 +4680,33 @@ def _factory_units_per_planet(bundle_at_1, pg_budget, cpu_budget,
     return best_units, pg_per, cpu_per, best_storage
 
 
+def _snap_facilities(bundle, units_hr, pg_budget, cpu_budget, storage_count):
+    """Whole factories to actually build, and the throughput they support.
+
+    You cannot place 9.72 High-Tech Production Plants. Round each facility type
+    up so nothing starves; if the rounded-up build no longer fits the command
+    centre, round down instead and accept the lower ceiling.
+
+    Returns (counts, achievable_units_hr, pg_used, cpu_used).
+    """
+    c = FACILITY_COSTS
+    base_pg = c["launchpad"]["pg"] + storage_count * c["storage"]["pg"]
+    base_cpu = c["launchpad"]["cpu"] + storage_count * c["storage"]["cpu"]
+    wanted = {k: v for k, v in bundle.items() if v > 0}
+    if not wanted or units_hr <= 0:
+        return {}, 0.0, base_pg, base_cpu
+    for rounder in (math.ceil, math.floor):
+        counts = {k: int(rounder(v * units_hr)) for k, v in wanted.items()}
+        if not all(counts.values()):
+            continue
+        pg = base_pg + sum(n * c[k]["pg"] for k, n in counts.items())
+        cpu = base_cpu + sum(n * c[k]["cpu"] for k, n in counts.items())
+        if pg <= pg_budget and cpu <= cpu_budget:
+            achieved = min(counts[k] / wanted[k] for k in counts)
+            return counts, achieved, pg, cpu
+    return {}, 0.0, base_pg, base_cpu
+
+
 def _factory_tax_rate(state):
     """POCO rate for a hypothetical import factory: the cheapest scouted
     rate among active-inventory planets (a factory needs no extraction, so
@@ -4697,11 +4781,14 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
 
     flags = []
     input_vol = 0.0
-    import_tax = 0.0
+    # POCO tax is linear in the rate, so accumulate it at rate 1.0 and scale.
+    # That lets a caller re-price the same build on a different planet's
+    # customs office without redoing any of the work.
+    tax_unit_per_rate = PI_TAX_BASE.get(out_tier, 70000)  # export leg
     for in_tid, qty in bom.items():
         it = pi_types.get(in_tid, {})
         input_vol += qty * it.get("volume", 0)
-        import_tax += qty * PI_TAX_BASE.get(it.get("tier", "P1"), 500) * 0.5 * tax_rate
+        tax_unit_per_rate += qty * PI_TAX_BASE.get(it.get("tier", "P1"), 500) * 0.5
 
     # ── 1. Throughput: PG/CPU after a launchpad + the storage the buffer needs
     bundle = {}
@@ -4722,6 +4809,29 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
             (input_vol + out_vol) * units_hr * 24 * cad["buffer_days"])
     else:
         storage_count = 0
+
+    # ── 2b. Snap to whole facilities. Rounding up leaves them idling a few
+    # percent (duty cycle); if it no longer fits, the build rounds down and
+    # throughput drops to what those facilities really make.
+    fac_counts, achieved_hr, pg_used, cpu_used = _snap_facilities(
+        bundle, units_hr, pg_budget, cpu_budget, storage_count)
+    if achieved_hr <= 0:
+        units_hr = 0.0
+    elif achieved_hr < units_hr:
+        units_hr = achieved_hr
+    duty_cycle = (units_hr / achieved_hr) if achieved_hr > 0 else 0.0
+    # Rounding down moves less cargo, which can free a Storage Facility the
+    # build no longer needs — report what it actually takes, not the estimate.
+    if units_hr <= 0:
+        storage_count = 0
+    elif cad["buffer_days"] > 0:
+        shrunk = _storage_for(
+            (input_vol + out_vol) * units_hr * 24 * cad["buffer_days"])
+        if shrunk < storage_count:
+            freed = storage_count - shrunk
+            pg_used -= freed * FACILITY_COSTS["storage"]["pg"]
+            cpu_used -= freed * FACILITY_COSTS["storage"]["cpu"]
+            storage_count = shrunk
 
     # ── 3. Price both legs by walking the book for one haul window
     window_out = units_hr * 24 * haul_days * max(n_planets, 1)
@@ -4770,11 +4880,11 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
         rev_basis = "jita_buy+vwap"
     flags.extend(_depth_flags(sell_fill, "SELL"))
 
-    export_tax = PI_TAX_BASE.get(out_tier, 70000) * tax_rate
-    tax_per_unit = import_tax + export_tax
+    tax_per_unit = tax_unit_per_rate * tax_rate
     sales_tax_per_unit = revenue * sales_tax
 
-    net_per_unit = revenue - input_cost - tax_per_unit - sales_tax_per_unit
+    pretax_net_per_unit = revenue - input_cost - sales_tax_per_unit
+    net_per_unit = pretax_net_per_unit - tax_per_unit
     roi = (net_per_unit / input_cost) if input_cost > 0 else 0.0
 
     # Buy-order sourcing upside (see docstring)
@@ -4807,15 +4917,20 @@ def _import_option(chain, buy_level, market, pi_types, schematics,
         "sell_filled_frac": sell_fill["filled_frac"],
         "revenue_basis": rev_basis,
         "net_per_unit": net_per_unit,
+        "pretax_net_per_unit": pretax_net_per_unit,
+        "tax_unit_per_rate": tax_unit_per_rate,
         "roi": roi,
         "units_hr_per_planet": units_hr,
         "net_isk_hr_per_planet": net_isk_hr,
         "net_isk_hr_buy_sourced": net_isk_hr_buy_sourced,
-        # Facility counts for the actual planet build (not per unit/hr)
-        "aif_count": round(bundle.get("aif", 0) * units_hr, 2),
-        "htif_count": round(bundle.get("htif", 0) * units_hr, 2),
+        # Whole facilities to actually place on the planet
+        "aif_count": fac_counts.get("aif", 0),
+        "htif_count": fac_counts.get("htif", 0),
         "storage_count": storage_count,
         "launchpad_count": 1,
+        "duty_cycle": duty_cycle,
+        "pg_used": pg_used,
+        "cpu_used": cpu_used,
         "on_planet_m3": on_planet_m3,
         "on_planet_capacity_m3": (FACILITY_M3["launchpad"]
                                   + storage_count * FACILITY_M3["storage"]),
@@ -5085,7 +5200,41 @@ def best_pi_plays(isk_per_haul_min=None, min_tier="P1"):
     }
 
 
-def pi_run_plan(isk_per_haul_min=None, max_planets=None):
+def _factory_sites(state, limit):
+    """The cheapest scouted POCOs, cheapest first — where factories should go.
+
+    A factory planet extracts nothing, so tax is the only siting criterion.
+    Rates vary a lot (1% vs 5% is a 5x difference on a P4 export), so the
+    planner assigns real planets rather than assuming every slot gets the one
+    cheapest customs office.
+    """
+    ctx = state.get("ctx") or {}
+    cfg = state.get("cfg") or {}
+    taxes = ctx.get("planet_taxes") or {}
+    sites = []
+    for system, planets in (ctx.get("inv") or {}).items():
+        for ptype, count in planets.items():
+            for i in range(int(count)):
+                key = f"{system}.{ptype}.{chr(ord('A') + i)}"
+                rate = taxes.get(key)
+                if rate is not None:
+                    sites.append({"key": key, "system": system, "type": ptype,
+                                  "tax_rate": rate})
+    sites.sort(key=lambda s: s["tax_rate"])
+    if not sites:  # nothing scouted — fall back to the configured default
+        rate = cfg.get("tax_rate", 0.15)
+        sites = [{"key": None, "system": "", "type": "", "tax_rate": rate}
+                 for _ in range(max(limit, 1))]
+    return sites[:limit]
+
+
+# Candidate lines kept per ranking criterion (net, net per ISK, net per m3).
+# The union is what the allocation search runs over.
+RUN_PLAN_MAX_LINES = 8
+
+
+def pi_run_plan(isk_per_haul_min=None, max_planets=None,
+                capital=None, max_trips=None):
     """The do-this-tonight sheet: what to build, buy, drop, and bring back.
 
     Fills your planet slots greedily, one at a time. Each candidate is re-priced
@@ -5124,51 +5273,127 @@ def pi_run_plan(isk_per_haul_min=None, max_planets=None):
     jita_rt_min = (jita_jumps * 2 * haul.get("sec_per_jump", 45)
                    + 2 * haul.get("sec_per_station", 180)) / 60.0
 
+    sites = _factory_sites(state, slots)
+    # Pad with the configured default so a slot without a scouted planet is
+    # taxed pessimistically rather than dropping out of the zip untaxed.
+    while len(sites) < slots:
+        sites.append({"key": None, "system": "", "type": "",
+                      "tax_rate": cfg.get("tax_rate", 0.15)})
+    site_rates = sorted(s["tax_rate"] for s in sites)
+    ref_rate = site_rates[0] if site_rates else tax_rate
+
     def _trips(m3):
         return math.ceil(m3 / hauler_m3) if (m3 > 0 and hauler_m3 > 0) else 0
 
-    def _best_option(chain, n):
-        """Best buy-in tier for running n planets of this product, after haul."""
-        best = None
+    def _opt(chain, lvl, n):
+        return _import_option(chain, lvl, market, pi_types, schematics,
+                              pg_budget, cpu_budget, ref_rate, sales_tax,
+                              broker_fee, cad, n_planets=n)
+
+    # ── Candidate lines: one per (product, buy-in tier).
+    # The ceilings are deliberately NOT applied here. Pruning the candidate
+    # set by a ceiling makes the set change as the ceiling moves, and then a
+    # tighter budget can hand back a *better* plan than a loose one. Ceilings
+    # belong in _score, where they only ever shrink the feasible region.
+    lines = []
+    for tid, chain in chains.items():
+        if _TIER_LEVEL.get(chain["tier"], 0) < 2:
+            continue
         for lvl in range(1, _TIER_LEVEL.get(chain["tier"], 0)):
-            o = _import_option(chain, lvl, market, pi_types, schematics,
-                               pg_budget, cpu_budget, tax_rate, sales_tax,
-                               broker_fee, cad, n_planets=n)
-            trips = max(_trips(o["daily_import_m3"] * haul_days * n),
-                        _trips(o["daily_export_m3"] * haul_days * n))
-            o["_haul_min_per_day"] = trips * jita_rt_min / haul_days
-            o["_trips"] = trips
-            o["_total_net_isk_hr"] = (o["net_isk_hr_per_planet"] * n
-                                      - o["_haul_min_per_day"] * isk_per_haul_min / 24.0)
-            if best is None or o["_total_net_isk_hr"] > best["_total_net_isk_hr"]:
-                best = o
-        return best
-
-    candidates = {tid: c for tid, c in chains.items()
-                  if _TIER_LEVEL.get(c["tier"], 0) >= 2}
-
-    counts, running_net, chosen = {}, {}, {}
-    marginals = []
-    for slot in range(slots):
-        pick_tid, pick_marginal, pick_opt = None, 0.0, None
-        for tid, chain in candidates.items():
-            n = counts.get(tid, 0) + 1
-            opt = _best_option(chain, n)
-            if opt is None or not opt["viable"]:
+            o = _opt(chain, lvl, 1)
+            if not o["viable"]:
                 continue
-            marginal = opt["_total_net_isk_hr"] - running_net.get(tid, 0.0)
-            if marginal > pick_marginal:
-                pick_tid, pick_marginal, pick_opt = tid, marginal, opt
-        if pick_tid is None:
-            break
-        counts[pick_tid] = counts.get(pick_tid, 0) + 1
-        running_net[pick_tid] = pick_opt["_total_net_isk_hr"]
-        chosen[pick_tid] = pick_opt
-        marginals.append({
-            "slot": slot + 1,
-            "output_name": chains[pick_tid]["output_name"],
-            "marginal_net_isk_hr": pick_marginal,
-        })
+            lines.append({
+                "tid": tid, "chain": chain, "buy_level": lvl, "opts": {1: o},
+                "net1": o["net_isk_hr_per_planet"],
+                "spend1": o["input_cost_per_unit"] * o["window_units"],
+                "cargo1": max(o["daily_import_m3"],
+                              o["daily_export_m3"]) * haul_days,
+            })
+
+    # Which line is worth a slot depends on which ceiling bites: planet slots,
+    # ISK, or cargo space. Keep the leaders under each, because ranking on net
+    # alone starves the search exactly when capital is the binding constraint.
+    def _per(attr):
+        return lambda l: -(l["net1"] / l[attr]) if l[attr] > 0 else 0.0
+    keep = {}
+    for key in (lambda l: -l["net1"], _per("spend1"), _per("cargo1")):
+        for line in sorted(lines, key=key)[:RUN_PLAN_MAX_LINES]:
+            keep[(line["tid"], line["buy_level"])] = line
+    lines = sorted(keep.values(), key=lambda l: -l["net1"])
+
+    for line in lines:  # depth-aware pricing at each portfolio size
+        for n in range(2, slots + 1):
+            line["opts"][n] = _opt(line["chain"], line["buy_level"], n)
+
+    def _score(alloc):
+        """Exact net ISK/hr after haul for an allocation [(line, count), ...].
+
+        Cheap customs offices go to whichever planets pay the most tax per
+        hour, which is optimal by the rearrangement inequality.
+        """
+        spend = imp_m3 = exp_m3 = pretax = 0.0
+        sensitivities = []
+        for line, n in alloc:
+            o = line["opts"][n]
+            spend += o["input_cost_per_unit"] * o["window_units"] * n
+            imp_m3 += o["daily_import_m3"] * haul_days * n
+            exp_m3 += o["daily_export_m3"] * haul_days * n
+            pretax += o["pretax_net_per_unit"] * o["units_hr_per_planet"] * n
+            sensitivities += [o["tax_unit_per_rate"]
+                              * o["units_hr_per_planet"]] * n
+        if capital is not None and spend > capital:
+            return None
+        trips = max(_trips(imp_m3), _trips(exp_m3))
+        if max_trips is not None and trips > max_trips:
+            return None
+        sensitivities.sort(reverse=True)
+        tax_hr = sum(s * r for s, r in zip(sensitivities, site_rates))
+        haul_cost = trips * jita_rt_min / haul_days * isk_per_haul_min / 24.0
+        return {"net": pretax - tax_hr - haul_cost, "spend": spend,
+                "import_m3": imp_m3, "export_m3": exp_m3, "trips": trips,
+                "tax_isk_hr": tax_hr, "haul_cost_isk_hr": haul_cost}
+
+    # ── Exhaustive search over allocations. Spend and cargo only ever grow as
+    # planets are added, so an infeasible prefix prunes its whole subtree —
+    # under a real budget that kills almost everything immediately.
+    best_alloc, best_score = [], None
+
+    def _search(start, slots_left, alloc):
+        nonlocal best_alloc, best_score
+        if alloc:
+            sc = _score(alloc)
+            if sc is None:
+                return  # infeasible, and adding planets cannot fix it
+            if best_score is None or sc["net"] > best_score["net"]:
+                best_alloc, best_score = list(alloc), sc
+        if slots_left == 0:
+            return
+        used = {line["tid"] for line, _ in alloc}
+        for i in range(start, len(lines)):
+            if lines[i]["tid"] in used:
+                continue  # one buy-in tier per product, or depth double-counts
+            for n in range(1, slots_left + 1):
+                alloc.append((lines[i], n))
+                _search(i + 1, slots_left - n, alloc)
+                alloc.pop()
+
+    _search(0, slots, [])
+
+    counts = {line["tid"]: n for line, n in best_alloc}
+    chosen = {line["tid"]: line["opts"][n] for line, n in best_alloc}
+
+    # Assign real planets: cheapest customs office to the biggest tax bill.
+    assign = []
+    for line, n in best_alloc:
+        o = line["opts"][n]
+        for _ in range(n):
+            assign.append((o["tax_unit_per_rate"] * o["units_hr_per_planet"],
+                           line["tid"]))
+    assign.sort(key=lambda x: -x[0])
+    sites_for = {}
+    for (_, tid), site in zip(assign, sites):
+        sites_for.setdefault(tid, []).append(site)
 
     # ── Build the per-planet + shopping output ──
     shopping = {}
@@ -5177,10 +5402,20 @@ def pi_run_plan(isk_per_haul_min=None, max_planets=None):
     spend_per_run = revenue_per_run = 0.0
     total_net_isk_hr = 0.0
 
-    for tid, opt in sorted(chosen.items(),
-                           key=lambda kv: -kv[1]["_total_net_isk_hr"]):
+    def _product_net(tid):
+        """Net ISK/hr for a product, taxed at the customs offices it got."""
+        o = chosen[tid]
+        n = counts[tid]
+        gross = o["pretax_net_per_unit"] * o["units_hr_per_planet"] * n
+        tax = sum(o["tax_unit_per_rate"] * o["units_hr_per_planet"]
+                  * s["tax_rate"] for s in sites_for.get(tid, []))
+        return gross - tax, tax
+
+    for tid in sorted(chosen, key=lambda t: -_product_net(t)[0]):
+        opt = chosen[tid]
         chain = chains[tid]
         n = counts[tid]
+        net_hr, tax_hr = _product_net(tid)
         per_planet_units = opt["window_units"]          # units per haul run
         run_units = per_planet_units * n
 
@@ -5213,7 +5448,7 @@ def pi_run_plan(isk_per_haul_min=None, max_planets=None):
         export_m3 += p_export_m3
         spend_per_run += opt["input_cost_per_unit"] * run_units
         revenue_per_run += opt["revenue_per_unit"] * run_units
-        total_net_isk_hr += opt["_total_net_isk_hr"]
+        total_net_isk_hr += net_hr
 
         if opt["on_planet_m3"] > opt["on_planet_capacity_m3"] + 1e-6:
             warnings.append(f"{chain['output_name']}: on-planet buffer "
@@ -5227,10 +5462,16 @@ def pi_run_plan(isk_per_haul_min=None, max_planets=None):
             "tier": chain["tier"],
             "buy_tier": opt["buy_tier"],
             "planet_count": n,
+            "sites": [{"planet": s["key"], "system": s["system"],
+                       "type": s["type"], "tax_rate": s["tax_rate"]}
+                      for s in sites_for.get(tid, [])],
             "facilities": {
                 "aif": opt["aif_count"], "htif": opt["htif_count"],
                 "launchpad": 1, "storage": opt["storage_count"],
             },
+            "duty_cycle": opt["duty_cycle"],
+            "pg_used": opt["pg_used"], "pg_budget": pg_budget,
+            "cpu_used": opt["cpu_used"], "cpu_budget": cpu_budget,
             "units_hr_per_planet": opt["units_hr_per_planet"],
             "units_per_planet_per_run": per_planet_units,
             "units_per_run": run_units,
@@ -5239,8 +5480,10 @@ def pi_run_plan(isk_per_haul_min=None, max_planets=None):
             "on_planet_capacity_m3": opt["on_planet_capacity_m3"],
             "import_m3_per_run": p_import_m3,
             "export_m3_per_run": p_export_m3,
-            "net_isk_hr_per_planet": opt["net_isk_hr_per_planet"],
-            "total_net_isk_hr": opt["_total_net_isk_hr"],
+            "spend_per_run": opt["input_cost_per_unit"] * run_units,
+            "net_isk_hr_per_planet": net_hr / n if n else 0.0,
+            "total_net_isk_hr": net_hr,
+            "tax_isk_hr": tax_hr,
             "net_per_unit": opt["net_per_unit"],
             "roi": opt["roi"],
             "revenue_per_unit": opt["revenue_per_unit"],
@@ -5252,10 +5495,20 @@ def pi_run_plan(isk_per_haul_min=None, max_planets=None):
         })
 
     trips = max(_trips(import_m3), _trips(export_m3))
+    haul_cost_isk_hr = trips * jita_rt_min / haul_days * isk_per_haul_min / 24.0
+    total_net_isk_hr -= haul_cost_isk_hr
     if trips > 1:
         warnings.append(f"One run needs {trips} hauler trips "
                         f"({max(import_m3, export_m3):,.0f} m3 vs "
                         f"{hauler_m3:,.0f} m3 hold)")
+    if not planets:
+        warnings.append(
+            "Nothing fits the ceilings. Raise the budget or the trip limit, "
+            "or drop to a lower-tier product.")
+    if capital is not None and planets:
+        warnings.append(f"Uses {spend_per_run / capital:.0%} of the "
+                        f"{capital:,.0f} ISK budget "
+                        f"({capital - spend_per_run:,.0f} idle).")
 
     # Reference: the best extraction play, for the extract-vs-import sanity check
     bp = best_pi_plays(isk_per_haul_min=isk_per_haul_min, min_tier="P1")
@@ -5281,20 +5534,23 @@ def pi_run_plan(isk_per_haul_min=None, max_planets=None):
         "jita_jumps": jita_jumps,
         "jita_round_trip_min": jita_rt_min,
         "isk_per_haul_min": isk_per_haul_min,
-        "tax_rate": tax_rate,
+        "capital": capital,
+        "max_trips": max_trips,
+        "tax_rate": ref_rate,
         "factory_tax_planet": tax_planet,
+        "site_tax_rates": site_rates,
         "sales_tax": sales_tax,
         "pg_budget": pg_budget,
         "cpu_budget": cpu_budget,
         "slots": slots,
         "slots_used": sum(counts.values()),
         "planets": planets,
-        "marginals": marginals,
         "shopping_list": sorted(shopping.values(), key=lambda s: -s["isk"]),
         "spend_per_run": spend_per_run,
         "revenue_per_run": revenue_per_run,
         "net_per_run": revenue_per_run - spend_per_run,
         "total_net_isk_hr": total_net_isk_hr,
+        "haul_cost_isk_hr": haul_cost_isk_hr,
         "import_m3_per_run": import_m3,
         "export_m3_per_run": export_m3,
         "trips_per_run": trips,
@@ -5728,6 +5984,29 @@ def self_test():
     if layout2:
         check("P2 self-contained has units_hr > 0", layout2["units_hr"] > 0,
               f"units_hr={layout2['units_hr']}")
+        # Two 10-head ECUs alone are 16,200 PG — it only fits on fewer heads.
+        check("P2 self-contained drops heads to fit two ECUs",
+              layout2["ecu_heads"] < DEFAULT_ECU_HEADS,
+              f"heads={layout2['ecu_heads']}")
+
+    # ECU cost and head-count search
+    check("ECU cost matches SDE (2600 PG + 550/head, 400 CPU + 110/head)",
+          _ecu_pg_cpu(10) == (2600 + 5500, 400 + 1100)
+          and _ecu_pg_cpu(1) == (3150, 510), _ecu_pg_cpu(10))
+    check("CCU budgets are the real per-level command centres",
+          CCU_BUDGETS[1] == (9000, 7057) and CCU_BUDGETS[4] == (17000, 21315)
+          and CCU_BUDGETS[5] == (19000, 25415))
+    _tight = compute_p1_layout(test_chain_p1, 14000, 9000, 7057)
+    check("Tight command centre trades heads for BIFs",
+          _tight is not None and _tight["ecu_heads"] < DEFAULT_ECU_HEADS
+          and _tight["pg_used"] <= 9000 and _tight["cpu_used"] <= 7057,
+          _tight)
+    check("Roomy command centre keeps all 10 heads",
+          compute_p1_layout(test_chain_p1, 14000, 19000,
+                            25415)["ecu_heads"] == DEFAULT_ECU_HEADS)
+    check("Head count scales the rate that reaches the BIFs",
+          compute_p1_layout(test_chain_p1, 14000, 9000, 7057)["units_hr"]
+          < compute_p1_layout(test_chain_p1, 14000, 19000, 25415)["units_hr"])
 
     factory = compute_factory_layout(test_chain_p2, 17000, 21315)
     check("P2 factory layout computes", factory is not None)
@@ -6297,15 +6576,18 @@ def self_test():
               abs(_p3["tax_per_unit"] - _exp_tax) < 1, _p3["tax_per_unit"])
         check("Revenue = Jita buy of P4",
               abs(_p3["revenue_per_unit"] - 1500000) < 1)
-        # 4 Storage Facilities leave 21315-3600-2000 CPU for HTIFs at 1100 each.
-        # That ceiling (14.29/hr) sits under the daily POCO cap, so storage —
-        # not the customs office — is what binds at a 1-day buffer.
-        check("P4<-P3 sized by storage-adjusted CPU ceiling",
-              abs(_p3["units_hr_per_planet"] - 15715 / 1100) < 0.01
-              and _p3["storage_count"] == 4
-              and abs(_p3["htif_count"] - _p3["units_hr_per_planet"]) < 0.02
+        # Storage + launchpad leave 21315-3600-2000 CPU for HTIFs at 1100 each,
+        # a 14.29/hr ceiling. 15 whole HTIFs do not fit that CPU, so the build
+        # rounds down to 14 and the planet makes exactly 14/hr. Storage — not
+        # the customs office — is what binds at a 1-day buffer.
+        check("P4<-P3 sized by whole HTIFs under the storage-adjusted ceiling",
+              _p3["htif_count"] == 14
+              and abs(_p3["units_hr_per_planet"] - 14.0) < 1e-9
+              and _p3["storage_count"] == 3
+              and _p3["cpu_used"] <= 21315 and _p3["pg_used"] <= 17000
               and not any("POCO BUFFER" in f for f in _p3["flags"]),
-              f"{_p3['units_hr_per_planet']} storage={_p3['storage_count']}")
+              f"{_p3['units_hr_per_planet']} htif={_p3['htif_count']} "
+              f"storage={_p3['storage_count']} cpu={_p3['cpu_used']}")
         check("On-planet buffer fits the storage that was built",
               _p3["on_planet_m3"] <= _p3["on_planet_capacity_m3"] + 1e-6,
               f"{_p3['on_planet_m3']:.0f} > {_p3['on_planet_capacity_m3']}")
@@ -6325,10 +6607,10 @@ def self_test():
         check("Buy-sourced net = revenue - buy cost - POCO tax",
               abs(_p3_bo["net_per_unit_buy_sourced"]
                   - (1500000 - 6 * 85000 * 1.027 - _exp_tax)) < 1)
-        check("Direct option: CPU-limited ceiling, planet-scale HTIF count",
-              abs(_p3_bo["units_hr_per_planet"] - 15715 / 1100) < 0.01
-              and abs(_p3_bo["htif_count"] - _p3_bo["units_hr_per_planet"])
-              < 0.02, _p3_bo["htif_count"])
+        check("Direct option: whole HTIFs, throughput matches the build",
+              _p3_bo["htif_count"] == 14
+              and abs(_p3_bo["units_hr_per_planet"] - 14.0) < 1e-9,
+              _p3_bo["htif_count"])
     if _s:
         check("P3 target only offers P1/P2 buy-in",
               {o["buy_tier"] for o in _s["options"]} == {"P1", "P2"})
@@ -6344,8 +6626,16 @@ def self_test():
         "planets_used": [1, 2, 3], "haul_minutes_per_day": 30.0,
         "jita_buy_price": 85000, "viable": True, "flags": [],
     }]
+    # Two cheap customs offices, then pricier ones — enough spread that the
+    # planner has to assign real planets rather than assume one rate.
+    _rp_inv = {"Cheapville": {"Gas": 2}, "Pricyton": {"Barren": 4}}
+    _rp_taxes = {"Cheapville.Gas.A": 0.01, "Cheapville.Gas.B": 0.01,
+                 "Pricyton.Barren.A": 0.10, "Pricyton.Barren.B": 0.10,
+                 "Pricyton.Barren.C": 0.10, "Pricyton.Barren.D": 0.10}
     _LAST_RUN["state"] = {
-        "ctx": {"pi_types": _iu_types, "schematics": _iu_sch, "chains": _iu_chains},
+        "ctx": {"pi_types": _iu_types, "schematics": _iu_sch,
+                "chains": _iu_chains, "inv": _rp_inv,
+                "planet_taxes": _rp_taxes},
         "ectx": {"market_prices": _iu_market, "jita_jumps": 15},
         "cfg": {"tax_rate": 0.10, "pg_budget": 17000, "cpu_budget": 21315,
                 "hauler_m3": 9000,
@@ -6493,19 +6783,33 @@ def self_test():
     check("Daily drop = run quantity / haul cadence",
           abs(_in0["units_per_planet_per_day"] * 3
               - _in0["units_per_planet_per_run"]) < 1e-6)
-    # Hauler trips are integral, so a planet that rides along in an
-    # already-paid trip really is worth more than the one that bought it.
-    _trip_cost = _rp["jita_round_trip_min"] / 3 * 100000 / 24
-    check("Marginal value non-increasing, bar whole-trip lumpiness",
-          all(_rp["marginals"][i]["marginal_net_isk_hr"]
-              >= _rp["marginals"][i + 1]["marginal_net_isk_hr"]
-              - _trip_cost - 1e-6
-              for i in range(len(_rp["marginals"]) - 1)),
-          [round(m["marginal_net_isk_hr"]) for m in _rp["marginals"]])
+    check("Every planet gets a named customs office, cheapest first",
+          sum(len(p["sites"]) for p in _rp["planets"]) == _rp["slots_used"]
+          and all(p["sites"][0]["planet"] for p in _rp["planets"]),
+          [s["planet"] for p in _rp["planets"] for s in p["sites"]])
+    check("Facility counts are whole numbers you can actually place",
+          all(float(p["facilities"]["aif"]).is_integer()
+              and float(p["facilities"]["htif"]).is_integer()
+              for p in _rp["planets"]))
+    check("Built facilities fit the command centre",
+          all(p["pg_used"] <= p["pg_budget"]
+              and p["cpu_used"] <= p["cpu_budget"] for p in _rp["planets"]))
     check("Trips sized against the hauler hold",
           _rp["trips_per_run"] == max(
               math.ceil(_rp["import_m3_per_run"] / 55000),
               math.ceil(_rp["export_m3_per_run"] / 55000)))
+    check("Headline net is exactly the parts minus the haul",
+          abs(_rp["total_net_isk_hr"]
+              - (sum(p["total_net_isk_hr"] for p in _rp["planets"])
+                 - _rp["haul_cost_isk_hr"])) < 1e-6)
+    check("Headline spend is exactly the per-planet spend",
+          abs(_rp["spend_per_run"]
+              - sum(p["spend_per_run"] for p in _rp["planets"])) < 1e-6)
+    check("Cargo totals are the sum of the planets",
+          abs(_rp["import_m3_per_run"]
+              - sum(p["import_m3_per_run"] for p in _rp["planets"])) < 1e-6
+          and abs(_rp["export_m3_per_run"]
+                  - sum(p["export_m3_per_run"] for p in _rp["planets"])) < 1e-6)
     check("Every built planet holds its own buffer",
           all(p["on_planet_m3"] <= p["on_planet_capacity_m3"] + 1e-6
               for p in _rp["planets"]))
@@ -6517,11 +6821,43 @@ def self_test():
     check("Thin buy book pushes later slots onto another product",
           len(_rp2["planets"]) > 1,
           [(p["output_name"], p["planet_count"]) for p in _rp2["planets"]])
-    check("Depth degradation shows up as a falling marginal",
-          _rp2["marginals"][0]["marginal_net_isk_hr"]
-          > _rp2["marginals"][-1]["marginal_net_isk_hr"],
-          [round(m["marginal_net_isk_hr"]) for m in _rp2["marginals"]])
     _LAST_RUN["state"]["ectx"]["market_prices"] = _iu_market
+
+    # ── Ceilings: working capital and hauler trips ──
+    _cap = _rp["spend_per_run"] / 3.0
+    _rp_cap = pi_run_plan(isk_per_haul_min=100000, capital=_cap)
+    check("Capital ceiling is respected",
+          _rp_cap["spend_per_run"] <= _cap + 1e-6,
+          f"{_rp_cap['spend_per_run']:.0f} > {_cap:.0f}")
+    check("Capital ceiling costs throughput, not correctness",
+          _rp_cap["slots_used"] <= _rp["slots_used"]
+          and _rp_cap["total_net_isk_hr"] <= _rp["total_net_isk_hr"] + 1e-6)
+    check("Tightening capital never improves the plan",
+          all(pi_run_plan(isk_per_haul_min=100000, capital=_cap * f)
+              ["total_net_isk_hr"]
+              <= pi_run_plan(isk_per_haul_min=100000, capital=_cap * (f + 0.25))
+              ["total_net_isk_hr"] + 1e-6
+              for f in (0.25, 0.5, 0.75)))
+    check("Cheapest customs offices go to the biggest tax bills",
+          all(p["sites"] == sorted(p["sites"], key=lambda s: s["tax_rate"])
+              for p in _rp_cap["planets"])
+          and [s["tax_rate"] for p in _rp["planets"] for s in p["sites"]]
+          != [] and min(s["tax_rate"] for p in _rp["planets"]
+                        for s in p["sites"]) == 0.01)
+    _rp_trip = pi_run_plan(isk_per_haul_min=100000, max_trips=1)
+    check("Trip ceiling is respected", _rp_trip["trips_per_run"] <= 1,
+          _rp_trip["trips_per_run"])
+    check("Trip ceiling holds every leg inside one hold",
+          max(_rp_trip["import_m3_per_run"],
+              _rp_trip["export_m3_per_run"]) <= 55000 + 1e-6)
+    _rp_none = pi_run_plan(isk_per_haul_min=100000, capital=1.0)
+    check("Impossible ceiling yields an empty, flagged plan",
+          not _rp_none["planets"] and _rp_none["slots_used"] == 0
+          and any("Nothing fits" in w for w in _rp_none["warnings"]))
+    # An exact search must never be beaten by the plan a tighter run found.
+    check("Unconstrained plan is at least as good as any constrained one",
+          _rp["total_net_isk_hr"] >= _rp_cap["total_net_isk_hr"] - 1e-6
+          and _rp["total_net_isk_hr"] >= _rp_trip["total_net_isk_hr"] - 1e-6)
     _rp_state = _LAST_RUN["state"]
     _LAST_RUN["state"] = None
     check("pi_run_plan errors with no run", "error" in pi_run_plan())
