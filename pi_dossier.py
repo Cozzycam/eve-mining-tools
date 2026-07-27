@@ -4708,9 +4708,18 @@ def _snap_facilities(bundle, units_hr, pg_budget, cpu_budget, storage_count):
             continue
         pg = base_pg + sum(n * c[k]["pg"] for k, n in counts.items())
         cpu = base_cpu + sum(n * c[k]["cpu"] for k, n in counts.items())
-        if pg <= pg_budget and cpu <= cpu_budget:
-            achieved = min(counts[k] / wanted[k] for k in counts)
-            return counts, achieved, pg, cpu
+        if pg > pg_budget or cpu > cpu_budget:
+            continue
+        # One facility type ends up the bottleneck; trim the rest to what
+        # feeding it actually needs. Rounding each type independently
+        # otherwise leaves the non-binding ones permanently idle — real
+        # facilities you would pay for and build for no extra output.
+        achieved = min(counts[k] / wanted[k] for k in counts)
+        counts = {k: max(1, int(math.ceil(round(v * achieved, 6))))
+                  for k, v in wanted.items()}
+        pg = base_pg + sum(n * c[k]["pg"] for k, n in counts.items())
+        cpu = base_cpu + sum(n * c[k]["cpu"] for k, n in counts.items())
+        return counts, achieved, pg, cpu
     return {}, 0.0, base_pg, base_cpu
 
 
@@ -6688,6 +6697,18 @@ def self_test():
               _p3_bo["htif_count"] == 14
               and abs(_p3_bo["units_hr_per_planet"] - 14.0) < 1e-9,
               _p3_bo["htif_count"])
+        # A mixed AIF+HTIF build must not leave the non-binding type idle.
+        _mix = _import_option(_iu_chains[30], 2, _iu_market, _iu_types,
+                              _iu_sch, 17000, 21315, 0.10)
+        _mb = {}
+        _facility_bundle(30, 1.0, 2, _iu_types, _iu_sch, _mb)
+        _u = _mix["units_hr_per_planet"]
+        check("No idle facilities: every type sized to the achieved rate",
+              _mix["aif_count"] == math.ceil(round(_mb["aif"] * _u, 6))
+              and _mix["htif_count"] == math.ceil(round(_mb["htif"] * _u, 6)),
+              f"{_mix['htif_count']} HTIF + {_mix['aif_count']} AIF at "
+              f"{_u:.3f}/hr needs {math.ceil(_mb['htif']*_u)} + "
+              f"{math.ceil(_mb['aif']*_u)}")
     if _s:
         check("P3 target only offers P1/P2 buy-in",
               {o["buy_tier"] for o in _s["options"]} == {"P1", "P2"})
