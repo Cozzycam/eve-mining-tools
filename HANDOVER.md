@@ -1,5 +1,27 @@
 # EVE Mining Tools — Handover Notes
 
+## PI Dossier — 2026-07-27 — Don't build facilities that can never run
+
+Surfaced by the player asking what each facility on each planet actually makes.
+Deriving the chain step by step from the schematics gave 16 Advanced Industry
+Facilities on the Organic Mortar Applicators planet where the sheet said 19.
+
+`_snap_facilities` rounded each facility *type* independently against the same
+fractional throughput. Whichever type rounds down hardest becomes the
+bottleneck, and the others are left over-built — facilities you pay for, place,
+link and power for zero extra output. On the live 4-planet plan that was 3
+wasted AIF on the Organic Mortar Applicators planet and 2 on each Sterile
+Conduits planet: 7 in total.
+
+After the rounding that fits the command centre, every type is now trimmed to
+`ceil(bundle * achieved_rate)`. Throughput is unchanged by construction — the
+binding type is never touched. Side benefit: PG headroom went from ~700 to
+~2,800 on the Temperate planet and ~500 to ~1,900 on each Agoze one, which
+materially de-risks the unmodelled planetary-link power draw.
+
+Self-test +1 check comparing a mixed AIF+HTIF build against the bundle sized to
+its own achieved rate.
+
 ## PI Dossier — 2026-07-27 — PI tab reorganised around a planner
 
 The tab had grown into a wall of panels with the answer buried in the middle:
