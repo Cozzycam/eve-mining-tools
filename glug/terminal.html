@@ -31,6 +31,14 @@ h1 small { display:block; font-size:10px; color:var(--dim); font-weight:400; let
           background:#0a0c10; object-fit:cover; display:none; }
 #nameplate b { font-size:15px; letter-spacing:.08em; color:var(--glug); }
 #nameplate div div { font-size:11px; color:var(--dim); }
+#decknav { position:absolute; right:12px; top:50%; transform:translateY(-70%);
+           display:flex; flex-direction:column; align-items:center; gap:4px; }
+#decknav button { padding:2px 10px; font-size:11px; background:#1c2129;
+                  color:var(--ink); border:1px solid var(--edge); }
+#decknav button:hover { background:#262c37; }
+#deck-label { font:9.5px Consolas,monospace; color:var(--glug); letter-spacing:.08em;
+              background:#0009; padding:2px 6px; border-radius:4px; white-space:pre; }
+#crew tr { cursor:pointer; }
 #dockbadge { position:absolute; right:14px; top:12px; font-size:10px; letter-spacing:.14em;
              padding:3px 9px; border-radius:4px; background:#0009; border:1px solid var(--edge);
              color:var(--dim); pointer-events:none; }
@@ -92,6 +100,8 @@ footer { margin-top:14px; color:#454c58; font-size:10.5px; letter-spacing:.06em;
   <div id="dockbadge">…</div>
   <div id="nameplate"><img id="np-img" alt="">
     <div><b id="np-name">…</b><div id="np-sub">…</div></div></div>
+  <div id="decknav"><button id="deck-up">▲</button>
+    <div id="deck-label">…</div><button id="deck-down">▼</button></div>
 </div>
 
 <div class="grid">
@@ -162,19 +172,22 @@ function renderPanels(){
     $("np-name").textContent = (c.ship_name||"UNREGISTERED VESSEL").toUpperCase();
     const mass = it.mass ? fmt(it.mass/1000) + " t" : "";
     $("np-sub").textContent = `${c.ship_type||"?"}-class ${it.ship_class}` +
-      ` · ≈${fmt(it.length_m)} m · est. complement ${fmt(it.complement)} souls · ${mass}`;
+      ` · ≈${fmt(it.length_m)}×${fmt(it.height_m)} m · ${it.n_decks} decks` +
+      ` · est. complement ${fmt(it.complement)} souls · ${mass}`;
     if (it.type_id){
       const src = `https://images.evetech.net/types/${it.type_id}/render?size=64`;
       if (img.src !== src) img.src = src;
       img.style.display = "block";
     } else img.style.display = "none";
   }
-  $("crew").innerHTML = S.crew.map(m =>
-    `<tr><td><span class="dept-dot" style="background:${DEPT_COLOR[m.dept]||"#888"}"></span>
-     <b>${m.name}</b><br><span class="tag">${m.dept}</span></td>
+  $("crew").innerHTML = S.crew.map((m, i) =>
+    `<tr onclick="locateCrew(${i})" title="Click to locate on ship">
+     <td><span class="dept-dot" style="background:${DEPT_COLOR[m.dept]||"#888"}"></span>
+     <b>${m.name}</b> <span class="tag" id="crew-deck-${i}"></span><br>
+     <span class="tag">${m.dept}</span></td>
      <td>L${m.level}</td><td class="dim">${fmt(m.rate)} u/hr</td>
      <td style="text-align:right"><button class="mini" ${S.scrip<m.train_cost?"disabled":""}
-       onclick='act({action:"train",id:${m.id}})'>Train ${fmt(m.train_cost)}</button></td></tr>`).join("");
+       onclick='event.stopPropagation();act({action:"train",id:${m.id}})'>Train ${fmt(m.train_cost)}</button></td></tr>`).join("");
   $("queue").innerHTML = S.orders.length ? S.orders.map(o =>
     `<tr><td><span class="tag">${o.kind}</span></td><td>${o.label}</td>
      <td style="width:80px"><div class="bar"><i style="width:${o.pct.toFixed(1)}%"></i></div></td>
@@ -277,55 +290,68 @@ window.addEventListener("resize", resize);
 const stars = Array.from({length:90}, () => ({x:Math.random(), y:Math.random(),
   r:Math.random()*1.3+0.3, tw:Math.random()*6}));
 
-let agents = [], layoutKey = "";
+let agents = [], layoutKey = "", deckIdx = 0;
 const worldW = () => (S ? S.interior.length_m*PPM : 0);
-function roomPx(r){ const d = DECKS[r.deck];
-  return {x:r.x*PPM, y:d.y, w:r.w*PPM, h:d.h, kind:r.kind, label:r.label, deck:r.deck}; }
+const nDecks = () => (S ? S.interior.n_decks : 2);
+// world room rect in px for a room on a VISIBLE row (0=upper, 1=lower)
+function roomPx(r, row){ const d = DECKS[row];
+  return {x:r.x*PPM, y:d.y, w:r.w*PPM, h:d.h, kind:r.kind, label:r.label}; }
 function clampOff(){
   if (worldW() <= W){ off = (worldW()-W)/2; return; }
   off = Math.max(0, Math.min(off, worldW()-W));
 }
+function setDeck(d){ deckIdx = Math.max(0, Math.min(d, nDecks()-2)); }
+$("deck-up").onclick = () => setDeck(deckIdx-1);
+$("deck-down").onclick = () => setDeck(deckIdx+1);
 
 function syncAgents(){
   const it = S.interior,
-    key = JSON.stringify([it.rooms.map(r=>r.kind+r.x), S.crew.map(c=>c.id)]);
+    key = JSON.stringify([it.type_id, it.n_decks, S.crew.map(c=>c.id)]);
   if (key === layoutKey) return;
   layoutKey = key;
   agents = [];
-  const rooms = it.rooms.map(roomPx);
+  setDeck(deckIdx);
   const named = S.crew.slice(0, 24);
-  const anon = Math.min(80, Math.round(it.length_m/18));  // contractor density
+  // contractors across every deck of the whole hull
+  const anon = Math.min(300, Math.round(it.length_m/18 * Math.max(1, it.n_decks/6)));
+  const deckRooms = d => it.rooms.filter(r => r.deck === d);
+  const decksWithRooms = [...new Set(it.rooms.map(r => r.deck))];
   const mk = (name, color, dark, isAnon) => {
-    const ri = Math.floor(Math.random()*rooms.length), r = rooms[ri];
-    agents.push({ name, color, dark, anon:isAnon, ri, dir:1,
-      x:r.x + Math.random()*r.w, dwell: 1+Math.random()*4,
+    const d = decksWithRooms[Math.floor(Math.random()*decksWithRooms.length)];
+    const rs = deckRooms(d), r = rs[Math.floor(Math.random()*rs.length)];
+    agents.push({ name, color, dark, anon:isAnon, deck:d, room:r, dir:1,
+      x:(r.x + Math.random()*r.w)*PPM, dwell: 1+Math.random()*4,
       speed: 26+Math.random()*18, phase: Math.random()*7 });
   };
   named.forEach(c => mk(c.name.split(" ")[0], DEPT_COLOR[c.dept]||"#999",
                         DEPT_DARK[c.dept]||"#555", false));
   for (let i=0;i<anon;i++) mk(null, "#3d434e", "#2c313b", true);
-  if (!offInit){ off = worldW(); clampOff(); offInit = true; }  // start at the bow
+  if (!offInit){
+    // open on the bridge deck, scrolled to the bridge
+    const br = it.rooms.find(r => r.kind === "bridge");
+    if (br){ setDeck(br.deck); off = br.x*PPM - W/2; } else off = worldW();
+    clampOff(); offInit = true;
+  }
 }
 
 function stepAgents(dt){
   if (!S) return;
-  const rooms = S.interior.rooms.map(roomPx);
+  const it = S.interior;
   const active = new Set();
   for (const o of (S.orders||[])) (WORK_ROOMS[o.kind]||[]).forEach(k=>active.add(k));
   for (const a of agents){
-    a.room = rooms[a.ri] || rooms[0];
+    if (a.deck < deckIdx-1 || a.deck > deckIdx+2) continue;  // step near-view only
     if (a.tx == null){
       a.dwell -= dt;
       if (a.dwell <= 0){
-        // contractors wander locally; named crew roam and chase active work
-        const sameDeck = rooms.map((r,i)=>({r,i})).filter(o =>
-          o.r.deck === a.room.deck &&
-          (!a.anon || Math.abs(o.r.x - a.room.x) < 120*PPM));
-        const hot = sameDeck.filter(o => active.has(o.r.kind));
+        // contractors wander locally; named crew roam their deck chasing work
+        const sameDeck = it.rooms.filter(r => r.deck === a.deck &&
+          (!a.anon || Math.abs(r.x*PPM - a.x) < 120*PPM));
+        const hot = sameDeck.filter(r => active.has(r.kind));
         const pool = (!a.anon && hot.length && Math.random() < 0.75) ? hot : sameDeck;
         const dest = pool[Math.floor(Math.random()*pool.length)];
-        if (dest){ a.ri = dest.i; a.room = dest.r;
-          a.tx = dest.r.x + 8 + Math.random()*(dest.r.w-16); }
+        if (dest){ a.room = dest;
+          a.tx = (dest.x + 2)*PPM + Math.random()*(dest.w-4)*PPM; }
         else a.dwell = 2;
       }
     } else {
@@ -346,7 +372,8 @@ cv.addEventListener("wheel", e => { e.preventDefault();
   off += (e.deltaY + e.deltaX); clampOff(); }, {passive:false});
 const mm = $("minimap");
 function mmJump(e){ const r = mm.getBoundingClientRect();
-  off = ((e.clientX - r.left) / r.width) * worldW() - W/2; clampOff(); }
+  off = ((e.clientX - r.left) / r.width) * worldW() - W/2; clampOff();
+  setDeck(Math.round(((e.clientY - r.top) / r.height) * nDecks()) - 1); }
 mm.addEventListener("pointerdown", e => { mmJump(e); mm.setPointerCapture(e.pointerId); mm._d = 1; });
 mm.addEventListener("pointermove", e => { if (mm._d) mmJump(e); });
 mm.addEventListener("pointerup", () => mm._d = 0);
@@ -379,8 +406,7 @@ const SPR_CONSOLE = ["..OOOOOO..","..OWWWWO..","..OWwWWO..","..OOOOOO..",
 const SPR_PAL = {O:"#080a0f", G:"#ffd23e", K:"#20242e", k:"#ffd23e",
                  C:"#39415a", W:"#9fd6ff"};
 
-function drawAgent(a, t){
-  const floor = a.room.y + a.room.h - 2;
+function drawAgent(a, t, floor){
   const walking = a.tx != null;
   const legs = !walking ? LEGS_IDLE
     : (Math.floor(t*8+a.phase)%2 ? LEGS_W1 : LEGS_W2);
@@ -523,67 +549,70 @@ function draw(t){
   const it = S.interior, WW = worldW(), docked = S.ceo.docked;
 
   ctx.save(); ctx.translate(-Math.round(off), 0);
-  // hull body — full real length in world coords
-  ctx.fillStyle = "#101319";
-  ctx.beginPath();
-  ctx.moveTo(-14, HULL_TOP+30);
-  ctx.quadraticCurveTo(-14, HULL_TOP, 40, HULL_TOP);
-  ctx.lineTo(WW-90, HULL_TOP);
-  ctx.quadraticCurveTo(WW+26, (HULL_TOP+HULL_BOT)/2, WW-90, HULL_BOT);
-  ctx.lineTo(40, HULL_BOT);
-  ctx.quadraticCurveTo(-14, HULL_BOT, -14, HULL_BOT-30);
-  ctx.closePath(); ctx.fill();
-  ctx.strokeStyle = "#39404e"; ctx.lineWidth = 3; ctx.stroke();
-  ctx.strokeStyle = "#1c212b"; ctx.lineWidth = 4;   // deck divider
-  ctx.beginPath(); ctx.moveTo(20, 172); ctx.lineTo(WW-70, 172); ctx.stroke();
-  if (!docked && it.archetype !== "hq"){   // stern engine glow
-    const p = 0.6+Math.sin(t*9)*0.25;
-    for (const ey of [70, 220]){
-      const grad = ctx.createLinearGradient(-54, 0, -12, 0);
-      grad.addColorStop(0, "rgba(106,176,243,0)");
-      grad.addColorStop(1, `rgba(106,176,243,${p*0.55})`);
-      ctx.fillStyle = grad; ctx.fillRect(-54, ey, 42, 50);
-    }
-  }
-
   const active = new Set();
   for (const o of (S.orders||[])) (WORK_ROOMS[o.kind]||[]).forEach(k=>active.add(k));
-
   ctx.textBaseline = "alphabetic";
-  for (const r0 of it.rooms){
-    const r = roomPx(r0);
-    if (r.x + r.w < off - 60 || r.x > off + W + 60) continue;   // cull
-    ctx.fillStyle = "#151a22";
-    ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.fill();
-    const hot = active.has(r.kind);
-    ctx.strokeStyle = hot ? `rgba(255,210,62,${0.45+Math.sin(t*4)*0.25})` : "#232936";
-    ctx.lineWidth = hot ? 2 : 1.5;
-    ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.stroke();
-    ctx.strokeStyle = "#2a303c"; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(r.x+2, r.y+r.h-2); ctx.lineTo(r.x+r.w-2, r.y+r.h-2); ctx.stroke();
-    (PROPS[r.kind]||prop_console_room)(r, t);
-    ctx.font = "9.5px Segoe UI"; ctx.textAlign = "left";
-    ctx.fillStyle = hot ? "#c8a832" : "#525a68";
-    ctx.fillText(r.label.toUpperCase(), r.x+5, r.y+11);
-    if (hot){
-      for (let i=0;i<2;i++){
-        const my = (t*14+i*9) % (r.h-18);
-        ctx.fillStyle = "rgba(255,210,62,0.5)";
-        ctx.beginPath(); ctx.arc(r.x+r.w-8, r.y+r.h-6-my, 1.5, 0, 7); ctx.fill();
+
+  for (let row = 0; row < 2; row++){
+    const d = deckIdx + row, band = DECKS[row];
+    const spans = (it.decks[d] && it.decks[d].spans) || [];
+    for (const [x0m, x1m] of spans){   // hull band segments for this deck
+      const x0 = x0m*PPM, x1 = x1m*PPM;
+      if (x1 < off - 80 || x0 > off + W + 80) continue;
+      ctx.fillStyle = "#101319";
+      ctx.beginPath(); ctx.roundRect(x0-14, band.y-9, x1-x0+28, band.h+18, 12); ctx.fill();
+      ctx.strokeStyle = "#39404e"; ctx.lineWidth = 3; ctx.stroke();
+      if (!docked && x0m < 5){   // engine glow off the sternmost segments
+        const p = 0.6+Math.sin(t*9)*0.25;
+        const grad = ctx.createLinearGradient(x0-52, 0, x0-12, 0);
+        grad.addColorStop(0, "rgba(106,176,243,0)");
+        grad.addColorStop(1, `rgba(106,176,243,${p*0.55})`);
+        ctx.fillStyle = grad; ctx.fillRect(x0-52, band.y+30, 40, band.h-60);
       }
     }
-    if (r.kind === "training_pod" && S.ceo.training){
-      ctx.font = "8.5px Segoe UI"; ctx.textAlign = "center";
-      ctx.fillStyle = "#4a90c2";
-      ctx.fillText(trainingText().split("— ")[1]||"", r.x+r.w/2, r.y+r.h+10);
+    ctx.font = "9px Consolas,monospace"; ctx.textAlign = "left";
+    ctx.fillStyle = "#39404e";
+    ctx.fillText(`DECK ${String(d+1).padStart(2,"0")}`, off+6, band.y-14);
+
+    for (const r0 of it.rooms){
+      if (r0.deck !== d) continue;
+      const r = roomPx(r0, row);
+      if (r.x + r.w < off - 60 || r.x > off + W + 60) continue;
+      ctx.fillStyle = "#151a22";
+      ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.fill();
+      const hot = active.has(r.kind);
+      ctx.strokeStyle = hot ? `rgba(255,210,62,${0.45+Math.sin(t*4)*0.25})` : "#232936";
+      ctx.lineWidth = hot ? 2 : 1.5;
+      ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.stroke();
+      ctx.strokeStyle = "#2a303c"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(r.x+2, r.y+r.h-2); ctx.lineTo(r.x+r.w-2, r.y+r.h-2); ctx.stroke();
+      (PROPS[r.kind]||prop_console_room)(r, t);
+      ctx.font = "9.5px Segoe UI"; ctx.textAlign = "left";
+      ctx.fillStyle = hot ? "#c8a832" : "#525a68";
+      ctx.fillText(r.label.toUpperCase(), r.x+5, r.y+11);
+      if (hot){
+        for (let i=0;i<2;i++){
+          const my = (t*14+i*9) % (r.h-18);
+          ctx.fillStyle = "rgba(255,210,62,0.5)";
+          ctx.beginPath(); ctx.arc(r.x+r.w-8, r.y+r.h-6-my, 1.5, 0, 7); ctx.fill();
+        }
+      }
+      if (r.kind === "training_pod" && S.ceo.training){
+        ctx.font = "8.5px Segoe UI"; ctx.textAlign = "center";
+        ctx.fillStyle = "#4a90c2";
+        ctx.fillText(trainingText().split("— ")[1]||"", r.x+r.w/2, r.y+r.h+10);
+      }
     }
-  }
-  for (const a of agents){
-    if (a.x < off - 40 || a.x > off + W + 40) continue;   // cull
-    drawAgent(a, t);
+    for (const a of agents){
+      if (a.deck !== d) continue;
+      if (a.x < off - 40 || a.x > off + W + 40) continue;
+      drawAgent(a, t, band.y + band.h - 2);
+    }
   }
   ctx.restore();
   drawRuler();
+  $("deck-label").textContent =
+    `DECKS ${String(deckIdx+1).padStart(2,"0")}–${String(deckIdx+2).padStart(2,"0")}\n  OF ${it.n_decks}`;
 }
 
 function drawRuler(){
@@ -609,25 +638,51 @@ function drawMinimap(){
   g.setTransform(dpr,0,0,dpr,0,0);
   g.fillStyle = "#0a0c10"; g.fillRect(0,0,mw,mh);
   if (!S) return;
-  const WW = worldW(), sc = (mw-24)/WW, x0 = 12;
+  const it = S.interior, WW = worldW(), sc = (mw-24)/WW, x0 = 12;
+  const y0 = 5, yh = mh - 10, nd = it.n_decks;
+  // real silhouette from the traced profile columns
   g.fillStyle = "#1a1f29"; g.strokeStyle = "#39404e"; g.lineWidth = 1.5;
   g.beginPath();
-  g.moveTo(x0, 14); g.lineTo(x0+WW*sc*0.93, 12);
-  g.quadraticCurveTo(x0+WW*sc+5, 24, x0+WW*sc*0.93, 36);
-  g.lineTo(x0, 34); g.closePath(); g.fill(); g.stroke();
+  it.columns.forEach(([x, top], i) => {
+    const px = x0 + x*WW*sc, py = y0 + top*yh;
+    i ? g.lineTo(px, py) : g.moveTo(px, py);
+  });
+  [...it.columns].reverse().forEach(([x,, bot]) =>
+    g.lineTo(x0 + x*WW*sc, y0 + bot*yh));
+  g.closePath(); g.fill(); g.stroke();
+  // hot rooms glow at their true deck depth
   const active = new Set();
   for (const o of (S.orders||[])) (WORK_ROOMS[o.kind]||[]).forEach(k=>active.add(k));
-  for (const r0 of S.interior.rooms){
-    g.fillStyle = active.has(r0.kind) ? "#ffd23e" : "#2c3340";
-    g.fillRect(x0 + r0.x*PPM*sc, r0.deck ? 26 : 18, Math.max(1.5, r0.w*PPM*sc), 5);
+  for (const r0 of it.rooms){
+    if (!active.has(r0.kind)) continue;
+    g.fillStyle = "#ffd23e";
+    g.fillRect(x0 + r0.x*PPM*sc, y0 + (r0.deck/nd)*yh,
+               Math.max(1.5, r0.w*PPM*sc), Math.max(1, yh/nd));
   }
   for (const a of agents) if (!a.anon){
-    g.fillStyle = a.color; g.fillRect(x0 + a.x*sc - 1, 22, 2.5, 4);
+    g.fillStyle = a.color;
+    g.fillRect(x0 + a.x*sc - 1, y0 + (a.deck/nd)*yh - 1, 2.5, 3);
   }
+  // viewport: x range and current deck band
   g.strokeStyle = "#ffd23e"; g.lineWidth = 1.5;
-  g.strokeRect(x0 + off*sc, 3, Math.max(8, W*sc), 42);
+  g.strokeRect(x0 + off*sc, y0 + (deckIdx/nd)*yh - 1,
+               Math.max(8, W*sc), Math.max(4, (2/nd)*yh) + 2);
 }
 function prop_console_room(r,t){ prop_console(r.x+r.w/2, r.y+r.h-4, t); }
+
+function locateCrew(i){
+  const a = agents[i];
+  if (!a || a.anon) return;
+  setDeck(a.deck > 0 && a.deck === nDecks()-1 ? a.deck-1 : a.deck);
+  off = a.x - W/2; clampOff();
+  toast(`${a.name} located — Deck ${String(a.deck+1).padStart(2,"0")}.`);
+}
+function updateDeckBadges(){
+  S.crew.slice(0, 24).forEach((m, i) => {
+    const el = $("crew-deck-"+i), a = agents[i];
+    if (el && a) el.textContent = "D"+String(a.deck+1).padStart(2,"0");
+  });
+}
 
 let last = performance.now();
 function frame(now){
@@ -640,7 +695,7 @@ function frame(now){
 async function refresh(){
   try {
     S = await (await fetch("/api/state")).json();
-    syncAgents(); renderPanels();
+    syncAgents(); renderPanels(); updateDeckBadges();
   } catch(e) { /* server briefly away; keep last state */ }
 }
 resize(); refresh(); setInterval(refresh, 10000);

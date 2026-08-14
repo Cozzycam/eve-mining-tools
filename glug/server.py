@@ -72,20 +72,74 @@ GROUP_LENGTHS = [
 ]
 TIER_LENGTHS = {1: 80, 2: 250, 3: 500, 4: 1100, 5: 3600}
 
-# Per-hull overrides (Campbell-calibrated) — beat the class table.
-SHIP_LENGTHS = {
-    12731: 800,   # Bustard
+DECK_PITCH = 6.0   # metres per deck (industrial hulls have tall holds)
+
+# Hand-traced hull profiles from Campbell's in-game side shots.
+# columns: (x_frac stern→bow, top_frac, bot_frac) — 0 = top of hull envelope.
+# A deck exists at x where its band lies inside [top, bot].
+SHIP_PROFILES = {
+    12731: {   # Bustard — traced from the 775 m profile shot (2026-08-15)
+        "length_m": 775, "height_m": 220,
+        "columns": [
+            (0.00, 0.06, 0.88), (0.07, 0.06, 0.88),
+            (0.08, 0.00, 0.92), (0.27, 0.00, 0.92),
+            (0.30, 0.02, 0.75), (0.33, 0.02, 1.00),
+            (0.70, 0.02, 1.00), (0.73, 0.02, 0.70),
+            (0.88, 0.02, 0.70), (0.93, 0.09, 0.68),
+            (1.00, 0.14, 0.66),
+        ],
+        "bridge_at": "stern",
+    },
 }
 
 
 def hull_length(type_id, group_name, tier):
-    if type_id in SHIP_LENGTHS:
-        return SHIP_LENGTHS[type_id]
+    if type_id in SHIP_PROFILES:
+        return SHIP_PROFILES[type_id]["length_m"]
     g = (group_name or "").lower()
     for key, metres in GROUP_LENGTHS:
         if key in g:
             return metres
     return TIER_LENGTHS[tier]
+
+
+def fallback_profile(length, archetype):
+    """Generic boxy hull for un-traced ships: bow taper, stern shoulder."""
+    return {
+        "length_m": length,
+        "height_m": max(12.0, min(400.0, length * 0.24)),
+        "columns": [
+            (0.00, 0.10, 0.90), (0.04, 0.00, 1.00),
+            (0.90, 0.00, 1.00), (1.00, 0.18, 0.82),
+        ],
+        "bridge_at": "bow",
+    }
+
+
+def _interp_cols(cols, x):
+    for i in range(len(cols) - 1):
+        (x0, t0, b0), (x1, t1, b1) = cols[i], cols[i + 1]
+        if x0 <= x <= x1:
+            f = 0 if x1 == x0 else (x - x0) / (x1 - x0)
+            return t0 + (t1 - t0) * f, b0 + (b1 - b0) * f
+    return cols[-1][1], cols[-1][2]
+
+
+def deck_spans(cols, tf, bf, length, samples=160):
+    """x-ranges (metres) where the deck band [tf, bf] fits inside the hull."""
+    spans, start = [], None
+    for i in range(samples + 1):
+        x = i / samples
+        top, bot = _interp_cols(cols, x)
+        ok = top <= tf + 1e-6 and bot >= bf - 1e-6
+        if ok and start is None:
+            start = x
+        if (not ok or i == samples) and start is not None:
+            end = x if not ok else 1.0
+            if (end - start) * length >= 10:   # ignore slivers under 10 m
+                spans.append((round(start * length, 1), round(end * length, 1)))
+            start = None
+    return spans
 
 
 def build_interior(ship_type_id, training):
@@ -113,42 +167,55 @@ def build_interior(ship_type_id, training):
             {"kind": "vault", "label": "Scrip Vault", "deck": 1, "x": 47, "w": 12},
             ]
         return {"archetype": "hq", "tier": 0, "complement": 0, "length_m": 60,
+                "height_m": 12, "n_decks": 2, "deck_pitch": DECK_PITCH,
+                "decks": [{"spans": [(0, 60)]}, {"spans": [(0, 60)]}],
+                "columns": [(0, 0, 1), (1, 0, 1)],
                 "ship_class": "Corporate Headquarters", "mass": None,
                 "type_id": None, "rooms": rooms}
 
     L = hull_length(ship_type_id, group.get("name"), tier)
-    stern = L * 0.09          # engineering zone
-    bow = L * 0.07            # bridge zone
-    rooms = [
-        {"kind": "engineering", "label": "Engineering", "deck": 1,
-         "x": 1, "w": round(stern - 2, 1)},
-        {"kind": "bridge", "label": "Bridge", "deck": 0,
-         "x": round(L - bow, 1), "w": round(bow - 1, 1)},
-    ]
-    if training:
-        w = min(30, L * 0.05)
-        rooms.append({"kind": "training_pod", "label": "Executive Pod", "deck": 0,
-                      "x": round(L - bow - w - 2, 1), "w": round(w, 1)})
-
+    prof = SHIP_PROFILES.get(ship_type_id) or fallback_profile(L, archetype)
+    n_decks = max(2, round(prof["height_m"] / DECK_PITCH))
     role_pool = ROLE_ROOMS[archetype]
-    upper_pool = ["mess", "bunks"] + role_pool[:1]
+    support = ["mess", "bunks"]
+    rooms, decks = [], []
+    bridge_done, pod_done = False, not training
 
-    def fill(deck, pool, start, end, i0=0):
-        x, i = start, i0
-        while x < end - 12:
-            w = min(rng.uniform(35, 65), end - x - 2)
-            kind = pool[i % len(pool)]
-            rooms.append({"kind": kind, "label": ROOM_LABELS.get(kind, kind.title()),
-                          "deck": deck, "x": round(x, 1), "w": round(w, 1)})
-            x += w + 2.5
-            i += 1
-
-    fill(1, role_pool, stern + 2, L - bow - 2)
-    up_end = L - bow - (34 if training else 2)
-    fill(0, upper_pool, 2, up_end, i0=rng.randrange(3))
+    for d in range(n_decks):
+        tf, bf = d / n_decks, (d + 1) / n_decks
+        spans = deck_spans(prof["columns"], tf, bf, L)
+        decks.append({"spans": spans})
+        if not spans:
+            continue
+        frac = d / max(1, n_decks - 1)
+        rngd = _r.Random(ship_type_id * 1000 + d)
+        eng = frac > 0.82
+        for (x0, x1) in spans:
+            x, i = x0 + 2, rngd.randrange(4)
+            while x < x1 - 12:
+                w = min(rngd.uniform(35, 65), x1 - x - 2)
+                if not bridge_done and (
+                        (prof["bridge_at"] == "stern" and x0 < L * 0.3) or
+                        (prof["bridge_at"] == "bow" and x1 > L * 0.7)):
+                    kind, bridge_done = "bridge", True
+                elif bridge_done and not pod_done:
+                    kind, pod_done = "training_pod", True
+                    w = min(w, 30)
+                elif eng:
+                    kind = "engineering"
+                else:
+                    kind = role_pool[i % len(role_pool)] if i % 3 else support[i % 2]
+                rooms.append({"kind": kind,
+                              "label": ROOM_LABELS.get(kind, kind.title()),
+                              "deck": d, "x": round(x, 1), "w": round(w, 1)})
+                x += w + 2.5
+                i += 1
 
     return {"archetype": archetype, "tier": tier,
             "complement": COMPLEMENT[archetype][tier], "length_m": L,
+            "height_m": prof["height_m"], "n_decks": n_decks,
+            "deck_pitch": DECK_PITCH, "decks": decks,
+            "columns": prof["columns"],
             "ship_class": group.get("name", "?"), "mass": info.get("mass"),
             "type_id": ship_type_id, "rooms": rooms}
 
