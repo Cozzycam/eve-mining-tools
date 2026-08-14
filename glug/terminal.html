@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLUG&trade; Internal Operations Terminal</title>
+<style>
+:root { --bg:#0c0e12; --panel:#14171d; --panel2:#181c23; --edge:#262b35;
+        --ink:#c9cfd9; --dim:#6b7482; --glug:#ffd23e; --glug-dk:#b8921c;
+        --ok:#7bd88f; --warn:#e5484d; --blue:#6ab0f3; }
+* { box-sizing:border-box; margin:0; }
+body { background:var(--bg); color:var(--ink);
+       font:14px/1.45 "Segoe UI",system-ui,sans-serif; }
+.wrap { max-width:1280px; margin:0 auto; padding:14px 16px 24px; }
+header { display:flex; align-items:center; gap:12px; padding:4px 2px 12px; }
+.logo { width:42px; height:42px; border-radius:50%; background:var(--glug); flex:none;
+        display:flex; align-items:center; justify-content:center;
+        font-size:26px; color:#15130a; box-shadow:0 0 18px #ffd23e33; }
+h1 { font-size:16px; letter-spacing:.07em; }
+h1 small { display:block; font-size:10px; color:var(--dim); font-weight:400; letter-spacing:.18em; }
+.head-scrip { margin-left:auto; text-align:right; }
+.head-scrip b { display:block; font-size:22px; color:var(--glug); font-variant-numeric:tabular-nums; }
+.head-scrip span { font-size:10px; color:var(--dim); letter-spacing:.14em; }
+#stage { position:relative; border:1px solid var(--edge); border-radius:10px;
+         overflow:hidden; background:#07080b; }
+#diorama { display:block; width:100%; height:400px; }
+#nameplate { position:absolute; left:14px; bottom:10px; pointer-events:none;
+             text-shadow:0 1px 4px #000; }
+#nameplate b { font-size:15px; letter-spacing:.08em; color:var(--glug); }
+#nameplate div { font-size:11px; color:var(--dim); }
+#dockbadge { position:absolute; right:14px; top:12px; font-size:10px; letter-spacing:.14em;
+             padding:3px 9px; border-radius:4px; background:#0009; border:1px solid var(--edge);
+             color:var(--dim); pointer-events:none; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+        gap:12px; margin-top:12px; }
+.panel { background:var(--panel); border:1px solid var(--edge); border-radius:10px; padding:12px 14px; }
+.panel h2 { font-size:10px; color:var(--dim); letter-spacing:.16em; text-transform:uppercase;
+            margin-bottom:9px; display:flex; justify-content:space-between; }
+.kv { display:flex; justify-content:space-between; padding:2.5px 0; gap:10px; }
+.kv span:first-child { color:var(--dim); flex:none; }
+.kv b { text-align:right; font-weight:600; }
+table { width:100%; border-collapse:collapse; }
+td { padding:4.5px 6px 4.5px 0; vertical-align:middle; }
+tr + tr td { border-top:1px solid #1d222b; }
+.dim { color:var(--dim); } .pos { color:var(--ok); } .neg { color:var(--warn); }
+.bar { background:var(--edge); border-radius:4px; height:7px; overflow:hidden; min-width:64px; }
+.bar i { display:block; height:100%; background:var(--glug); }
+button { background:var(--glug); color:#15130a; border:0; border-radius:6px;
+         padding:6px 14px; font-weight:700; cursor:pointer; font-size:13px; }
+button:hover { filter:brightness(1.08); }
+button.mini { padding:2px 9px; font-size:11.5px; font-weight:600; }
+button:disabled { opacity:.35; cursor:default; }
+.tag { font-size:9.5px; padding:1px 6px; border-radius:3px; background:var(--edge);
+       color:var(--dim); text-transform:uppercase; letter-spacing:.08em; }
+.dept-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+#toast { position:fixed; bottom:18px; right:18px; background:var(--glug); color:#15130a;
+         padding:10px 16px; border-radius:7px; font-weight:700; display:none; z-index:9;
+         box-shadow:0 4px 18px #000a; }
+footer { margin-top:14px; color:#454c58; font-size:10.5px; letter-spacing:.06em; text-align:center; }
+</style></head><body><div class="wrap">
+<header>
+  <div class="logo">&#9786;</div>
+  <h1>GLUG&trade; INTERNAL OPERATIONS TERMINAL
+    <small>NOURISHING WORKERS &middot; DEFENDING MARGINS</small></h1>
+  <div class="head-scrip"><b id="scrip">…</b><span>COMPANY SCRIP (GS)</span></div>
+</header>
+
+<div id="stage">
+  <canvas id="diorama"></canvas>
+  <div id="dockbadge">…</div>
+  <div id="nameplate"><b id="np-name">…</b><div id="np-sub">…</div></div>
+</div>
+
+<div class="grid">
+  <div class="panel"><h2>Company</h2>
+    <div class="kv"><span>Company age</span><b id="age">…</b></div>
+    <div class="kv"><span>Work orders open / filled</span><b id="orders-n">…</b></div>
+    <div style="margin-top:9px"><button id="hire">Hire crew</button>
+      <span class="dim" id="hire-cost"></span></div>
+  </div>
+  <div class="panel"><h2>Executive Status</h2>
+    <div class="kv"><span>CEO</span><b id="ceo-online">…</b></div>
+    <div class="kv"><span>Location</span><b id="ceo-sys">…</b></div>
+    <div class="kv"><span>Corporate treasury</span><b id="ceo-wallet">…</b></div>
+    <div class="kv"><span>Executive development</span><b id="ceo-train">…</b></div>
+  </div>
+  <div class="panel"><h2>Crew Roster</h2><table id="crew"></table></div>
+  <div class="panel"><h2>Work Order Queue</h2><table id="queue"></table></div>
+  <div class="panel" style="grid-column:1/-1"><h2>Scrip Ledger</h2><table id="ledger"></table></div>
+</div>
+<footer>GLUG&trade; IS A FAMILY COMPANY &middot; THIS TERMINAL IS MONITORED FOR YOUR CONVENIENCE</footer>
+</div>
+<div id="toast"></div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const fmt = (n,d=0) => n==null ? "—" : n.toLocaleString(undefined,{maximumFractionDigits:d});
+const DEPT_COLOR = { "Logistics":"#6ab0f3", "Catering":"#7bd88f",
+  "Safety & Compliance":"#ffd23e", "Marketing":"#e58ae5", "R&D":"#9f8af3" };
+let S = null;
+
+function toast(msg){ const t=$("toast"); t.textContent=msg; t.style.display="block";
+  clearTimeout(t._h); t._h=setTimeout(()=>t.style.display="none",3500); }
+async function act(body){ const r=await fetch("/api/action",{method:"POST",body:JSON.stringify(body)});
+  toast((await r.json()).msg); refresh(); }
+$("hire").onclick = () => act({action:"hire"});
+
+// ── Panels ───────────────────────────────────────────────────
+function renderPanels(){
+  $("scrip").textContent = fmt(S.scrip);
+  $("age").textContent = S.age_days.toFixed(1) + " days";
+  $("orders-n").textContent = S.n_open + " / " + S.n_done;
+  $("hire-cost").textContent = " " + fmt(S.hire_cost) + " GS";
+  $("hire").disabled = S.scrip < S.hire_cost;
+  const c = S.ceo, it = S.interior;
+  $("ceo-online").textContent = c.online ? "ON DECK" : "OFF PREMISES";
+  $("ceo-online").style.color = c.online ? "var(--ok)" : "var(--dim)";
+  $("ceo-sys").textContent = (c.system||"—") + (c.docked ? " · docked" : c.system ? " · in space" : "");
+  $("ceo-wallet").textContent = fmt(c.wallet) + " ISK";
+  $("dockbadge").textContent = c.docked ? "DOCKED — " + (c.system||"") : "UNDER WAY — " + (c.system||"");
+  if (it.archetype === "hq") {
+    $("np-name").textContent = "GLUG CORPORATE HEADQUARTERS";
+    $("np-sub").textContent = "The CEO is commuting. Business continues.";
+  } else {
+    $("np-name").textContent = (c.ship_name||"UNREGISTERED VESSEL").toUpperCase();
+    const mass = it.mass ? fmt(it.mass/1000) + " t" : "";
+    $("np-sub").textContent = `${c.ship_type||"?"}-class ${it.ship_class}` +
+      ` · est. complement ${fmt(it.complement)} souls · ${mass}`;
+  }
+  $("crew").innerHTML = S.crew.map(m =>
+    `<tr><td><span class="dept-dot" style="background:${DEPT_COLOR[m.dept]||"#888"}"></span>
+     <b>${m.name}</b><br><span class="tag">${m.dept}</span></td>
+     <td>L${m.level}</td><td class="dim">${fmt(m.rate)} u/hr</td>
+     <td style="text-align:right"><button class="mini" ${S.scrip<m.train_cost?"disabled":""}
+       onclick='act({action:"train",id:${m.id}})'>Train ${fmt(m.train_cost)}</button></td></tr>`).join("");
+  $("queue").innerHTML = S.orders.length ? S.orders.map(o =>
+    `<tr><td><span class="tag">${o.kind}</span></td><td>${o.label}</td>
+     <td style="width:80px"><div class="bar"><i style="width:${o.pct.toFixed(1)}%"></i></div></td>
+     <td class="dim" style="text-align:right">${o.pct.toFixed(0)}%</td></tr>`).join("")
+    : `<tr><td class="dim">Queue clear. Crew engaged in enriching internal Glug contracts.</td></tr>`;
+  $("ledger").innerHTML = S.ledger.map(l =>
+    `<tr><td class="dim" style="width:56px">${l.age_h<1 ? Math.round(l.age_h*60)+"m" : l.age_h.toFixed(1)+"h"}</td>
+     <td class="${l.amount>=0?"pos":"neg"}" style="width:90px">${l.amount>=0?"+":""}${fmt(l.amount,1)}</td>
+     <td>${l.reason}</td></tr>`).join("");
+}
+function trainingText(){
+  const t = S && S.ceo.training;
+  if (!t) return "—";
+  const ms = new Date(t.finish) - Date.now();
+  if (ms <= 0) return `${t.skill} L${t.level} — complete`;
+  const h = Math.floor(ms/3.6e6), m = Math.floor(ms%3.6e6/6e4), s = Math.floor(ms%6e4/1e3);
+  return `${t.skill} L${t.level} — ${h}h ${String(m).padStart(2,"0")}m ${String(s).padStart(2,"0")}s`;
+}
+
+// ── Diorama ──────────────────────────────────────────────────
+const cv = $("diorama"), ctx = cv.getContext("2d");
+const dpr = window.devicePixelRatio || 1;
+let W = 0, H = 400;
+function resize(){ W = cv.clientWidth; cv.width = W*dpr; cv.height = H*dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0); }
+window.addEventListener("resize", resize);
+
+const stars = Array.from({length:90}, () => ({x:Math.random(), y:Math.random(),
+  r:Math.random()*1.3+0.3, tw:Math.random()*6}));
+
+let agents = [], layoutKey = "";
+function hull(){ const m = 46; return {x:m, y:26, w:W-2*m, h:H-100}; }
+function roomPx(r){ const h = hull();
+  return {x:h.x+r.x*h.w, y:h.y+r.y*h.h, w:r.w*h.w, h:r.h*h.h, kind:r.kind, label:r.label}; }
+
+function syncAgents(){
+  const it = S.interior, key = JSON.stringify([it.rooms.map(r=>r.kind), S.crew.map(c=>c.id)]);
+  if (key === layoutKey) return;
+  layoutKey = key;
+  agents = [];
+  const rooms = it.rooms.map(roomPx);
+  const named = S.crew.slice(0, 12);
+  const anon = Math.min(14, it.complement ? Math.round(Math.sqrt(it.complement)) : 0);
+  const mk = (name, color, isAnon) => {
+    const r = rooms[Math.floor(Math.random()*rooms.length)];
+    agents.push({ name, color, anon:isAnon, room:r,
+      x:r.x + Math.random()*r.w, dwell: 1+Math.random()*4,
+      speed: 26+Math.random()*18, phase: Math.random()*7 });
+  };
+  named.forEach(c => mk(c.name.split(" ")[0], DEPT_COLOR[c.dept]||"#999", false));
+  for (let i=0;i<anon;i++) mk(null, "#3d434e", true);
+}
+
+function stepAgents(dt){
+  if (!S) return;
+  const rooms = S.interior.rooms.map(roomPx);
+  for (const a of agents){
+    // keep the reference fresh after resize
+    a.room = rooms.find(r => r.label === a.room.label) || rooms[0];
+    const floor = a.room.y + a.room.h;
+    if (a.tx == null){
+      a.dwell -= dt;
+      if (a.dwell <= 0){
+        const sameDeck = rooms.filter(r => Math.abs((r.y+r.h) - floor) < 4);
+        const dest = sameDeck[Math.floor(Math.random()*sameDeck.length)] || a.room;
+        a.room = dest; a.tx = dest.x + 8 + Math.random()*(dest.w-16);
+      }
+    } else {
+      const dx = a.tx - a.x, step = a.speed*dt;
+      if (Math.abs(dx) <= step){ a.x = a.tx; a.tx = null; a.dwell = 2+Math.random()*6; }
+      else a.x += Math.sign(dx)*step;
+    }
+  }
+}
+
+function drawAgent(a, t){
+  const floor = a.room.y + a.room.h - 3;
+  const walking = a.tx != null;
+  const bob = walking ? Math.sin(t*14+a.phase)*1.2 : Math.sin(t*2.2+a.phase)*0.5;
+  const x = a.x, y = floor + bob;
+  ctx.save();
+  ctx.globalAlpha = a.anon ? 0.55 : 1;
+  // legs
+  ctx.strokeStyle = "#20242c"; ctx.lineWidth = 2;
+  const leg = walking ? Math.sin(t*14+a.phase)*3 : 0;
+  ctx.beginPath(); ctx.moveTo(x-2, y-7); ctx.lineTo(x-2+leg, y);
+  ctx.moveTo(x+2, y-7); ctx.lineTo(x+2-leg, y); ctx.stroke();
+  // body
+  ctx.fillStyle = a.color;
+  ctx.beginPath(); ctx.roundRect(x-3.5, y-14, 7, 8, 2); ctx.fill();
+  // head
+  ctx.fillStyle = "#e8caa2";
+  ctx.beginPath(); ctx.arc(x, y-17, 3.2, 0, 7); ctx.fill();
+  if (!a.anon && a.name){
+    ctx.font = "9px Segoe UI"; ctx.textAlign = "center";
+    ctx.fillStyle = "#9aa3b1"; ctx.fillText(a.name, x, y-23);
+  }
+  ctx.restore();
+}
+
+// per-room-kind props (t = seconds, r = px rect)
+const PROPS = {
+  bridge(r,t){ prop_console(r.x+r.w*0.55, r.y+r.h-4, t);
+    ctx.fillStyle="#28303e"; ctx.beginPath();
+    ctx.roundRect(r.x+r.w-16, r.y+6, 10, r.h-14, 3); ctx.fill(); },
+  mess(r,t){ // Glug vending machine + table
+    const vx=r.x+8, vy=r.y+r.h-26;
+    ctx.fillStyle="#ffd23e"; ctx.beginPath(); ctx.roundRect(vx,vy,14,22,2); ctx.fill();
+    ctx.fillStyle="#15130a"; ctx.font="10px Segoe UI"; ctx.textAlign="center";
+    ctx.fillText("☺", vx+7, vy+11);
+    ctx.strokeStyle="#3a4150"; ctx.lineWidth=2;
+    const tx=r.x+r.w*0.6, ty=r.y+r.h-10;
+    ctx.beginPath(); ctx.moveTo(tx-12,ty); ctx.lineTo(tx+12,ty);
+    ctx.moveTo(tx-8,ty); ctx.lineTo(tx-8,ty+7); ctx.moveTo(tx+8,ty); ctx.lineTo(tx+8,ty+7); ctx.stroke(); },
+  bunks(r){ ctx.strokeStyle="#3a4150"; ctx.lineWidth=2;
+    for (let i=0;i<2;i++){ const bx=r.x+8+i*(r.w-16)/2, by=r.y+r.h-8;
+      ctx.strokeRect(bx, by-14, Math.max(16,(r.w-24)/2), 5);
+      ctx.strokeRect(bx, by-6, Math.max(16,(r.w-24)/2), 5); } },
+  engineering(r,t){ const cx=r.x+r.w/2, cy=r.y+r.h/2, p=(Math.sin(t*3)+1)/2;
+    ctx.strokeStyle="#3a4150"; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.arc(cx,cy,Math.min(r.w,r.h)*0.24,0,7); ctx.stroke();
+    ctx.fillStyle=`rgba(123,216,143,${0.25+p*0.5})`;
+    ctx.beginPath(); ctx.arc(cx,cy,Math.min(r.w,r.h)*0.13,0,7); ctx.fill(); },
+  training_pod(r,t){ const cx=r.x+r.w/2, cy=r.y+r.h-16;
+    ctx.fillStyle="#1d2b38"; ctx.strokeStyle="#4a90c2"; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.ellipse(cx,cy,11,15,0,0,7); ctx.fill(); ctx.stroke();
+    ctx.fillStyle="#e8caa2"; ctx.beginPath(); ctx.arc(cx,cy-4,3,0,7); ctx.fill();
+    ctx.fillStyle=`rgba(106,176,243,${0.4+Math.sin(t*4)*0.3})`;
+    ctx.beginPath(); ctx.arc(cx,cy+16,1.6,0,7); ctx.fill(); },
+  intake(r,t){ ctx.strokeStyle="#3a4150"; ctx.lineWidth=2; // hopper + falling ore
+    const cx=r.x+r.w/2;
+    ctx.beginPath(); ctx.moveTo(cx-14,r.y+6); ctx.lineTo(cx+14,r.y+6);
+    ctx.lineTo(cx+5,r.y+20); ctx.lineTo(cx-5,r.y+20); ctx.closePath(); ctx.stroke();
+    ctx.fillStyle="#8a7f66";
+    for (let i=0;i<3;i++){ const fy=(t*30+i*17)%(r.h-26);
+      ctx.beginPath(); ctx.arc(cx+(i-1)*4, r.y+22+fy, 2.2, 0, 7); ctx.fill(); } },
+  processing(r,t){ const y=r.y+r.h-12; // conveyor with moving chunks
+    ctx.strokeStyle="#3a4150"; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.moveTo(r.x+6,y); ctx.lineTo(r.x+r.w-6,y); ctx.stroke();
+    ctx.fillStyle="#8a7f66";
+    const span=r.w-16;
+    for (let i=0;i<4;i++){ const ox=(t*22+i*span/4)%span;
+      ctx.beginPath(); ctx.arc(r.x+8+ox, y-4, 2.6, 0, 7); ctx.fill(); } },
+  ore_hold(r){ ctx.fillStyle="#655c48";
+    const bx=r.x+r.w/2, by=r.y+r.h-4;
+    for (const [dx,dy,rad] of [[-10,-4,6],[0,-6,8],[10,-4,6],[-4,-11,5],[5,-11,5]]){
+      ctx.beginPath(); ctx.arc(bx+dx,by+dy,rad,Math.PI,0); ctx.fill(); } },
+  crystal_bay(r,t){ ctx.fillStyle=`rgba(159,138,243,${0.6+Math.sin(t*2)*0.25})`;
+    const bx=r.x+r.w/2, by=r.y+r.h-4;
+    for (const [dx,hgt] of [[-8,10],[0,16],[8,9]]){
+      ctx.beginPath(); ctx.moveTo(bx+dx-3,by); ctx.lineTo(bx+dx,by-hgt);
+      ctx.lineTo(bx+dx+3,by); ctx.closePath(); ctx.fill(); } },
+  cargo(r){ // stacked Glug crates
+    const n=Math.max(2,Math.floor(r.w/22));
+    for (let i=0;i<n;i++) for (let j=0;j<2;j++){
+      const bx=r.x+6+i*20, by=r.y+r.h-12*(j+1);
+      if (bx+16>r.x+r.w-4) continue;
+      ctx.fillStyle="#2b3140"; ctx.fillRect(bx,by,16,10);
+      ctx.fillStyle="#ffd23e"; ctx.fillRect(bx+6,by+3,4,4); } },
+  crane_bay(r,t){ const y=r.y+8, cx=r.x+10+((Math.sin(t*0.7)+1)/2)*(r.w-24);
+    ctx.strokeStyle="#3a4150"; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(r.x+4,y); ctx.lineTo(r.x+r.w-4,y);
+    ctx.moveTo(cx,y); ctx.lineTo(cx,y+14); ctx.stroke();
+    ctx.fillStyle="#2b3140"; ctx.fillRect(cx-7,y+14,14,9);
+    ctx.fillStyle="#ffd23e"; ctx.fillRect(cx-2,y+17,4,4); },
+  manifest(r,t){ prop_console(r.x+r.w*0.5, r.y+r.h-4, t); },
+  magazine(r){ ctx.strokeStyle="#3a4150"; ctx.lineWidth=1.5; // missile racks
+    for (let j=0;j<2;j++){ const y=r.y+r.h-8-j*9;
+      const n=Math.max(2,Math.floor((r.w-16)/14));
+      for (let i=0;i<n;i++){ const bx=r.x+8+i*14;
+        ctx.fillStyle="#2b3140"; ctx.beginPath();
+        ctx.roundRect(bx,y-4,11,4,2); ctx.fill();
+        ctx.fillStyle="#e5484d"; ctx.beginPath();
+        ctx.moveTo(bx+11,y-4); ctx.lineTo(bx+14,y-2); ctx.lineTo(bx+11,y); ctx.fill(); } } },
+  fire_control(r,t){ const cx=r.x+r.w/2, cy=r.y+r.h/2, rad=Math.min(r.w,r.h)*0.26;
+    ctx.strokeStyle="#2f4a37"; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(cx,cy,rad,0,7); ctx.stroke();
+    const ang=t*1.8;
+    ctx.strokeStyle="#7bd88f";
+    ctx.beginPath(); ctx.moveTo(cx,cy);
+    ctx.lineTo(cx+Math.cos(ang)*rad, cy+Math.sin(ang)*rad); ctx.stroke(); },
+  armory(r){ ctx.strokeStyle="#3a4150"; ctx.lineWidth=2;
+    const n=Math.max(2,Math.floor((r.w-12)/12));
+    for (let i=0;i<n;i++){ const bx=r.x+8+i*12, by=r.y+r.h-4;
+      ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(bx+3,by-13); ctx.stroke(); } },
+  lab(r,t){ ctx.strokeStyle="#3a4150"; ctx.lineWidth=2;
+    const y=r.y+r.h-10;
+    ctx.beginPath(); ctx.moveTo(r.x+6,y); ctx.lineTo(r.x+r.w-6,y); ctx.stroke();
+    for (let i=0;i<3;i++){ const bx=r.x+14+i*16;
+      ctx.fillStyle=["#7bd88f","#ffd23e","#e58ae5"][i];
+      ctx.globalAlpha=0.7+Math.sin(t*3+i)*0.3;
+      ctx.beginPath(); ctx.roundRect(bx,y-10,6,10,2); ctx.fill(); ctx.globalAlpha=1; } },
+  vault(r,t){ const cx=r.x+r.w/2, cy=r.y+r.h/2;
+    ctx.strokeStyle="#b8921c"; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.arc(cx,cy,Math.min(r.w,r.h)*0.25,0,7); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx,cy,Math.min(r.w,r.h)*0.1,0,7); ctx.stroke();
+    for (let i=0;i<4;i++){ const a=i*Math.PI/2+t*0.2;
+      ctx.beginPath(); ctx.moveTo(cx+Math.cos(a)*6,cy+Math.sin(a)*6);
+      ctx.lineTo(cx+Math.cos(a)*13,cy+Math.sin(a)*13); ctx.stroke(); } },
+  lobby(r){ ctx.strokeStyle="#3a4150"; ctx.lineWidth=2; // desk + plant
+    ctx.strokeRect(r.x+r.w*0.3, r.y+r.h-14, r.w*0.4, 10);
+    ctx.fillStyle="#7bd88f";
+    ctx.beginPath(); ctx.arc(r.x+10, r.y+r.h-14, 5, Math.PI, 0); ctx.fill();
+    ctx.strokeStyle="#5a4632"; ctx.beginPath();
+    ctx.moveTo(r.x+10,r.y+r.h-14); ctx.lineTo(r.x+10,r.y+r.h-4); ctx.stroke(); },
+  office(r,t){ prop_console(r.x+r.w*0.35, r.y+r.h-4, t);
+    prop_console(r.x+r.w*0.7, r.y+r.h-4, t+2); },
+};
+function prop_console(x, floorY, t){
+  ctx.fillStyle="#2b3140"; ctx.beginPath();
+  ctx.roundRect(x-8, floorY-12, 16, 12, 2); ctx.fill();
+  ctx.fillStyle=`rgba(106,176,243,${0.5+Math.sin(t*5)*0.3})`;
+  ctx.fillRect(x-5, floorY-9, 10, 5);
+}
+
+const WORK_ROOMS = { ore:["intake","processing","ore_hold","crystal_bay"],
+  income:["manifest","bridge","office"], colony:["crane_bay","engineering","lab"] };
+
+function draw(t){
+  ctx.clearRect(0,0,W,H);
+  const it = S && S.interior;
+  // space backdrop
+  ctx.fillStyle = "#07080b"; ctx.fillRect(0,0,W,H);
+  for (const s of stars){
+    ctx.globalAlpha = 0.35 + 0.45*Math.abs(Math.sin(t*0.7+s.tw));
+    ctx.fillStyle = "#cdd6e4";
+    ctx.beginPath(); ctx.arc(((s.x+t*0.004)%1)*W, s.y*H, s.r, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  if (!it) return;
+  const h = hull(), docked = S.ceo.docked, hq = it.archetype==="hq";
+
+  if (docked && !hq){ // dock gantry behind hull
+    ctx.strokeStyle="#161a21"; ctx.lineWidth=9;
+    for (const gx of [h.x-18, h.x+h.w+18]){
+      ctx.beginPath(); ctx.moveTo(gx,0); ctx.lineTo(gx,H); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(gx, h.y+20); ctx.lineTo(gx<W/2?h.x+6:h.x+h.w-6, h.y+40); ctx.stroke();
+    }
+  }
+
+  // hull silhouette
+  ctx.save();
+  ctx.beginPath();
+  if (hq){
+    ctx.roundRect(h.x, h.y, h.w, h.h, 8);
+  } else {
+    const nose = it.archetype==="generic" ? 70 : 40;
+    ctx.moveTo(h.x+14, h.y);
+    ctx.lineTo(h.x+h.w-nose, h.y);
+    ctx.quadraticCurveTo(h.x+h.w+8, h.y+h.h/2, h.x+h.w-nose, h.y+h.h);
+    ctx.lineTo(h.x+14, h.y+h.h);
+    ctx.quadraticCurveTo(h.x-6, h.y+h.h/2, h.x+14, h.y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = "#101319"; ctx.fill();
+  ctx.strokeStyle = "#39404e"; ctx.lineWidth = 3; ctx.stroke();
+
+  if (!hq && !docked){ // engine glow at stern
+    const p = 0.6+Math.sin(t*9)*0.25;
+    const grad = ctx.createLinearGradient(h.x-36, 0, h.x, 0);
+    grad.addColorStop(0, "rgba(106,176,243,0)");
+    grad.addColorStop(1, `rgba(106,176,243,${p*0.55})`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(h.x-36, h.y+h.h*0.3, 38, h.h*0.16);
+    ctx.fillRect(h.x-36, h.y+h.h*0.58, 38, h.h*0.16);
+  }
+  if (it.archetype==="miner" && !hq){ // mining rig mast on top
+    ctx.strokeStyle="#39404e"; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.moveTo(h.x+h.w*0.35, h.y); ctx.lineTo(h.x+h.w*0.35, h.y-16);
+    ctx.lineTo(h.x+h.w*0.48, h.y-16); ctx.stroke();
+  }
+  ctx.clip();
+
+  // active-work room kinds this frame
+  const active = new Set();
+  for (const o of (S.orders||[])) (WORK_ROOMS[o.kind]||[]).forEach(k=>active.add(k));
+
+  // rooms
+  ctx.textBaseline = "alphabetic";
+  for (const r0 of it.rooms){
+    const r = roomPx(r0);
+    ctx.fillStyle = "#151a22";
+    ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.fill();
+    const hot = active.has(r.kind);
+    ctx.strokeStyle = hot ? `rgba(255,210,62,${0.45+Math.sin(t*4)*0.25})` : "#232936";
+    ctx.lineWidth = hot ? 2 : 1.5;
+    ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.stroke();
+    // floor line
+    ctx.strokeStyle = "#2a303c"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(r.x+2, r.y+r.h-2); ctx.lineTo(r.x+r.w-2, r.y+r.h-2); ctx.stroke();
+    (PROPS[r.kind]||prop_console_room)(r, t);
+    ctx.font = "9.5px Segoe UI"; ctx.textAlign = "left";
+    ctx.fillStyle = hot ? "#c8a832" : "#525a68";
+    ctx.fillText(r.label.toUpperCase(), r.x+5, r.y+11);
+    if (hot){ // work motes rising
+      for (let i=0;i<2;i++){
+        const my = (t*14+i*9) % (r.h-18);
+        ctx.fillStyle = "rgba(255,210,62,0.5)";
+        ctx.beginPath(); ctx.arc(r.x+r.w-8, r.y+r.h-6-my, 1.5, 0, 7); ctx.fill();
+      }
+    }
+    if (r.kind === "training_pod" && S.ceo.training){
+      ctx.font = "8.5px Segoe UI"; ctx.textAlign = "center";
+      ctx.fillStyle = "#4a90c2";
+      ctx.fillText(trainingText().split("— ")[1]||"", r.x+r.w/2, r.y+r.h+10);
+    }
+  }
+  for (const a of agents) drawAgent(a, t);
+  ctx.restore();
+}
+function prop_console_room(r,t){ prop_console(r.x+r.w/2, r.y+r.h-4, t); }
+
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(0.1, (now-last)/1000); last = now;
+  if (S){ stepAgents(dt); draw(now/1000); $("ceo-train").textContent = trainingText(); }
+  requestAnimationFrame(frame);
+}
+
+async function refresh(){
+  try {
+    S = await (await fetch("/api/state")).json();
+    syncAgents(); renderPanels();
+  } catch(e) { /* server briefly away; keep last state */ }
+}
+resize(); refresh(); setInterval(refresh, 10000);
+requestAnimationFrame(frame);
+</script></body></html>
