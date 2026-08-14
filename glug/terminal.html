@@ -123,6 +123,8 @@ const $ = id => document.getElementById(id);
 const fmt = (n,d=0) => n==null ? "—" : n.toLocaleString(undefined,{maximumFractionDigits:d});
 const DEPT_COLOR = { "Logistics":"#6ab0f3", "Catering":"#7bd88f",
   "Safety & Compliance":"#ffd23e", "Marketing":"#e58ae5", "R&D":"#9f8af3" };
+const DEPT_DARK = { "Logistics":"#3a6ea6", "Catering":"#458a5c",
+  "Safety & Compliance":"#b8921c", "Marketing":"#9c4f9c", "R&D":"#6b5cc4" };
 let S = null;
 
 function toast(msg){ const t=$("toast"); t.textContent=msg; t.style.display="block";
@@ -270,14 +272,15 @@ function syncAgents(){
   const rooms = it.rooms.map(roomPx);
   const named = S.crew.slice(0, 12);
   const anon = Math.min(14, it.complement ? Math.round(Math.sqrt(it.complement)) : 0);
-  const mk = (name, color, isAnon) => {
+  const mk = (name, color, dark, isAnon) => {
     const r = rooms[Math.floor(Math.random()*rooms.length)];
-    agents.push({ name, color, anon:isAnon, room:r,
+    agents.push({ name, color, dark, anon:isAnon, room:r, dir:1,
       x:r.x + Math.random()*r.w, dwell: 1+Math.random()*4,
       speed: 26+Math.random()*18, phase: Math.random()*7 });
   };
-  named.forEach(c => mk(c.name.split(" ")[0], DEPT_COLOR[c.dept]||"#999", false));
-  for (let i=0;i<anon;i++) mk(null, "#3d434e", true);
+  named.forEach(c => mk(c.name.split(" ")[0], DEPT_COLOR[c.dept]||"#999",
+                        DEPT_DARK[c.dept]||"#555", false));
+  for (let i=0;i<anon;i++) mk(null, "#3d434e", "#2c313b", true);
 }
 
 function stepAgents(dt){
@@ -301,32 +304,53 @@ function stepAgents(dt){
     } else {
       const dx = a.tx - a.x, step = a.speed*dt;
       if (Math.abs(dx) <= step){ a.x = a.tx; a.tx = null; a.dwell = 2+Math.random()*6; }
-      else a.x += Math.sign(dx)*step;
+      else { a.x += Math.sign(dx)*step; a.dir = Math.sign(dx); }
     }
   }
 }
 
+// ── Pixel sprites (hybrid art direction: pixel crew in vector rooms) ──
+const PXS = 3;
+function spr(grid, pal, x, y, flip){
+  x = Math.round(x); y = Math.round(y);
+  for (let r=0;r<grid.length;r++){ const row=grid[r];
+    for (let c=0;c<row.length;c++){ const ch=row[c]; if (ch===".") continue;
+      const col = pal[ch]; if (!col) continue;
+      const cx = flip ? row.length-1-c : c;
+      ctx.fillStyle = col; ctx.fillRect(x+cx*PXS, y+r*PXS, PXS, PXS); } }
+}
+const BODY_TOP = [
+  "..OOOO..",".OHHHHO.",".OSSSSO.",".OSsSsO.","..OSSO..",
+  ".OBBBBO.","OBBBBBDO","OBBBBBDO",".OBBBDO.",
+];
+const LEGS_IDLE = ["..OPPO..","..OPPO..",".OY..YO."];
+const LEGS_W1   = ["..OPPO..",".OP..PO.","OY....YO"];
+const LEGS_W2   = ["..OPPO..","..OPPO..","..OYYO.."];
+const SPR_VENDING = [
+  "OOOOOOOOOO","OGGGGGGGGO","OGKKKKKKGO","OGKkKKkKGO","OGKKKKKKGO",
+  "OGKkkkkKGO","OGKKKKKKGO","OGGGGGGGGO","OGKKGGGGGO","OGKKGGGGGO",
+  "OGGGGGGGGO","OOOOOOOOOO",
+];
+const SPR_CRATE = ["OOOOOOOOOO","OCCCCCCCCO","OCGGCCGGCO","OCCCCCCCCO","OOOOOOOOOO"];
+const SPR_CONSOLE = ["..OOOOOO..","..OWWWWO..","..OWwWWO..","..OOOOOO..",
+                     ".OOCCCCOO.","OCCCCCCCCO","OOOOOOOOOO"];
+const SPR_PAL = {O:"#080a0f", G:"#ffd23e", K:"#20242e", k:"#ffd23e",
+                 C:"#39415a", W:"#9fd6ff"};
+
 function drawAgent(a, t){
-  const floor = a.room.y + a.room.h - 3;
+  const floor = a.room.y + a.room.h - 2;
   const walking = a.tx != null;
-  const bob = walking ? Math.sin(t*14+a.phase)*1.2 : Math.sin(t*2.2+a.phase)*0.5;
-  const x = a.x, y = floor + bob;
+  const legs = !walking ? LEGS_IDLE
+    : (Math.floor(t*8+a.phase)%2 ? LEGS_W1 : LEGS_W2);
+  const gr = BODY_TOP.concat(legs);
+  const pal = {O:"#080a0f", H:"#2e2620", S:"#e8caa2", s:"#0a0c10",
+               B:a.color, D:a.dark, P:"#252c3b", Y:"#11141b"};
   ctx.save();
-  ctx.globalAlpha = a.anon ? 0.55 : 1;
-  // legs
-  ctx.strokeStyle = "#20242c"; ctx.lineWidth = 2;
-  const leg = walking ? Math.sin(t*14+a.phase)*3 : 0;
-  ctx.beginPath(); ctx.moveTo(x-2, y-7); ctx.lineTo(x-2+leg, y);
-  ctx.moveTo(x+2, y-7); ctx.lineTo(x+2-leg, y); ctx.stroke();
-  // body
-  ctx.fillStyle = a.color;
-  ctx.beginPath(); ctx.roundRect(x-3.5, y-14, 7, 8, 2); ctx.fill();
-  // head
-  ctx.fillStyle = "#e8caa2";
-  ctx.beginPath(); ctx.arc(x, y-17, 3.2, 0, 7); ctx.fill();
+  ctx.globalAlpha = a.anon ? 0.5 : 1;
+  spr(gr, pal, a.x-4*PXS, floor-gr.length*PXS, a.dir<0);
   if (!a.anon && a.name){
     ctx.font = "9px Segoe UI"; ctx.textAlign = "center";
-    ctx.fillStyle = "#9aa3b1"; ctx.fillText(a.name, x, y-23);
+    ctx.fillStyle = "#9aa3b1"; ctx.fillText(a.name, a.x, floor-gr.length*PXS-4);
   }
   ctx.restore();
 }
@@ -336,13 +360,10 @@ const PROPS = {
   bridge(r,t){ prop_console(r.x+r.w*0.55, r.y+r.h-4, t);
     ctx.fillStyle="#28303e"; ctx.beginPath();
     ctx.roundRect(r.x+r.w-16, r.y+6, 10, r.h-14, 3); ctx.fill(); },
-  mess(r,t){ // Glug vending machine + table
-    const vx=r.x+8, vy=r.y+r.h-26;
-    ctx.fillStyle="#ffd23e"; ctx.beginPath(); ctx.roundRect(vx,vy,14,22,2); ctx.fill();
-    ctx.fillStyle="#15130a"; ctx.font="10px Segoe UI"; ctx.textAlign="center";
-    ctx.fillText("☺", vx+7, vy+11);
+  mess(r,t){ // pixel Glug vending machine + table
+    spr(SPR_VENDING, SPR_PAL, r.x+8, r.y+r.h-2-12*PXS);
     ctx.strokeStyle="#3a4150"; ctx.lineWidth=2;
-    const tx=r.x+r.w*0.6, ty=r.y+r.h-10;
+    const tx=r.x+r.w*0.62, ty=r.y+r.h-10;
     ctx.beginPath(); ctx.moveTo(tx-12,ty); ctx.lineTo(tx+12,ty);
     ctx.moveTo(tx-8,ty); ctx.lineTo(tx-8,ty+7); ctx.moveTo(tx+8,ty); ctx.lineTo(tx+8,ty+7); ctx.stroke(); },
   bunks(r){ ctx.strokeStyle="#3a4150"; ctx.lineWidth=2;
@@ -383,14 +404,13 @@ const PROPS = {
     for (const [dx,hgt] of [[-8,10],[0,16],[8,9]]){
       ctx.beginPath(); ctx.moveTo(bx+dx-3,by); ctx.lineTo(bx+dx,by-hgt);
       ctx.lineTo(bx+dx+3,by); ctx.closePath(); ctx.fill(); } },
-  cargo(r){ // stacked Glug crates
-    const n=Math.max(2,Math.floor(r.w/22));
-    for (let i=0;i<n;i++) for (let j=0;j<2;j++){
-      const bx=r.x+6+i*20, by=r.y+r.h-12*(j+1);
-      if (bx+16>r.x+r.w-4) continue;
-      ctx.fillStyle="#2b3140"; ctx.fillRect(bx,by,16,10);
-      ctx.fillStyle="#ffd23e"; ctx.fillRect(bx+6,by+3,4,4); } },
-  crane_bay(r,t){ const y=r.y+8, cx=r.x+10+((Math.sin(t*0.7)+1)/2)*(r.w-24);
+  cargo(r){ // stacked pixel Glug crates
+    const cw = 10*PXS, n = Math.max(1, Math.floor((r.w-12)/(cw+4)));
+    for (let i=0;i<n;i++) for (let j=0;j<(i%2?1:2);j++){
+      const bx=r.x+6+i*(cw+4), by=r.y+r.h-2-(j+1)*5*PXS;
+      if (bx+cw > r.x+r.w-4) continue;
+      spr(SPR_CRATE, SPR_PAL, bx, by); } },
+  crane_bay(r,t){ const y=r.y+18, cx=r.x+10+((Math.sin(t*0.7)+1)/2)*(r.w-24);
     ctx.strokeStyle="#3a4150"; ctx.lineWidth=2;
     ctx.beginPath(); ctx.moveTo(r.x+4,y); ctx.lineTo(r.x+r.w-4,y);
     ctx.moveTo(cx,y); ctx.lineTo(cx,y+14); ctx.stroke();
@@ -440,10 +460,8 @@ const PROPS = {
     prop_console(r.x+r.w*0.7, r.y+r.h-4, t+2); },
 };
 function prop_console(x, floorY, t){
-  ctx.fillStyle="#2b3140"; ctx.beginPath();
-  ctx.roundRect(x-8, floorY-12, 16, 12, 2); ctx.fill();
-  ctx.fillStyle=`rgba(106,176,243,${0.5+Math.sin(t*5)*0.3})`;
-  ctx.fillRect(x-5, floorY-9, 10, 5);
+  spr(SPR_CONSOLE, {...SPR_PAL, w:(Math.sin(t*5)>0?"#e8f4ff":"#5f87b8")},
+      x-5*PXS, floorY-7*PXS);
 }
 
 const WORK_ROOMS = { ore:["intake","processing","ore_hold","crystal_bay"],
