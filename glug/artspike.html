@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLUG Brand Identity Review</title>
+<style>
+:root { --bg:#0c0e12; --panel:#14171d; --edge:#262b35; --ink:#c9cfd9;
+        --dim:#6b7482; --glug:#ffd23e; }
+* { box-sizing:border-box; margin:0; }
+body { background:var(--bg); color:var(--ink);
+       font:14px/1.5 "Segoe UI",system-ui,sans-serif; }
+.wrap { max-width:1000px; margin:0 auto; padding:18px 16px 40px; }
+header { display:flex; align-items:center; gap:12px; margin-bottom:6px; }
+.logo { width:38px; height:38px; border-radius:50%; background:var(--glug); flex:none;
+        display:flex; align-items:center; justify-content:center; font-size:23px; color:#15130a; }
+h1 { font-size:16px; letter-spacing:.07em; }
+h1 small { display:block; font-size:10px; color:var(--dim); letter-spacing:.18em; font-weight:400; }
+.memo { font-size:12px; color:var(--dim); border-left:3px solid var(--glug);
+        padding:6px 12px; margin:12px 0 20px; font-style:italic; }
+section { margin-bottom:26px; }
+section h2 { font-size:11px; letter-spacing:.16em; color:var(--glug);
+             text-transform:uppercase; margin-bottom:8px; }
+canvas { display:block; width:100%; border:1px solid var(--edge); border-radius:8px;
+         background:#07080b; }
+.note { font-size:12px; color:var(--dim); margin-top:7px; }
+footer { color:#454c58; font-size:10.5px; letter-spacing:.06em; text-align:center; margin-top:8px; }
+</style></head><body><div class="wrap">
+<header><div class="logo">&#9786;</div>
+<h1>GLUG&trade; BRAND IDENTITY REVIEW <small>INTERIOR VISUALIZATION — CANDIDATE STYLES</small></h1></header>
+<div class="memo">MEMO from Marketing: The Board will review three visualization directions
+for the Internal Operations Terminal. All candidates depict the same deck section of the
+<b>Glug Asset Hauler Elite</b>, live. Staff are reminded that enthusiasm is mandatory.</div>
+
+<section><h2>Candidate A — Vector Flat (current production)</h2>
+<canvas id="cvA" width="940" height="230"></canvas>
+<div class="note">The look shipping today. Crisp at any size, cheapest to extend to new rooms and hulls.</div></section>
+
+<section><h2>Candidate B — Pixel Crew (FTL energy)</h2>
+<canvas id="cvB" width="940" height="230"></canvas>
+<div class="note">Chunky sprites, riveted hull, warm little guys. Most "game" of the three; each new prop costs pixel work.</div></section>
+
+<section><h2>Candidate C — Holo-Schematic (corporate blueprint)</h2>
+<canvas id="cvC" width="940" height="230"></canvas>
+<div class="note">The terminal as Glug sees you: an amber wireframe asset visualization. Most on-brand for the ERP fiction, least cuddly.</div></section>
+
+<footer>GLUG&trade; BRAND ASSETS ARE THE PROPERTY OF GLUG. INCLUDING YOU.</footer>
+</div>
+<script>
+"use strict";
+// ── Shared scene: same geometry + crew motion drives all three ──
+const HULL = {x:20, y:14, w:900, h:186};
+const ROOMS = [
+  {key:"canteen", label:"GLUG CANTEEN", x:44,  w:262},
+  {key:"cargo",   label:"CARGO BAY 2",  x:330, w:296},
+  {key:"bridge",  label:"BRIDGE",       x:650, w:246},
+];
+const ROOM_Y = 36, ROOM_H = 142, FLOOR = ROOM_Y + ROOM_H;
+const CREW = [
+  {name:"Suvi", color:"#6ab0f3", dark:"#3a6ea6"},
+  {name:"Fenn", color:"#7bd88f", dark:"#458a5c"},
+  {name:"Moro", color:"#ffd23e", dark:"#b8921c"},
+  {name:"Kess", color:"#e58ae5", dark:"#9c4f9c"},
+];
+CREW.forEach((c,i) => { const r = ROOMS[i % ROOMS.length];
+  c.x = r.x + 30 + Math.random()*(r.w-60); c.tx = null;
+  c.dwell = 1+Math.random()*3; c.speed = 24+Math.random()*14; c.phase = i*1.7; });
+
+function stepCrew(dt){
+  for (const c of CREW){
+    if (c.tx == null){
+      c.dwell -= dt;
+      if (c.dwell <= 0){ const r = ROOMS[Math.floor(Math.random()*ROOMS.length)];
+        c.tx = r.x + 20 + Math.random()*(r.w-40); }
+    } else {
+      const dx = c.tx - c.x, st = c.speed*dt;
+      if (Math.abs(dx) <= st){ c.x = c.tx; c.tx = null; c.dwell = 2+Math.random()*5; }
+      else { c.x += Math.sign(dx)*st; c.dir = Math.sign(dx); }
+    }
+  }
+}
+
+// ══ CANDIDATE A — vector flat (current look) ═════════════════
+const gA = cvA.getContext("2d");
+function drawA(t){
+  const g = gA; g.clearRect(0,0,940,230);
+  g.fillStyle="#07080b"; g.fillRect(0,0,940,230);
+  g.fillStyle="#cdd6e4";
+  for (let i=0;i<26;i++){ g.globalAlpha=.25+.4*Math.abs(Math.sin(t+i*2.7));
+    g.beginPath(); g.arc((i*167+t*4)%940, (i*83)%230, 1, 0, 7); g.fill(); }
+  g.globalAlpha=1;
+  g.fillStyle="#101319"; g.strokeStyle="#39404e"; g.lineWidth=3;
+  g.beginPath(); g.roundRect(HULL.x,HULL.y,HULL.w,HULL.h,10); g.fill(); g.stroke();
+  for (const r of ROOMS){
+    g.fillStyle="#151a22"; g.beginPath(); g.roundRect(r.x,ROOM_Y,r.w,ROOM_H,4); g.fill();
+    g.strokeStyle="#232936"; g.lineWidth=1.5; g.stroke();
+    g.strokeStyle="#2a303c"; g.lineWidth=2;
+    g.beginPath(); g.moveTo(r.x+2,FLOOR-2); g.lineTo(r.x+r.w-2,FLOOR-2); g.stroke();
+    g.font="9.5px Segoe UI"; g.textAlign="left"; g.fillStyle="#525a68";
+    g.fillText(r.label, r.x+6, ROOM_Y+12);
+  }
+  // props: vending, table / crates / console
+  let r=ROOMS[0];
+  g.fillStyle="#ffd23e"; g.beginPath(); g.roundRect(r.x+12,FLOOR-34,17,28,2); g.fill();
+  g.fillStyle="#15130a"; g.font="12px Segoe UI"; g.textAlign="center";
+  g.fillText("☺", r.x+20.5, FLOOR-18);
+  g.strokeStyle="#3a4150"; g.lineWidth=2;
+  g.beginPath(); g.moveTo(r.x+150,FLOOR-14); g.lineTo(r.x+190,FLOOR-14);
+  g.moveTo(r.x+156,FLOOR-14); g.lineTo(r.x+156,FLOOR-4);
+  g.moveTo(r.x+184,FLOOR-14); g.lineTo(r.x+184,FLOOR-4); g.stroke();
+  r=ROOMS[1];
+  for (let i=0;i<5;i++) for (let j=0;j<(i%2?1:2);j++){
+    g.fillStyle="#2b3140"; g.fillRect(r.x+16+i*26, FLOOR-14*(j+1), 22, 12);
+    g.fillStyle="#ffd23e"; g.fillRect(r.x+24+i*26, FLOOR-14*(j+1)+4, 5, 5); }
+  r=ROOMS[2];
+  g.fillStyle="#2b3140"; g.beginPath(); g.roundRect(r.x+r.w-70,FLOOR-18,34,16,2); g.fill();
+  g.fillStyle=`rgba(106,176,243,${.5+Math.sin(t*5)*.3})`; g.fillRect(r.x+r.w-64,FLOOR-14,22,8);
+  for (const c of CREW){
+    const y = FLOOR-3 + (c.tx!=null ? Math.sin(t*14+c.phase)*1.2 : 0);
+    g.strokeStyle="#20242c"; g.lineWidth=2;
+    const leg = c.tx!=null ? Math.sin(t*14+c.phase)*3 : 0;
+    g.beginPath(); g.moveTo(c.x-2,y-7); g.lineTo(c.x-2+leg,y);
+    g.moveTo(c.x+2,y-7); g.lineTo(c.x+2-leg,y); g.stroke();
+    g.fillStyle=c.color; g.beginPath(); g.roundRect(c.x-3.5,y-14,7,8,2); g.fill();
+    g.fillStyle="#e8caa2"; g.beginPath(); g.arc(c.x,y-17,3.2,0,7); g.fill();
+    g.font="9px Segoe UI"; g.textAlign="center"; g.fillStyle="#9aa3b1";
+    g.fillText(c.name, c.x, y-23);
+  }
+}
+
+// ══ CANDIDATE B — pixel crew ═════════════════════════════════
+const gB = cvB.getContext("2d");
+const PX = 3;  // pixel size
+function spr(g, grid, pal, x, y, flip){
+  for (let r=0;r<grid.length;r++){ const row=grid[r];
+    for (let c=0;c<row.length;c++){ const ch=row[c]; if (ch===".") continue;
+      const col = pal[ch]; if (!col) continue;
+      const cx = flip ? row.length-1-c : c;
+      g.fillStyle = col; g.fillRect(Math.round(x)+cx*PX, Math.round(y)+r*PX, PX, PX); } }
+}
+const BODY_TOP = [
+  "..OOOO..",
+  ".OHHHHO.",
+  ".OSSSSO.",
+  ".OSsSsO.",
+  "..OSSO..",
+  ".OBBBBO.",
+  "OBBBBBDO",
+  "OBBBBBDO",
+  ".OBBBDO.",
+];
+const LEGS_IDLE = ["..OPPO..", "..OPPO..", ".OY..YO.", "........"];
+const LEGS_W1   = ["..OPPO..", ".OP..PO.", "OY....YO", "........"];
+const LEGS_W2   = ["..OPPO..", "..OPPO..", "..OYYO..", "........"];
+const VENDING = [
+  "OOOOOOOOOO","OGGGGGGGGO","OGKKKKKKGO","OGKkKKkKGO","OGKKKKKKGO",
+  "OGKkkkkKGO","OGKKKKKKGO","OGGGGGGGGO","OGGGGGGGGO","OGKKGGGGGO",
+  "OGKKGGGGGO","OGGGGGGGGO","OOOOOOOOOO",
+];
+const CRATE = [
+  "OOOOOOOOOO","OCCCCCCCCO","OCGGCCGGCO","OCCCCCCCCO","OCCCCCCCCO","OOOOOOOOOO",
+];
+const CONSOLE = [
+  "..OOOOOO..","..OWWWWO..","..OWwWWO..","..OOOOOO..",".OOCCCCOO.","OCCCCCCCCO","OOOOOOOOOO",
+];
+function drawB(t){
+  const g = gB; g.imageSmoothingEnabled = false;
+  g.clearRect(0,0,940,230);
+  g.fillStyle="#05060a"; g.fillRect(0,0,940,230);
+  g.fillStyle="#aab6cc";
+  for (let i=0;i<30;i++){ if (Math.sin(t*.8+i*3.3)>0.2)
+    g.fillRect((i*151+Math.floor(t*3))%940, (i*67)%230, 2, 2); }
+  // hull: plated with rivets
+  g.fillStyle="#141926"; g.fillRect(HULL.x,HULL.y,HULL.w,HULL.h);
+  g.strokeStyle="#3f4a63"; g.lineWidth=4; g.strokeRect(HULL.x,HULL.y,HULL.w,HULL.h);
+  g.fillStyle="#4a5876";
+  for (let x=HULL.x+10;x<HULL.x+HULL.w;x+=24){ g.fillRect(x,HULL.y+3,2,2);
+    g.fillRect(x,HULL.y+HULL.h-5,2,2); }
+  for (const r of ROOMS){
+    g.fillStyle="#0e1118"; g.fillRect(r.x,ROOM_Y,r.w,ROOM_H);
+    g.strokeStyle="#2b3346"; g.lineWidth=2; g.strokeRect(r.x,ROOM_Y,r.w,ROOM_H);
+    g.fillStyle="#1a2030";                      // floor strip
+    g.fillRect(r.x+2,FLOOR-6,r.w-4,4);
+    g.fillStyle="#2b3346";
+    for (let x=r.x+8;x<r.x+r.w-8;x+=16) g.fillRect(x,FLOOR-6,2,4);
+    for (let x=r.x+30;x<r.x+r.w-10;x+=44){       // wall seams
+      g.fillStyle="#161c29"; g.fillRect(x,ROOM_Y+2,2,ROOM_H-10); }
+    g.font="bold 9px Consolas,monospace"; g.textAlign="left";
+    g.fillStyle="#5b6580";
+    g.fillText(r.label, r.x+6, ROOM_Y+12);
+  }
+  const palCommon = {O:"#080a0f", G:"#ffd23e", K:"#20242e", k:"#ffd23e",
+                     C:"#39415a", W:"#9fd6ff", w:"#e8f4ff"};
+  let r=ROOMS[0];
+  spr(g, VENDING, palCommon, r.x+12, FLOOR-14*PX-6);
+  // table: two pixel benches
+  g.fillStyle="#39415a"; g.fillRect(r.x+150,FLOOR-18,44,4);
+  g.fillRect(r.x+154,FLOOR-14,4,8); g.fillRect(r.x+186,FLOOR-14,4,8);
+  r=ROOMS[1];
+  for (let i=0;i<4;i++) for (let j=0;j<(i%2?1:2);j++)
+    spr(g, CRATE, {O:"#080a0f", C:"#3a4258", G:"#ffd23e"},
+        r.x+18+i*40, FLOOR-6-(j+1)*6*PX);
+  // crane hook drifting
+  const hx = r.x+30+((Math.sin(t*.6)+1)/2)*(r.w-70);
+  g.fillStyle="#2b3346"; g.fillRect(r.x+8,ROOM_Y+20,r.w-16,3);
+  g.fillRect(hx,ROOM_Y+23,2,14); g.fillStyle="#ffd23e"; g.fillRect(hx-3,ROOM_Y+37,8,4);
+  r=ROOMS[2];
+  spr(g, CONSOLE, {...palCommon, w:(Math.sin(t*6)>0?"#e8f4ff":"#9fd6ff")},
+      r.x+r.w-90, FLOOR-7*PX-6);
+  // crew sprites
+  for (const c of CREW){
+    const pal = {O:"#080a0f", H:"#2e2620", S:"#e8caa2", s:"#0a0c10",
+                 B:c.color, D:c.dark, P:"#252c3b", Y:"#11141b"};
+    const walking = c.tx != null;
+    const legs = !walking ? LEGS_IDLE : (Math.floor(t*8+c.phase)%2 ? LEGS_W1 : LEGS_W2);
+    const gr = BODY_TOP.concat(legs);
+    spr(g, gr, pal, c.x-4*PX, FLOOR-6-gr.length*PX, c.dir<0);
+    g.font="bold 8px Consolas,monospace"; g.textAlign="center"; g.fillStyle="#8b95a8";
+    g.fillText(c.name.toUpperCase(), c.x, FLOOR-6-gr.length*PX-4);
+  }
+}
+
+// ══ CANDIDATE C — holo-schematic ═════════════════════════════
+const gC = cvC.getContext("2d");
+const AMBER = "#ffb84d", AMBER_DIM = "rgba(255,184,77,.28)";
+function drawC(t){
+  const g = gC; g.clearRect(0,0,940,230);
+  g.fillStyle="#080604"; g.fillRect(0,0,940,230);
+  g.strokeStyle="rgba(255,184,77,.06)"; g.lineWidth=1;   // grid
+  for (let x=0;x<940;x+=20){ g.beginPath(); g.moveTo(x,0); g.lineTo(x,230); g.stroke(); }
+  for (let y=0;y<230;y+=20){ g.beginPath(); g.moveTo(0,y); g.lineTo(940,y); g.stroke(); }
+  const flick = 0.92 + 0.08*Math.sin(t*31) * Math.sin(t*7.3);
+  g.globalAlpha = flick;
+  g.shadowColor = AMBER; g.shadowBlur = 8;
+  g.strokeStyle = AMBER_DIM; g.lineWidth = 1.5;
+  g.strokeRect(HULL.x,HULL.y,HULL.w,HULL.h);
+  g.strokeStyle = AMBER;
+  for (const [cx,cy] of [[HULL.x,HULL.y],[HULL.x+HULL.w,HULL.y],
+                         [HULL.x,HULL.y+HULL.h],[HULL.x+HULL.w,HULL.y+HULL.h]]){
+    g.beginPath(); g.moveTo(cx-8,cy); g.lineTo(cx+8,cy);
+    g.moveTo(cx,cy-8); g.lineTo(cx,cy+8); g.stroke(); }
+  g.font="9px Consolas,monospace"; g.textAlign="left"; g.fillStyle=AMBER;
+  g.fillText("ASSET 1054553906618 · BUSTARD · DECK 2/2", HULL.x+4, HULL.y-4);
+  for (const r of ROOMS){
+    g.strokeStyle=AMBER_DIM; g.lineWidth=1;
+    g.strokeRect(r.x,ROOM_Y,r.w,ROOM_H);
+    g.strokeStyle=AMBER;
+    for (const [cx,cy] of [[r.x,ROOM_Y],[r.x+r.w,ROOM_Y],[r.x,FLOOR],[r.x+r.w,FLOOR]]){
+      g.beginPath(); g.moveTo(cx-4,cy); g.lineTo(cx+4,cy);
+      g.moveTo(cx,cy-4); g.lineTo(cx,cy+4); g.stroke(); }
+    g.fillStyle=AMBER; g.fillText(r.label, r.x+5, ROOM_Y+12);
+    g.fillStyle="rgba(255,184,77,.5)";
+    g.fillText("NOMINAL", r.x+5, FLOOR-6);
+  }
+  // wireframe props
+  g.strokeStyle=AMBER; g.lineWidth=1;
+  let r=ROOMS[0];
+  g.strokeRect(r.x+14,FLOOR-36,16,30);
+  g.beginPath(); g.arc(r.x+22,FLOOR-26,4,0,7); g.stroke();
+  g.beginPath(); g.arc(r.x+22,FLOOR-26,1.5,.3,2.8); g.stroke();
+  r=ROOMS[1];
+  for (let i=0;i<4;i++){ const bx=r.x+20+i*36;
+    g.strokeRect(bx,FLOOR-22,26,16);
+    g.beginPath(); g.moveTo(bx,FLOOR-22); g.lineTo(bx+26,FLOOR-6);
+    g.moveTo(bx+26,FLOOR-22); g.lineTo(bx,FLOOR-6); g.stroke(); }
+  r=ROOMS[2];
+  g.strokeRect(r.x+r.w-74,FLOOR-20,36,14);
+  g.beginPath(); g.arc(r.x+r.w-56,FLOOR-24,10,3.4,6.1); g.stroke();
+  // crew as tracked assets
+  for (const c of CREW){
+    const y = FLOOR-10;
+    g.shadowBlur = 12; g.fillStyle = AMBER;
+    g.beginPath(); g.moveTo(c.x,y-6); g.lineTo(c.x+4,y); g.lineTo(c.x,y+6);
+    g.lineTo(c.x-4,y); g.closePath(); g.fill();
+    g.shadowBlur = 8;
+    g.strokeStyle=AMBER_DIM;
+    g.beginPath(); g.moveTo(c.x,y-14); g.lineTo(c.x,y-22); g.stroke();
+    g.fillText("EMP·" + c.name.toUpperCase(), c.x+3, y-16);
+  }
+  // scan sweep
+  const sx = (t*90) % 1100 - 80;
+  const grad = g.createLinearGradient(sx-40,0,sx+8,0);
+  grad.addColorStop(0,"rgba(255,184,77,0)"); grad.addColorStop(1,"rgba(255,184,77,.10)");
+  g.shadowBlur = 0; g.fillStyle = grad; g.fillRect(sx-40,HULL.y,48,HULL.h);
+  g.globalAlpha = 1;
+}
+
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(.1,(now-last)/1000); last = now;
+  stepCrew(dt);
+  const t = now/1000;
+  drawA(t); drawB(t); drawC(t);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script></body></html>

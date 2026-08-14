@@ -252,12 +252,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path == "/":
+        pages = {"/": PAGE_PATH,
+                 "/spike": os.path.join(os.path.dirname(PAGE_PATH), "artspike.html")}
+        if self.path in pages:
             try:
-                with open(PAGE_PATH, "rb") as f:
+                with open(pages[self.path], "rb") as f:
                     page = f.read()
             except OSError:
-                page = b"terminal.html missing"
+                page = b"page missing"
             self._send(200, page, "text/html; charset=utf-8")
         elif self.path == "/api/state":
             self._send(200, build_state())
