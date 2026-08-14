@@ -57,9 +57,37 @@ ROLE_ROOMS = {
     "generic": ["magazine", "fire_control", "armory"],
 }
 
+# Approx hull lengths in metres by group keyword, first match wins.
+# ponytail: community-derived approximations, deliberately a calibration
+# table — tune freely, canon lengths are not in the SDE.
+GROUP_LENGTHS = [
+    ("capsule", 4), ("shuttle", 30), ("corvette", 45),
+    ("expedition frigate", 105), ("mining frigate", 95), ("frigate", 75),
+    ("destroyer", 160), ("battlecruiser", 500), ("battleship", 800),
+    ("cruiser", 300), ("deep space transport", 500),
+    ("blockade runner", 250), ("industrial command", 1100),
+    ("capital industrial", 3600), ("ore freighter", 1700),
+    ("freighter", 1100), ("industrial", 420),
+    ("exhumer", 260), ("mining barge", 240),
+]
+TIER_LENGTHS = {1: 80, 2: 250, 3: 500, 4: 1100, 5: 3600}
+
+
+def hull_length(group_name, tier):
+    g = (group_name or "").lower()
+    for key, metres in GROUP_LENGTHS:
+        if key in g:
+            return metres
+    return TIER_LENGTHS[tier]
+
 
 def build_interior(ship_type_id, training):
-    """Deterministic room layout in normalized hull coords (x,y,w,h in 0..1)."""
+    """Deterministic REAL-SCALE layout: rooms in metres along the hull.
+
+    deck 0 = upper, deck 1 = lower. Bow at x=length, stern at x=0.
+    The client renders at a fixed px-per-metre so a 1.8 m crew sprite is
+    the scale yardstick and big hulls are genuinely, scrollably big.
+    """
     import random as _r
     info = eve_common.get_type_info(ship_type_id) or {}
     group = (eve_common.get_group_info(info.get("group_id", 0)) or {})
@@ -69,40 +97,53 @@ def build_interior(ship_type_id, training):
 
     if archetype == "hq":
         rooms = [
-            {"kind": "lobby", "label": "Reception", "x": .02, "y": .55, "w": .2, "h": .3},
-            {"kind": "lab", "label": "R&D — Beverages", "x": .24, "y": .55, "w": .24, "h": .3},
-            {"kind": "magazine", "label": "R&D — Defense", "x": .5, "y": .55, "w": .24, "h": .3},
-            {"kind": "vault", "label": "Scrip Vault", "x": .76, "y": .55, "w": .21, "h": .3},
-            {"kind": "office", "label": "Marketing", "x": .02, "y": .18, "w": .3, "h": .3},
-            {"kind": "mess", "label": "Executive Canteen", "x": .34, "y": .18, "w": .3, "h": .3},
-            {"kind": "bridge", "label": "CEO Suite", "x": .66, "y": .18, "w": .31, "h": .3},
-        ]
-        return {"archetype": "hq", "tier": 0, "complement": 0,
-                "ship_class": "Corporate Headquarters", "mass": None, "rooms": rooms}
+            {"kind": "office", "label": "Marketing", "deck": 0, "x": 1, "w": 18},
+            {"kind": "mess", "label": "Executive Canteen", "deck": 0, "x": 20, "w": 18},
+            {"kind": "bridge", "label": "CEO Suite", "deck": 0, "x": 39, "w": 20},
+            {"kind": "lobby", "label": "Reception", "deck": 1, "x": 1, "w": 13},
+            {"kind": "lab", "label": "R&D — Beverages", "deck": 1, "x": 15, "w": 15},
+            {"kind": "magazine", "label": "R&D — Defense", "deck": 1, "x": 31, "w": 15},
+            {"kind": "vault", "label": "Scrip Vault", "deck": 1, "x": 47, "w": 12},
+            ]
+        return {"archetype": "hq", "tier": 0, "complement": 0, "length_m": 60,
+                "ship_class": "Corporate Headquarters", "mass": None,
+                "type_id": None, "rooms": rooms}
 
-    # Two decks, bow (right) to stern (left). Bridge fore, engineering aft.
+    L = hull_length(group.get("name"), tier)
+    stern = L * 0.09          # engineering zone
+    bow = L * 0.07            # bridge zone
+    rooms = [
+        {"kind": "engineering", "label": "Engineering", "deck": 1,
+         "x": 1, "w": round(stern - 2, 1)},
+        {"kind": "bridge", "label": "Bridge", "deck": 0,
+         "x": round(L - bow, 1), "w": round(bow - 1, 1)},
+    ]
+    if training:
+        w = min(30, L * 0.05)
+        rooms.append({"kind": "training_pod", "label": "Executive Pod", "deck": 0,
+                      "x": round(L - bow - w - 2, 1), "w": round(w, 1)})
+
     role_pool = ROLE_ROOMS[archetype]
-    n_role = min(2 + tier, 6)
-    role_rooms = [role_pool[i % len(role_pool)] for i in range(n_role)]
-    upper = ["bridge"] + (["training_pod"] if training else []) + ["mess", "bunks"]
-    lower = role_rooms + ["engineering"]
+    upper_pool = ["mess", "bunks"] + role_pool[:1]
 
-    def lay(names, y, h):
-        out, x = [], 0.03
-        widths = [1.0 + 0.6 * rng.random() for _ in names]
-        scale = 0.94 / sum(widths)
-        for name, w in zip(names, widths):
-            out.append({"kind": name, "label": ROOM_LABELS.get(name, name.title()),
-                        "x": round(x, 3), "y": y, "w": round(w * scale - 0.012, 3),
-                        "h": h})
-            x += w * scale
-        return out
+    def fill(deck, pool, start, end, i0=0):
+        x, i = start, i0
+        while x < end - 12:
+            w = min(rng.uniform(35, 65), end - x - 2)
+            kind = pool[i % len(pool)]
+            rooms.append({"kind": kind, "label": ROOM_LABELS.get(kind, kind.title()),
+                          "deck": deck, "x": round(x, 1), "w": round(w, 1)})
+            x += w + 2.5
+            i += 1
 
-    rooms = lay(list(reversed(lower)), .52, .34) + lay(list(reversed(upper)), .14, .32)
+    fill(1, role_pool, stern + 2, L - bow - 2)
+    up_end = L - bow - (34 if training else 2)
+    fill(0, upper_pool, 2, up_end, i0=rng.randrange(3))
+
     return {"archetype": archetype, "tier": tier,
-            "complement": COMPLEMENT[archetype][tier],
+            "complement": COMPLEMENT[archetype][tier], "length_m": L,
             "ship_class": group.get("name", "?"), "mass": info.get("mass"),
-            "rooms": rooms}
+            "type_id": ship_type_id, "rooms": rooms}
 
 
 ROOM_LABELS = {
@@ -221,8 +262,9 @@ def do_action(payload):
     action = payload.get("action")
     if action == "hire":
         result = game.hire_crew(db, now, dept=payload.get("dept"))
-        msg = (f"Welcome aboard, {result[0]} ({result[1]})!" if result
-               else "Insufficient scrip.")
+        msg = (f"Contractor promoted: {result[0]} ({result[1]}). "
+               f"Glug Premium Employment Membership™ granted." if result
+               else "Insufficient scrip for a membership.")
     elif action == "train":
         result = game.train_crew(db, int(payload.get("id", 0)), now)
         msg = (f"{result[0]} advanced to L{result[1]}." if result

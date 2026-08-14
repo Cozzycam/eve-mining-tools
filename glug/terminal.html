@@ -21,11 +21,16 @@ h1 small { display:block; font-size:10px; color:var(--dim); font-weight:400; let
 .head-scrip span { font-size:10px; color:var(--dim); letter-spacing:.14em; }
 #stage { position:relative; border:1px solid var(--edge); border-radius:10px;
          overflow:hidden; background:#07080b; }
-#diorama { display:block; width:100%; height:400px; }
-#nameplate { position:absolute; left:14px; bottom:10px; pointer-events:none;
-             text-shadow:0 1px 4px #000; }
+#diorama { display:block; width:100%; height:360px; cursor:grab; touch-action:none; }
+#diorama:active { cursor:grabbing; }
+#minimap { display:block; width:100%; height:48px; border-top:1px solid var(--edge);
+           background:#0a0c10; cursor:pointer; touch-action:none; }
+#nameplate { position:absolute; left:14px; top:10px; pointer-events:none;
+             text-shadow:0 1px 4px #000; display:flex; gap:10px; align-items:center; }
+#np-img { width:56px; height:56px; border-radius:6px; border:1px solid var(--edge);
+          background:#0a0c10; object-fit:cover; display:none; }
 #nameplate b { font-size:15px; letter-spacing:.08em; color:var(--glug); }
-#nameplate div { font-size:11px; color:var(--dim); }
+#nameplate div div { font-size:11px; color:var(--dim); }
 #dockbadge { position:absolute; right:14px; top:12px; font-size:10px; letter-spacing:.14em;
              padding:3px 9px; border-radius:4px; background:#0009; border:1px solid var(--edge);
              color:var(--dim); pointer-events:none; }
@@ -83,8 +88,10 @@ footer { margin-top:14px; color:#454c58; font-size:10.5px; letter-spacing:.06em;
 
 <div id="stage">
   <canvas id="diorama"></canvas>
+  <canvas id="minimap"></canvas>
   <div id="dockbadge">…</div>
-  <div id="nameplate"><b id="np-name">…</b><div id="np-sub">…</div></div>
+  <div id="nameplate"><img id="np-img" alt="">
+    <div><b id="np-name">…</b><div id="np-sub">…</div></div></div>
 </div>
 
 <div class="grid">
@@ -93,7 +100,7 @@ footer { margin-top:14px; color:#454c58; font-size:10.5px; letter-spacing:.06em;
     <div class="kv"><span>Work orders open / filled</span><b id="orders-n">…</b></div>
     <div class="kv"><span>Earnings multiplier</span><b id="mult">…</b></div>
     <div style="margin-top:9px; display:flex; gap:8px; align-items:center; flex-wrap:wrap">
-      <button id="hire">Hire crew</button>
+      <button id="hire">Promote contractor ☺</button>
       <select id="hire-dept"><option value="">Any dept</option>
         <option>Logistics</option><option>Catering</option>
         <option>Safety &amp; Compliance</option><option>Marketing</option>
@@ -146,14 +153,21 @@ function renderPanels(){
   $("ceo-sys").textContent = (c.system||"—") + (c.docked ? " · docked" : c.system ? " · in space" : "");
   $("ceo-wallet").textContent = fmt(c.wallet) + " ISK";
   $("dockbadge").textContent = c.docked ? "DOCKED — " + (c.system||"") : "UNDER WAY — " + (c.system||"");
+  const img = $("np-img");
   if (it.archetype === "hq") {
     $("np-name").textContent = "GLUG CORPORATE HEADQUARTERS";
     $("np-sub").textContent = "The CEO is commuting. Business continues.";
+    img.style.display = "none";
   } else {
     $("np-name").textContent = (c.ship_name||"UNREGISTERED VESSEL").toUpperCase();
     const mass = it.mass ? fmt(it.mass/1000) + " t" : "";
     $("np-sub").textContent = `${c.ship_type||"?"}-class ${it.ship_class}` +
-      ` · est. complement ${fmt(it.complement)} souls · ${mass}`;
+      ` · ≈${fmt(it.length_m)} m · est. complement ${fmt(it.complement)} souls · ${mass}`;
+    if (it.type_id){
+      const src = `https://images.evetech.net/types/${it.type_id}/render?size=64`;
+      if (img.src !== src) img.src = src;
+      img.style.display = "block";
+    } else img.style.display = "none";
   }
   $("crew").innerHTML = S.crew.map(m =>
     `<tr><td><span class="dept-dot" style="background:${DEPT_COLOR[m.dept]||"#888"}"></span>
@@ -251,55 +265,68 @@ function trainingText(){
 // ── Diorama ──────────────────────────────────────────────────
 const cv = $("diorama"), ctx = cv.getContext("2d");
 const dpr = window.devicePixelRatio || 1;
-let W = 0, H = 400;
+const PPM = 20;                     // px per metre — a 1.8 m crew sprite is 36 px
+const DECKS = [{y:36,h:130},{y:178,h:130}];
+const HULL_TOP = 24, HULL_BOT = 316, RULER_Y = 338;
+let W = 0, H = 360, off = 0, offInit = false;
 function resize(){ W = cv.clientWidth; cv.width = W*dpr; cv.height = H*dpr;
-  ctx.setTransform(dpr,0,0,dpr,0,0); }
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  const m = $("minimap"); m.width = m.clientWidth*dpr; m.height = 48*dpr; }
 window.addEventListener("resize", resize);
 
 const stars = Array.from({length:90}, () => ({x:Math.random(), y:Math.random(),
   r:Math.random()*1.3+0.3, tw:Math.random()*6}));
 
 let agents = [], layoutKey = "";
-function hull(){ const m = 46; return {x:m, y:26, w:W-2*m, h:H-100}; }
-function roomPx(r){ const h = hull();
-  return {x:h.x+r.x*h.w, y:h.y+r.y*h.h, w:r.w*h.w, h:r.h*h.h, kind:r.kind, label:r.label}; }
+const worldW = () => (S ? S.interior.length_m*PPM : 0);
+function roomPx(r){ const d = DECKS[r.deck];
+  return {x:r.x*PPM, y:d.y, w:r.w*PPM, h:d.h, kind:r.kind, label:r.label, deck:r.deck}; }
+function clampOff(){
+  if (worldW() <= W){ off = (worldW()-W)/2; return; }
+  off = Math.max(0, Math.min(off, worldW()-W));
+}
 
 function syncAgents(){
-  const it = S.interior, key = JSON.stringify([it.rooms.map(r=>r.kind), S.crew.map(c=>c.id)]);
+  const it = S.interior,
+    key = JSON.stringify([it.rooms.map(r=>r.kind+r.x), S.crew.map(c=>c.id)]);
   if (key === layoutKey) return;
   layoutKey = key;
   agents = [];
   const rooms = it.rooms.map(roomPx);
-  const named = S.crew.slice(0, 12);
-  const anon = Math.min(14, it.complement ? Math.round(Math.sqrt(it.complement)) : 0);
+  const named = S.crew.slice(0, 24);
+  const anon = Math.min(80, Math.round(it.length_m/18));  // contractor density
   const mk = (name, color, dark, isAnon) => {
-    const r = rooms[Math.floor(Math.random()*rooms.length)];
-    agents.push({ name, color, dark, anon:isAnon, room:r, dir:1,
+    const ri = Math.floor(Math.random()*rooms.length), r = rooms[ri];
+    agents.push({ name, color, dark, anon:isAnon, ri, dir:1,
       x:r.x + Math.random()*r.w, dwell: 1+Math.random()*4,
       speed: 26+Math.random()*18, phase: Math.random()*7 });
   };
   named.forEach(c => mk(c.name.split(" ")[0], DEPT_COLOR[c.dept]||"#999",
                         DEPT_DARK[c.dept]||"#555", false));
   for (let i=0;i<anon;i++) mk(null, "#3d434e", "#2c313b", true);
+  if (!offInit){ off = worldW(); clampOff(); offInit = true; }  // start at the bow
 }
 
 function stepAgents(dt){
   if (!S) return;
   const rooms = S.interior.rooms.map(roomPx);
+  const active = new Set();
+  for (const o of (S.orders||[])) (WORK_ROOMS[o.kind]||[]).forEach(k=>active.add(k));
   for (const a of agents){
-    // keep the reference fresh after resize
-    a.room = rooms.find(r => r.label === a.room.label) || rooms[0];
-    const floor = a.room.y + a.room.h;
+    a.room = rooms[a.ri] || rooms[0];
     if (a.tx == null){
       a.dwell -= dt;
       if (a.dwell <= 0){
-        const sameDeck = rooms.filter(r => Math.abs((r.y+r.h) - floor) < 4);
-        const active = new Set();
-        for (const o of (S.orders||[])) (WORK_ROOMS[o.kind]||[]).forEach(k=>active.add(k));
-        const hot = sameDeck.filter(r => active.has(r.kind));
+        // contractors wander locally; named crew roam and chase active work
+        const sameDeck = rooms.map((r,i)=>({r,i})).filter(o =>
+          o.r.deck === a.room.deck &&
+          (!a.anon || Math.abs(o.r.x - a.room.x) < 120*PPM));
+        const hot = sameDeck.filter(o => active.has(o.r.kind));
         const pool = (!a.anon && hot.length && Math.random() < 0.75) ? hot : sameDeck;
-        const dest = pool[Math.floor(Math.random()*pool.length)] || a.room;
-        a.room = dest; a.tx = dest.x + 8 + Math.random()*(dest.w-16);
+        const dest = pool[Math.floor(Math.random()*pool.length)];
+        if (dest){ a.ri = dest.i; a.room = dest.r;
+          a.tx = dest.r.x + 8 + Math.random()*(dest.r.w-16); }
+        else a.dwell = 2;
       }
     } else {
       const dx = a.tx - a.x, step = a.speed*dt;
@@ -308,6 +335,21 @@ function stepAgents(dt){
     }
   }
 }
+
+// ── Pan: drag, wheel, minimap ────────────────────────────────
+let dragX = null;
+cv.addEventListener("pointerdown", e => { dragX = e.clientX; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener("pointermove", e => {
+  if (dragX != null){ off -= (e.clientX - dragX); dragX = e.clientX; clampOff(); } });
+cv.addEventListener("pointerup", () => dragX = null);
+cv.addEventListener("wheel", e => { e.preventDefault();
+  off += (e.deltaY + e.deltaX); clampOff(); }, {passive:false});
+const mm = $("minimap");
+function mmJump(e){ const r = mm.getBoundingClientRect();
+  off = ((e.clientX - r.left) / r.width) * worldW() - W/2; clampOff(); }
+mm.addEventListener("pointerdown", e => { mmJump(e); mm.setPointerCapture(e.pointerId); mm._d = 1; });
+mm.addEventListener("pointermove", e => { if (mm._d) mmJump(e); });
+mm.addEventListener("pointerup", () => mm._d = 0);
 
 // ── Pixel sprites (hybrid art direction: pixel crew in vector rooms) ──
 const PXS = 3;
@@ -469,81 +511,61 @@ const WORK_ROOMS = { ore:["intake","processing","ore_hold","crystal_bay"],
 
 function draw(t){
   ctx.clearRect(0,0,W,H);
-  const it = S && S.interior;
-  // space backdrop
   ctx.fillStyle = "#07080b"; ctx.fillRect(0,0,W,H);
-  for (const s of stars){
+  for (const s of stars){   // parallax starfield
     ctx.globalAlpha = 0.35 + 0.45*Math.abs(Math.sin(t*0.7+s.tw));
     ctx.fillStyle = "#cdd6e4";
-    ctx.beginPath(); ctx.arc(((s.x+t*0.004)%1)*W, s.y*H, s.r, 0, 7); ctx.fill();
+    const sx = ((s.x - off*0.00012) % 1 + 1) % 1;
+    ctx.beginPath(); ctx.arc(sx*W, s.y*H, s.r, 0, 7); ctx.fill();
   }
   ctx.globalAlpha = 1;
-  if (!it) return;
-  const h = hull(), docked = S.ceo.docked, hq = it.archetype==="hq";
+  if (!S) return;
+  const it = S.interior, WW = worldW(), docked = S.ceo.docked;
 
-  if (docked && !hq){ // dock gantry behind hull
-    ctx.strokeStyle="#161a21"; ctx.lineWidth=9;
-    for (const gx of [h.x-18, h.x+h.w+18]){
-      ctx.beginPath(); ctx.moveTo(gx,0); ctx.lineTo(gx,H); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(gx, h.y+20); ctx.lineTo(gx<W/2?h.x+6:h.x+h.w-6, h.y+40); ctx.stroke();
+  ctx.save(); ctx.translate(-Math.round(off), 0);
+  // hull body — full real length in world coords
+  ctx.fillStyle = "#101319";
+  ctx.beginPath();
+  ctx.moveTo(-14, HULL_TOP+30);
+  ctx.quadraticCurveTo(-14, HULL_TOP, 40, HULL_TOP);
+  ctx.lineTo(WW-90, HULL_TOP);
+  ctx.quadraticCurveTo(WW+26, (HULL_TOP+HULL_BOT)/2, WW-90, HULL_BOT);
+  ctx.lineTo(40, HULL_BOT);
+  ctx.quadraticCurveTo(-14, HULL_BOT, -14, HULL_BOT-30);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "#39404e"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.strokeStyle = "#1c212b"; ctx.lineWidth = 4;   // deck divider
+  ctx.beginPath(); ctx.moveTo(20, 172); ctx.lineTo(WW-70, 172); ctx.stroke();
+  if (!docked && it.archetype !== "hq"){   // stern engine glow
+    const p = 0.6+Math.sin(t*9)*0.25;
+    for (const ey of [70, 220]){
+      const grad = ctx.createLinearGradient(-54, 0, -12, 0);
+      grad.addColorStop(0, "rgba(106,176,243,0)");
+      grad.addColorStop(1, `rgba(106,176,243,${p*0.55})`);
+      ctx.fillStyle = grad; ctx.fillRect(-54, ey, 42, 50);
     }
   }
 
-  // hull silhouette
-  ctx.save();
-  ctx.beginPath();
-  if (hq){
-    ctx.roundRect(h.x, h.y, h.w, h.h, 8);
-  } else {
-    const nose = it.archetype==="generic" ? 70 : 40;
-    ctx.moveTo(h.x+14, h.y);
-    ctx.lineTo(h.x+h.w-nose, h.y);
-    ctx.quadraticCurveTo(h.x+h.w+8, h.y+h.h/2, h.x+h.w-nose, h.y+h.h);
-    ctx.lineTo(h.x+14, h.y+h.h);
-    ctx.quadraticCurveTo(h.x-6, h.y+h.h/2, h.x+14, h.y);
-  }
-  ctx.closePath();
-  ctx.fillStyle = "#101319"; ctx.fill();
-  ctx.strokeStyle = "#39404e"; ctx.lineWidth = 3; ctx.stroke();
-
-  if (!hq && !docked){ // engine glow at stern
-    const p = 0.6+Math.sin(t*9)*0.25;
-    const grad = ctx.createLinearGradient(h.x-36, 0, h.x, 0);
-    grad.addColorStop(0, "rgba(106,176,243,0)");
-    grad.addColorStop(1, `rgba(106,176,243,${p*0.55})`);
-    ctx.fillStyle = grad;
-    ctx.fillRect(h.x-36, h.y+h.h*0.3, 38, h.h*0.16);
-    ctx.fillRect(h.x-36, h.y+h.h*0.58, 38, h.h*0.16);
-  }
-  if (it.archetype==="miner" && !hq){ // mining rig mast on top
-    ctx.strokeStyle="#39404e"; ctx.lineWidth=3;
-    ctx.beginPath(); ctx.moveTo(h.x+h.w*0.35, h.y); ctx.lineTo(h.x+h.w*0.35, h.y-16);
-    ctx.lineTo(h.x+h.w*0.48, h.y-16); ctx.stroke();
-  }
-  ctx.clip();
-
-  // active-work room kinds this frame
   const active = new Set();
   for (const o of (S.orders||[])) (WORK_ROOMS[o.kind]||[]).forEach(k=>active.add(k));
 
-  // rooms
   ctx.textBaseline = "alphabetic";
   for (const r0 of it.rooms){
     const r = roomPx(r0);
+    if (r.x + r.w < off - 60 || r.x > off + W + 60) continue;   // cull
     ctx.fillStyle = "#151a22";
     ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.fill();
     const hot = active.has(r.kind);
     ctx.strokeStyle = hot ? `rgba(255,210,62,${0.45+Math.sin(t*4)*0.25})` : "#232936";
     ctx.lineWidth = hot ? 2 : 1.5;
     ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.stroke();
-    // floor line
     ctx.strokeStyle = "#2a303c"; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(r.x+2, r.y+r.h-2); ctx.lineTo(r.x+r.w-2, r.y+r.h-2); ctx.stroke();
     (PROPS[r.kind]||prop_console_room)(r, t);
     ctx.font = "9.5px Segoe UI"; ctx.textAlign = "left";
     ctx.fillStyle = hot ? "#c8a832" : "#525a68";
     ctx.fillText(r.label.toUpperCase(), r.x+5, r.y+11);
-    if (hot){ // work motes rising
+    if (hot){
       for (let i=0;i<2;i++){
         const my = (t*14+i*9) % (r.h-18);
         ctx.fillStyle = "rgba(255,210,62,0.5)";
@@ -556,15 +578,62 @@ function draw(t){
       ctx.fillText(trainingText().split("— ")[1]||"", r.x+r.w/2, r.y+r.h+10);
     }
   }
-  for (const a of agents) drawAgent(a, t);
+  for (const a of agents){
+    if (a.x < off - 40 || a.x > off + W + 40) continue;   // cull
+    drawAgent(a, t);
+  }
   ctx.restore();
+  drawRuler();
+}
+
+function drawRuler(){
+  ctx.fillStyle = "#0a0c10"; ctx.fillRect(0, HULL_BOT+8, W, H-HULL_BOT-8);
+  ctx.font = "9px Consolas,monospace";
+  const m0 = Math.floor(off/PPM/10)*10;
+  for (let m = m0; m*PPM < off+W; m += 10){
+    const x = m*PPM - off, major = m % 50 === 0;
+    ctx.strokeStyle = major ? "#39404e" : "#20242c"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, RULER_Y-6); ctx.lineTo(x, RULER_Y+(major?4:0)); ctx.stroke();
+    if (major && m >= 0){ ctx.fillStyle = "#525a68"; ctx.textAlign = "left";
+      ctx.fillText(fmt(m)+" m", x+3, RULER_Y+7); }
+  }
+  ctx.fillStyle = "#6b7482"; ctx.textAlign = "right";
+  ctx.fillText(`VIEWING ${Math.round(Math.min(W, worldW())/PPM)} m OF ${fmt(S.interior.length_m)} m · CREW AT TRUE SCALE (1.8 m)`,
+    W-8, RULER_Y+7);
+  ctx.textAlign = "left";
+}
+
+function drawMinimap(){
+  const m = $("minimap"), g = m.getContext("2d");
+  const mw = m.clientWidth, mh = 48;
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.fillStyle = "#0a0c10"; g.fillRect(0,0,mw,mh);
+  if (!S) return;
+  const WW = worldW(), sc = (mw-24)/WW, x0 = 12;
+  g.fillStyle = "#1a1f29"; g.strokeStyle = "#39404e"; g.lineWidth = 1.5;
+  g.beginPath();
+  g.moveTo(x0, 14); g.lineTo(x0+WW*sc*0.93, 12);
+  g.quadraticCurveTo(x0+WW*sc+5, 24, x0+WW*sc*0.93, 36);
+  g.lineTo(x0, 34); g.closePath(); g.fill(); g.stroke();
+  const active = new Set();
+  for (const o of (S.orders||[])) (WORK_ROOMS[o.kind]||[]).forEach(k=>active.add(k));
+  for (const r0 of S.interior.rooms){
+    g.fillStyle = active.has(r0.kind) ? "#ffd23e" : "#2c3340";
+    g.fillRect(x0 + r0.x*PPM*sc, r0.deck ? 26 : 18, Math.max(1.5, r0.w*PPM*sc), 5);
+  }
+  for (const a of agents) if (!a.anon){
+    g.fillStyle = a.color; g.fillRect(x0 + a.x*sc - 1, 22, 2.5, 4);
+  }
+  g.strokeStyle = "#ffd23e"; g.lineWidth = 1.5;
+  g.strokeRect(x0 + off*sc, 3, Math.max(8, W*sc), 42);
 }
 function prop_console_room(r,t){ prop_console(r.x+r.w/2, r.y+r.h-4, t); }
 
 let last = performance.now();
 function frame(now){
   const dt = Math.min(0.1, (now-last)/1000); last = now;
-  if (S){ stepAgents(dt); draw(now/1000); $("ceo-train").textContent = trainingText(); }
+  if (S){ stepAgents(dt); draw(now/1000); drawMinimap();
+    $("ceo-train").textContent = trainingText(); }
   requestAnimationFrame(frame);
 }
 
