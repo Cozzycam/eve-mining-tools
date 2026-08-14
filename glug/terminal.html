@@ -51,6 +51,23 @@ button:disabled { opacity:.35; cursor:default; }
 .tag { font-size:9.5px; padding:1px 6px; border-radius:3px; background:var(--edge);
        color:var(--dim); text-transform:uppercase; letter-spacing:.08em; }
 .dept-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+.wings { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; }
+.wing h3 { font-size:10.5px; letter-spacing:.14em; color:var(--dim); margin:2px 0 7px;
+           text-transform:uppercase; }
+.prod { border:1px solid var(--edge); border-radius:8px; padding:8px 11px;
+        margin-bottom:8px; background:var(--panel2); }
+.prod.locked { opacity:.45; }
+.prod.launched { border-color:var(--glug-dk); }
+.prod .row1 { display:flex; justify-content:space-between; gap:8px; align-items:center; }
+.prod b { font-size:13px; }
+.prod .blurb { font-size:11px; color:var(--dim); font-style:italic; }
+.prod .bar { margin-top:7px; }
+.prod .foot { display:flex; justify-content:space-between; align-items:center; margin-top:7px; }
+.badge-launched { color:var(--glug); font-size:9.5px; letter-spacing:.12em; }
+.reqline { font-size:10.5px; color:var(--dim); margin-top:4px; }
+select { background:var(--panel2); color:var(--ink); border:1px solid var(--edge);
+         border-radius:6px; padding:5px 8px; font-size:12.5px; }
+#frmap { width:100%; height:130px; display:block; border-radius:6px; margin-bottom:8px; }
 #toast { position:fixed; bottom:18px; right:18px; background:var(--glug); color:#15130a;
          padding:10px 16px; border-radius:7px; font-weight:700; display:none; z-index:9;
          box-shadow:0 4px 18px #000a; }
@@ -61,6 +78,7 @@ footer { margin-top:14px; color:#454c58; font-size:10.5px; letter-spacing:.06em;
   <h1>GLUG&trade; INTERNAL OPERATIONS TERMINAL
     <small>NOURISHING WORKERS &middot; DEFENDING MARGINS</small></h1>
   <div class="head-scrip"><b id="scrip">…</b><span>COMPANY SCRIP (GS)</span></div>
+  <div class="head-scrip" style="margin-left:22px"><b id="be" style="color:var(--blue)">…</b><span>BRAND EQUITY</span></div>
 </header>
 
 <div id="stage">
@@ -73,7 +91,13 @@ footer { margin-top:14px; color:#454c58; font-size:10.5px; letter-spacing:.06em;
   <div class="panel"><h2>Company</h2>
     <div class="kv"><span>Company age</span><b id="age">…</b></div>
     <div class="kv"><span>Work orders open / filled</span><b id="orders-n">…</b></div>
-    <div style="margin-top:9px"><button id="hire">Hire crew</button>
+    <div class="kv"><span>Earnings multiplier</span><b id="mult">…</b></div>
+    <div style="margin-top:9px; display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+      <button id="hire">Hire crew</button>
+      <select id="hire-dept"><option value="">Any dept</option>
+        <option>Logistics</option><option>Catering</option>
+        <option>Safety &amp; Compliance</option><option>Marketing</option>
+        <option>R&amp;D</option></select>
       <span class="dim" id="hire-cost"></span></div>
   </div>
   <div class="panel"><h2>Executive Status</h2>
@@ -84,6 +108,10 @@ footer { margin-top:14px; color:#454c58; font-size:10.5px; letter-spacing:.06em;
   </div>
   <div class="panel"><h2>Crew Roster</h2><table id="crew"></table></div>
   <div class="panel"><h2>Work Order Queue</h2><table id="queue"></table></div>
+  <div class="panel"><h2>Franchise Network <span id="fr-sub"></span></h2>
+    <canvas id="frmap"></canvas><table id="franchises"></table></div>
+  <div class="panel" style="grid-column:1/-1"><h2>Product Development
+    <span id="pd-sub"></span></h2><div class="wings" id="products"></div></div>
   <div class="panel" style="grid-column:1/-1"><h2>Scrip Ledger</h2><table id="ledger"></table></div>
 </div>
 <footer>GLUG&trade; IS A FAMILY COMPANY &middot; THIS TERMINAL IS MONITORED FOR YOUR CONVENIENCE</footer>
@@ -101,7 +129,7 @@ function toast(msg){ const t=$("toast"); t.textContent=msg; t.style.display="blo
   clearTimeout(t._h); t._h=setTimeout(()=>t.style.display="none",3500); }
 async function act(body){ const r=await fetch("/api/action",{method:"POST",body:JSON.stringify(body)});
   toast((await r.json()).msg); refresh(); }
-$("hire").onclick = () => act({action:"hire"});
+$("hire").onclick = () => act({action:"hire", dept:$("hire-dept").value||undefined});
 
 // ── Panels ───────────────────────────────────────────────────
 function renderPanels(){
@@ -140,6 +168,74 @@ function renderPanels(){
     `<tr><td class="dim" style="width:56px">${l.age_h<1 ? Math.round(l.age_h*60)+"m" : l.age_h.toFixed(1)+"h"}</td>
      <td class="${l.amount>=0?"pos":"neg"}" style="width:90px">${l.amount>=0?"+":""}${fmt(l.amount,1)}</td>
      <td>${l.reason}</td></tr>`).join("");
+  $("be").textContent = fmt(S.brand_equity);
+  $("mult").textContent = "×" + S.earn_mult.toFixed(2);
+  renderProducts(); renderFranchises();
+}
+
+const REQ_TEXT = { ore_m3:"m³ of raw material processed",
+  income_units:"paperwork units filed", pi_events:"planetary transactions",
+  launches:"product launches", bounty_isk:"ISK of bounties collected" };
+const WING_TITLE = { consumer:"Consumer Wing ☺", defense:"Defense Wing" };
+
+function prodCard(p){
+  const nLaunched = S.products.filter(x=>x.launched).length;
+  if (p.launched)
+    return `<div class="prod launched"><div class="row1"><b>${p.name}</b>
+      <span class="badge-launched">IN MARKET</span></div>
+      <div class="blurb">${p.blurb}</div></div>`;
+  if (!p.unlocked){
+    const have = p.req[0]==="launches" ? nLaunched : (S.counters[p.req[0]]||0);
+    return `<div class="prod locked"><div class="row1"><b>${p.name}</b>
+      <span class="tag">Locked</span></div>
+      <div class="reqline">Requires ${fmt(p.req[1])} ${REQ_TEXT[p.req[0]]||p.req[0]}
+      — have ${fmt(have)}. Go get it in New Eden.</div></div>`;
+  }
+  const pct = Math.min(100, 100*p.research/p.cost);
+  const done = p.research >= p.cost;
+  return `<div class="prod"><div class="row1"><b>${p.name}</b>
+      ${p.active ? '<span class="tag" style="color:var(--glug)">RESEARCHING</span>' : ""}</div>
+    <div class="blurb">${p.blurb}</div>
+    <div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div>
+    <div class="foot"><span class="dim">${fmt(p.research)} / ${fmt(p.cost)} rp</span>
+      ${done ? `<button class="mini" onclick='act({action:"launch",key:"${p.key}"})'>LAUNCH (+${p.be} BE)</button>`
+             : p.active ? "" : `<button class="mini" onclick='act({action:"research",key:"${p.key}"})'>Research</button>`}
+    </div></div>`;
+}
+function renderProducts(){
+  const wings = ["consumer","defense"];
+  $("pd-sub").textContent = S.products.filter(p=>p.launched).length + " in market";
+  $("products").innerHTML = wings.map(w =>
+    `<div class="wing"><h3>${WING_TITLE[w]}</h3>` +
+    S.products.filter(p=>p.wing===w).map(prodCard).join("") + `</div>`).join("");
+}
+
+function renderFranchises(){
+  const fr = S.franchises;
+  $("fr-sub").textContent = `${fr.length} locations · +${fmt(fr.length*S.franchise_rate*S.earn_mult,1)} GS/hr`;
+  $("franchises").innerHTML = fr.length ? fr.map(f =>
+    `<tr><td>☺ Glug ${f.system}</td><td class="dim">${f.name.length>44?f.name.slice(0,44)+"…":f.name}</td></tr>`).join("")
+    : `<tr><td class="dim">Dock somewhere. Glug will follow.</td></tr>`;
+  const c = $("frmap"), w = c.clientWidth||300, h = 130;
+  c.width = w*dpr; c.height = h*dpr;
+  const g = c.getContext("2d"); g.setTransform(dpr,0,0,dpr,0,0);
+  g.fillStyle = "#0a0c10"; g.fillRect(0,0,w,h);
+  const pts = Object.values(Object.fromEntries(
+    fr.filter(f=>f.pos).map(f=>[f.system,f])));
+  if (!pts.length){ g.fillStyle="#525a68"; g.font="11px Segoe UI";
+    g.textAlign="center"; g.fillText("No franchise locations charted.", w/2, h/2); return; }
+  const xs = pts.map(p=>p.pos[0]), ys = pts.map(p=>p.pos[1]);
+  const minx=Math.min(...xs), maxx=Math.max(...xs), miny=Math.min(...ys), maxy=Math.max(...ys);
+  const span = Math.max(maxx-minx, maxy-miny) || 1;
+  const sc = (Math.min(w,h)-44)/span;
+  for (const f of pts){
+    const px = 22 + (f.pos[0]-minx)*sc + (w-44-(maxx-minx)*sc)/2;
+    const py = h-22 - ((f.pos[1]-miny)*sc + (h-44-(maxy-miny)*sc)/2);
+    g.fillStyle = "rgba(255,210,62,.22)"; g.beginPath(); g.arc(px,py,8,0,7); g.fill();
+    g.fillStyle = "#ffd23e"; g.beginPath(); g.arc(px,py,2.5,0,7); g.fill();
+    g.fillStyle = "#8a93a1"; g.font = "10px Segoe UI"; g.textAlign = "center";
+    g.fillText(f.system, px, py-11);
+  }
 }
 function trainingText(){
   const t = S && S.ceo.training;
@@ -195,7 +291,11 @@ function stepAgents(dt){
       a.dwell -= dt;
       if (a.dwell <= 0){
         const sameDeck = rooms.filter(r => Math.abs((r.y+r.h) - floor) < 4);
-        const dest = sameDeck[Math.floor(Math.random()*sameDeck.length)] || a.room;
+        const active = new Set();
+        for (const o of (S.orders||[])) (WORK_ROOMS[o.kind]||[]).forEach(k=>active.add(k));
+        const hot = sameDeck.filter(r => active.has(r.kind));
+        const pool = (!a.anon && hot.length && Math.random() < 0.75) ? hot : sameDeck;
+        const dest = pool[Math.floor(Math.random()*pool.length)] || a.room;
         a.room = dest; a.tx = dest.x + 8 + Math.random()*(dest.w-16);
       }
     } else {

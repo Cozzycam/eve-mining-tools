@@ -44,7 +44,44 @@ COLONY_ORDER_UNITS = 50.0 # per PI colony cycle detected
 
 SCRIP_PER_UNIT = {"ore": 1.0, "income": 0.8, "colony": 1.2}
 
+RESEARCH_RD_FACTOR = 0.5      # R&D crew: research points per work-unit rate
+RESEARCH_OTHER_FACTOR = 0.05  # everyone else chips in a little
+FRANCHISE_RATE = 2.0          # scrip/hour per open franchise
+LAUNCH_MULT = 0.02            # permanent earnings multiplier per launched product
+
 DEPARTMENTS = ["Logistics", "Catering", "Safety & Compliance", "Marketing", "R&D"]
+
+# Product catalogue. req: (activity counter, threshold) unlocked by REAL play.
+# be = Brand Equity minted at launch.
+PRODUCTS = {
+    "original":  {"wing": "consumer", "name": "Glug Original Formula", "cost": 200,
+                  "req": None, "be": 2,
+                  "blurb": "The milk that built an empire."},
+    "banana":    {"wing": "consumer", "name": "Glug Banana Milk", "cost": 600,
+                  "req": ("income_units", 100), "be": 6,
+                  "blurb": "Now with detectable banana."},
+    "sparkling": {"wing": "consumer", "name": "Glug Sparkling", "cost": 1500,
+                  "req": ("ore_m3", 5000), "be": 15,
+                  "blurb": "Carbonated with genuine asteroid minerals."},
+    "protein":   {"wing": "consumer", "name": "Glug HardWork Protein Shake", "cost": 3000,
+                  "req": ("pi_events", 10), "be": 30,
+                  "blurb": "Planetary nutrients. Mandatory cheerfulness."},
+    "zero":      {"wing": "consumer", "name": "Glug Zero", "cost": 6000,
+                  "req": ("launches", 2), "be": 60,
+                  "blurb": "Everything you love about Glug. Nothing else."},
+    "spray":     {"wing": "defense", "name": "Glug Pepper Spray (Family Size)", "cost": 800,
+                  "req": None, "be": 8,
+                  "blurb": "Self-defense for the whole household."},
+    "ammo":      {"wing": "defense", "name": "GlugShot Small Arms Ammunition", "cost": 2500,
+                  "req": ("ore_m3", 20000), "be": 25,
+                  "blurb": "Forged from minerals you personally met."},
+    "guidance":  {"wing": "defense", "name": "Glug Guidance Systems", "cost": 8000,
+                  "req": ("pi_events", 30), "be": 80,
+                  "blurb": "Finds its way home. Like family."},
+    "orbital":   {"wing": "defense", "name": "Glug Party Popper (Orbital)", "cost": 15000,
+                  "req": ("launches", 4), "be": 150,
+                  "blurb": "For very special occasions."},
+}
 
 FIRST = ["Aile", "Bex", "Cato", "Dree", "Emek", "Fenn", "Gozi", "Hale", "Ilya",
          "Jax", "Kess", "Lomi", "Moro", "Nyra", "Osun", "Pell", "Quon", "Rask",
@@ -82,6 +119,16 @@ CREATE TABLE IF NOT EXISTS mining_cursor(
 CREATE TABLE IF NOT EXISTS scrip_ledger(
     ts REAL, amount REAL, reason TEXT
 );
+CREATE TABLE IF NOT EXISTS products(
+    key TEXT PRIMARY KEY,
+    research REAL NOT NULL DEFAULT 0,
+    launched_ts REAL
+);
+CREATE TABLE IF NOT EXISTS franchises(
+    location_id INTEGER PRIMARY KEY,
+    solar_system_id INTEGER,
+    opened_ts REAL
+);
 """
 
 
@@ -105,12 +152,32 @@ def set_state(db, key, value):
                (key, json.dumps(value)))
 
 
+def launch_count(db):
+    return db.execute("SELECT COUNT(*) FROM products "
+                      "WHERE launched_ts IS NOT NULL").fetchone()[0]
+
+
+def earn_mult(db):
+    """Permanent company-wide earnings multiplier from launched products."""
+    return 1.0 + LAUNCH_MULT * launch_count(db)
+
+
 def earn(db, amount, reason, now):
+    amount *= earn_mult(db)
     if amount <= 0:
         return
     set_state(db, "scrip", get_state(db, "scrip", 0.0) + amount)
-    db.execute("INSERT INTO scrip_ledger(ts, amount, reason) VALUES(?,?,?)",
-               (now, amount, reason))
+    # Micro-earnings from frequent sim ticks pool up per reason and only hit
+    # the ledger once they reach 1 GS — keeps the ledger legible, scrip exact.
+    pending = get_state(db, "pending_ledger", {})
+    total = pending.get(reason, 0.0) + amount
+    if total >= 1.0:
+        db.execute("INSERT INTO scrip_ledger(ts, amount, reason) VALUES(?,?,?)",
+                   (now, total, reason))
+        pending[reason] = 0.0
+    else:
+        pending[reason] = total
+    set_state(db, "pending_ledger", pending)
 
 
 def spend(db, amount, reason, now):
@@ -158,9 +225,15 @@ def _type_name_vol(type_id):
     return info.get("name", f"Type {type_id}"), info.get("volume", 1.0)
 
 
+def bump(counters, key, amount=1):
+    counters[key] = counters.get(key, 0) + amount
+
+
 def ingest(db, now):
     """Turn new poller rows into work orders. Idempotent via cursors/sources."""
-    # Wallet journal → paperwork orders
+    counters = get_state(db, "counters", {})
+
+    # Wallet journal → paperwork orders + activity counters
     cursor = get_state(db, "journal_cursor", 0)
     rows = db.execute(
         "SELECT id, ref_type, amount, description FROM wallet_journal "
@@ -172,6 +245,11 @@ def ingest(db, now):
         label = f"{verb}: {desc or ref_type or 'transaction'}"
         _add_order(db, "income", label[:80], units, f"journal:{jid}", now)
         cursor = jid
+        bump(counters, "income_units", units)
+        if "planetary" in (ref_type or ""):
+            bump(counters, "pi_events")
+        if ref_type == "bounty_prizes" and amount > 0:
+            bump(counters, "bounty_isk", amount)
     set_state(db, "journal_cursor", cursor)
 
     # Mining ledger deltas → raw material intake orders
@@ -188,6 +266,16 @@ def ingest(db, now):
                    f"mining:{date}:{tid}:{sysid}:{qty}", now)
         db.execute("INSERT OR REPLACE INTO mining_cursor VALUES(?,?,?,?)",
                    (date, tid, sysid, qty))
+        bump(counters, "ore_m3", m3)
+
+    # Docking history → franchises (small table; full rescan is cheap)
+    for (blob, ts) in db.execute(
+            "SELECT data, ts FROM snapshots WHERE kind='location'"):
+        loc = json.loads(blob)
+        station = loc.get("station_id") or loc.get("structure_id")
+        if station:
+            db.execute("INSERT OR IGNORE INTO franchises VALUES(?,?,?)",
+                       (station, loc.get("solar_system_id"), ts))
 
     # PI colony snapshot changes → colony resupply orders
     snap_cursor = get_state(db, "snap_cursor", 0)
@@ -199,6 +287,10 @@ def ingest(db, now):
                    COLONY_ORDER_UNITS, f"snap:{sid}", now)
     row = db.execute("SELECT MAX(id) FROM snapshots").fetchone()
     set_state(db, "snap_cursor", row[0] or snap_cursor)
+    set_state(db, "counters", counters)
+    # Seed the product catalogue (idempotent)
+    for key in PRODUCTS:
+        db.execute("INSERT OR IGNORE INTO products(key) VALUES(?)", (key,))
     db.commit()
 
 
@@ -242,6 +334,25 @@ def advance(db, now):
         earn(db, BUSYWORK_RATE * len(crew) * idle_hours,
              "busywork: internal Glug contracts", now)
 
+    # Franchise network trickle
+    n_fr = db.execute("SELECT COUNT(*) FROM franchises").fetchone()[0]
+    if n_fr:
+        earn(db, FRANCHISE_RATE * n_fr * hours,
+             f"franchise network ({n_fr} locations)", now)
+
+    # R&D: research points into the active project
+    active = get_state(db, "active_research")
+    if active in PRODUCTS:
+        rd_rate = sum(crew_rate(lvl) for _, lvl in db.execute(
+            "SELECT id, level FROM crew WHERE department='R&D'").fetchall())
+        other_rate = sum(crew_rate(lvl) for _, lvl in db.execute(
+            "SELECT id, level FROM crew WHERE department!='R&D'").fetchall())
+        points = (rd_rate * RESEARCH_RD_FACTOR +
+                  other_rate * RESEARCH_OTHER_FACTOR) * hours
+        db.execute("UPDATE products SET research=MIN(research+?, ?) "
+                   "WHERE key=? AND launched_ts IS NULL",
+                   (points, PRODUCTS[active]["cost"], active))
+
     set_state(db, "last_sim_ts", now)
     db.commit()
 
@@ -263,17 +374,74 @@ def hire_cost(db):
     return HIRE_BASE * HIRE_GROWTH ** n
 
 
-def hire_crew(db, now, free=False, rng=random):
+def hire_crew(db, now, free=False, rng=random, dept=None):
     cost = 0 if free else hire_cost(db)
     if not free and not spend(db, cost, "hire", now):
         return None
     n = db.execute("SELECT COUNT(*) FROM crew").fetchone()[0]
     name = f"{rng.choice(FIRST)} {rng.choice(LAST)}"
-    dept = DEPARTMENTS[n % len(DEPARTMENTS)]
+    if dept not in DEPARTMENTS:
+        dept = DEPARTMENTS[n % len(DEPARTMENTS)]
     db.execute("INSERT INTO crew(name, department, hired_ts) VALUES(?,?,?)",
                (name, dept, now))
     db.commit()
     return name, dept, cost
+
+
+def req_met(db, key):
+    """Is a product's real-activity ingredient requirement satisfied?"""
+    req = PRODUCTS[key]["req"]
+    if req is None:
+        return True
+    counter, threshold = req
+    if counter == "launches":
+        return launch_count(db) >= threshold
+    return get_state(db, "counters", {}).get(counter, 0) >= threshold
+
+
+def set_research(db, key):
+    if key not in PRODUCTS or not req_met(db, key):
+        return False
+    row = db.execute("SELECT launched_ts FROM products WHERE key=?", (key,)).fetchone()
+    if row and row[0] is not None:
+        return False
+    set_state(db, "active_research", key)
+    db.commit()
+    return True
+
+
+def launch_product(db, key, now):
+    """Launch a completed product: mint Brand Equity, bump the multiplier."""
+    if key not in PRODUCTS or not req_met(db, key):
+        return None
+    p = PRODUCTS[key]
+    row = db.execute("SELECT research, launched_ts FROM products WHERE key=?",
+                     (key,)).fetchone()
+    if not row or row[1] is not None or row[0] < p["cost"]:
+        return None
+    db.execute("UPDATE products SET launched_ts=? WHERE key=?", (now, key))
+    set_state(db, "brand_equity", get_state(db, "brand_equity", 0) + p["be"])
+    if get_state(db, "active_research") == key:
+        set_state(db, "active_research", None)
+    db.execute("INSERT INTO scrip_ledger(ts, amount, reason) VALUES(?,?,?)",
+               (now, 0, f"PRODUCT LAUNCH: {p['name']} (+{p['be']} Brand Equity)"))
+    db.commit()
+    return p
+
+
+def product_state(db):
+    rows = dict((k, (r, l)) for k, r, l in db.execute(
+        "SELECT key, research, launched_ts FROM products"))
+    active = get_state(db, "active_research")
+    out = []
+    for key, p in PRODUCTS.items():
+        research, launched = rows.get(key, (0, None))
+        out.append({"key": key, "wing": p["wing"], "name": p["name"],
+                    "blurb": p["blurb"], "cost": p["cost"], "be": p["be"],
+                    "research": research, "launched": launched is not None,
+                    "unlocked": req_met(db, key), "req": p["req"],
+                    "active": key == active})
+    return out
 
 
 def train_cost(level):
@@ -398,6 +566,37 @@ def selftest():
     name, lvl, cost = train_crew(db, 1, t0)
     assert lvl == 2 and abs(cost - 75.0) < 0.01
     assert crew_rate(2) == BASE_RATE * RATE_GROWTH
+
+    # ── Farms: counters, franchises, research, launches ──
+    db.execute("INSERT INTO wallet_journal(id, ref_type, amount, description) "
+               "VALUES(3, 'planetary_import_tax', -20000, 'PI tax')")
+    db.execute("INSERT INTO snapshots(kind, ts, data) VALUES('location', ?, ?)",
+               (t0, json.dumps({"solar_system_id": 9, "station_id": 60000001})))
+    ingest(db, t0 + 3600 * 12)
+    ctr = get_state(db, "counters")
+    assert ctr["pi_events"] == 1 and ctr["income_units"] >= 5, ctr
+    assert db.execute("SELECT COUNT(*) FROM franchises").fetchone()[0] == 1
+    # clear the PI-tax order so the next advance is pure passive income
+    db.execute("UPDATE work_orders SET done=units, completed_ts=1 "
+               "WHERE completed_ts IS NULL")
+
+    db.execute("UPDATE crew SET department='R&D' WHERE id=1")
+    assert set_research(db, "original") is True
+    assert set_research(db, "zero") is False, "locked product accepted"
+    pre = get_state(db, "scrip")
+    advance(db, t0 + 3600 * 13)  # 2h window (last advance was t0+11h)
+    # crew: #1 L2 R&D (72 u/hr), #2+#3 L1 (60 each) → rp/h = 36 + 6
+    rp = db.execute("SELECT research FROM products WHERE key='original'").fetchone()[0]
+    assert abs(rp - 2 * (72 * 0.5 + 120 * 0.05)) < 0.01, rp
+    got = get_state(db, "scrip") - pre
+    assert abs(got - 2 * (8.0 * 3 + 2.0 * 1)) < 0.01, got  # busywork + 1 franchise
+
+    assert launch_product(db, "original", t0) is None, "unfinished launch allowed"
+    db.execute("UPDATE products SET research=? WHERE key='original'", (200,))
+    assert launch_product(db, "original", t0)["be"] == 2
+    assert launch_product(db, "original", t0) is None, "double launch"
+    assert get_state(db, "brand_equity") == 2
+    assert abs(earn_mult(db) - 1.02) < 1e-9
     print("selftest OK")
 
 

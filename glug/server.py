@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import eve_common
 import game
+import sso
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8750
 PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "terminal.html")
@@ -114,6 +115,32 @@ ROOM_LABELS = {
 }
 
 
+def franchise_list(db):
+    """Franchises with resolved names and 2D galaxy positions (all cached)."""
+    names = game.get_state(db, "loc_names", {})
+    changed = False
+    out = []
+    for lid, sysid, opened in db.execute(
+            "SELECT location_id, solar_system_id, opened_ts FROM franchises"):
+        key = str(lid)
+        if key not in names:
+            n = eve_common.resolve_station_name(lid)
+            if not n and lid > 10**12:  # player structure → authenticated lookup
+                d = sso.esi_auth_get(f"/universe/structures/{lid}/")
+                n = d.get("name") if d else None
+            names[key] = n or f"Station {lid}"
+            changed = True
+        sysname = eve_common.resolve_system_name(sysid) if sysid else "?"
+        pos = eve_common.get_system_positions({sysname: sysid}).get(sysname) \
+            if sysid else None
+        out.append({"name": names[key], "system": sysname, "pos": pos,
+                    "opened": opened})
+    if changed:
+        game.set_state(db, "loc_names", names)
+        db.commit()
+    return out
+
+
 def _latest(db, kind):
     row = db.execute("SELECT data FROM snapshots WHERE kind=? "
                      "ORDER BY id DESC LIMIT 1", (kind,)).fetchone()
@@ -161,6 +188,12 @@ def build_state():
     interior = build_interior(ship.get("ship_type_id", 0), training)
     state = {
         "interior": interior,
+        "products": game.product_state(db),
+        "franchises": franchise_list(db),
+        "brand_equity": game.get_state(db, "brand_equity", 0),
+        "earn_mult": game.earn_mult(db),
+        "franchise_rate": game.FRANCHISE_RATE,
+        "counters": game.get_state(db, "counters", {}),
         "scrip": game.get_state(db, "scrip", 0.0),
         "age_days": (now - game.get_state(db, "founded_ts", now)) / 86400,
         "hire_cost": game.hire_cost(db),
@@ -187,13 +220,22 @@ def do_action(payload):
     now = game.sim(db)
     action = payload.get("action")
     if action == "hire":
-        result = game.hire_crew(db, now)
+        result = game.hire_crew(db, now, dept=payload.get("dept"))
         msg = (f"Welcome aboard, {result[0]} ({result[1]})!" if result
                else "Insufficient scrip.")
     elif action == "train":
         result = game.train_crew(db, int(payload.get("id", 0)), now)
         msg = (f"{result[0]} advanced to L{result[1]}." if result
                else "Training failed.")
+    elif action == "research":
+        result = game.set_research(db, payload.get("key")) or None
+        msg = ("R&D reassigned. The lab hums with purpose."
+               if result else "That product line is unavailable.")
+    elif action == "launch":
+        result = game.launch_product(db, payload.get("key"), now)
+        msg = (f"🎉 {result['name']} LAUNCHED. +{result['be']} Brand Equity. "
+               f"Marketing is weeping with joy." if result
+               else "Launch conditions not met.")
     else:
         result, msg = None, "Unknown action."
     db.close()
