@@ -72,8 +72,15 @@ GROUP_LENGTHS = [
 ]
 TIER_LENGTHS = {1: 80, 2: 250, 3: 500, 4: 1100, 5: 3600}
 
+# Per-hull overrides (Campbell-calibrated) — beat the class table.
+SHIP_LENGTHS = {
+    12731: 800,   # Bustard
+}
 
-def hull_length(group_name, tier):
+
+def hull_length(type_id, group_name, tier):
+    if type_id in SHIP_LENGTHS:
+        return SHIP_LENGTHS[type_id]
     g = (group_name or "").lower()
     for key, metres in GROUP_LENGTHS:
         if key in g:
@@ -109,7 +116,7 @@ def build_interior(ship_type_id, training):
                 "ship_class": "Corporate Headquarters", "mass": None,
                 "type_id": None, "rooms": rooms}
 
-    L = hull_length(group.get("name"), tier)
+    L = hull_length(ship_type_id, group.get("name"), tier)
     stern = L * 0.09          # engineering zone
     bow = L * 0.07            # bridge zone
     rooms = [
