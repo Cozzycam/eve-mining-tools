@@ -769,7 +769,7 @@ function frame(now){
 
 async function refresh(){
   try {
-    S = await (await fetch("/api/state")).json();
+    S = await (await fetch("/api/state" + location.search)).json();
     syncAgents(); renderPanels(); updateDeckBadges();
   } catch(e) { /* server briefly away; keep last state */ }
 }

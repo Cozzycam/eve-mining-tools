@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import eve_common
@@ -129,24 +130,28 @@ SHIP_PROFILES = {
             (0.55, 1.00, 0.0, 1.0, "engineering"),  # harvester boom (purple)
         ],
     },
-    77114: {   # Metamorphosis — traced from Campbell's annotated shot (2026-08-15)
-        # Mirrored so the lance is the bow. Real hull has a vertical gap
-        # between upper fuselage and the lower pod; approximated continuous.
-        # Length is a guess — send the in-game Long axis to calibrate.
-        "length_m": 150, "height_m": 45,
+    77114: {   # Metamorphosis — re-traced from Campbell's side shot (2026-08-15 v2)
+        # Lance goes off LEFT (x=0); tall upper fin + separate lower pod on
+        # the right, approximated continuous where they meet the body.
+        # Length still a guess — send the in-game Long axis to calibrate;
+        # height follows the image aspect (~0.8 × length).
+        "length_m": 150, "height_m": 120,
         "columns": [
-            (0.00, 0.00, 0.35),                     # upper fuselage (stern edge)
-            (0.05, 0.00, 1.00), (0.30, 0.00, 1.00), # + hanging pod below
-            (0.32, 0.00, 0.57), (0.58, 0.05, 0.57), # fuselage over lance root
-            (0.62, 0.37, 0.57),                     # bare lance boom
-            (0.97, 0.40, 0.54), (1.00, 0.44, 0.50), # lance tip
+            (0.00, 0.36, 0.44),                     # lance tip (off left)
+            (0.30, 0.33, 0.47), (0.38, 0.32, 0.49), # lance thickens to root
+            (0.40, 0.02, 0.50),                     # fin block rises above lance
+            (0.55, 0.00, 0.55),                     # fin top plate, body core
+            (0.66, 0.00, 0.90),                     # lower pod begins
+            (0.80, 0.02, 1.00),                     # pod belly (deepest)
+            (0.97, 0.02, 0.95),                     # fin point over pod edge
+            (1.00, 0.10, 0.86),                     # aft face bevel
         ],
         "bridge_at": "stern",
         "zones": [
-            (0.00, 0.60, 0.00, 0.36, "admin"),       # upper fuselage (green)
-            (0.03, 0.32, 0.55, 1.00, "cargo"),       # lower pod (red)
-            (0.00, 0.06, 0.36, 1.00, "engineering"), # stern engines
-            (0.25, 1.00, 0.36, 0.58, "engineering"), # the lance (purple)
+            (0.00, 0.45, 0.30, 0.52, "engineering"), # the lance (purple)
+            (0.40, 1.00, 0.00, 0.35, "admin"),       # upper fin (green)
+            (0.45, 1.00, 0.35, 0.55, "engineering"), # mid-body machinery
+            (0.60, 1.00, 0.55, 1.00, "cargo"),       # lower pod (red)
         ],
     },
 }
@@ -350,11 +355,13 @@ def _latest(db, kind):
     return json.loads(row[0]) if row else None
 
 
-def build_state():
+def build_state(ship_override=None):
     db = game.open_db()
     now = game.sim(db)
 
     ship = _latest(db, "ship") or {}
+    if ship_override:   # dev hull preview: /?ship=<type_id>
+        ship["ship_type_id"] = ship_override
     loc = _latest(db, "location") or {}
     online = _latest(db, "online") or {}
     queue = _latest(db, "skillqueue") or []
@@ -458,15 +465,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         pages = {"/": PAGE_PATH,
                  "/spike": os.path.join(os.path.dirname(PAGE_PATH), "artspike.html")}
-        if self.path in pages:
+        route = urlparse(self.path).path
+        if route in pages:
             try:
-                with open(pages[self.path], "rb") as f:
+                with open(pages[route], "rb") as f:
                     page = f.read()
             except OSError:
                 page = b"page missing"
             self._send(200, page, "text/html; charset=utf-8")
-        elif self.path == "/api/state":
-            self._send(200, build_state())
+        elif route == "/api/state":
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                override = int(qs["ship"][0])
+            except (KeyError, ValueError):
+                override = None
+            self._send(200, build_state(override))
         else:
             self._send(404, {"error": "not found"})
 
