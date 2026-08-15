@@ -129,6 +129,26 @@ SHIP_PROFILES = {
             (0.55, 1.00, 0.0, 1.0, "engineering"),  # harvester boom (purple)
         ],
     },
+    77114: {   # Metamorphosis — traced from Campbell's annotated shot (2026-08-15)
+        # Mirrored so the lance is the bow. Real hull has a vertical gap
+        # between upper fuselage and the lower pod; approximated continuous.
+        # Length is a guess — send the in-game Long axis to calibrate.
+        "length_m": 150, "height_m": 45,
+        "columns": [
+            (0.00, 0.00, 0.35),                     # upper fuselage (stern edge)
+            (0.05, 0.00, 1.00), (0.30, 0.00, 1.00), # + hanging pod below
+            (0.32, 0.00, 0.57), (0.58, 0.05, 0.57), # fuselage over lance root
+            (0.62, 0.37, 0.57),                     # bare lance boom
+            (0.97, 0.40, 0.54), (1.00, 0.44, 0.50), # lance tip
+        ],
+        "bridge_at": "stern",
+        "zones": [
+            (0.00, 0.60, 0.00, 0.36, "admin"),       # upper fuselage (green)
+            (0.03, 0.32, 0.55, 1.00, "cargo"),       # lower pod (red)
+            (0.00, 0.06, 0.36, 1.00, "engineering"), # stern engines
+            (0.25, 1.00, 0.36, 0.58, "engineering"), # the lance (purple)
+        ],
+    },
 }
 
 ZONE_POOLS = {
