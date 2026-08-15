@@ -78,15 +78,19 @@ DECK_PITCH = 6.0   # metres per deck (industrial hulls have tall holds)
 # columns: (x_frac stern→bow, top_frac, bot_frac) — 0 = top of hull envelope.
 # A deck exists at x where its band lies inside [top, bot].
 SHIP_PROFILES = {
-    12731: {   # Bustard — traced from the 775 m profile shot (2026-08-15)
+    12731: {   # Bustard — re-traced from Campbell's hi-res 775 m side shot (2026-08-15)
         "length_m": 775, "height_m": 220,
         "columns": [
-            (0.00, 0.06, 0.88), (0.07, 0.06, 0.88),
-            (0.08, 0.00, 0.92), (0.27, 0.00, 0.92),
-            (0.30, 0.02, 0.75), (0.33, 0.02, 1.00),
-            (0.70, 0.02, 1.00), (0.73, 0.02, 0.70),
-            (0.88, 0.02, 0.70), (0.93, 0.09, 0.68),
-            (1.00, 0.14, 0.66),
+            (0.00, 0.16, 0.72),                      # stern armour block
+            (0.10, 0.16, 0.75), (0.105, 0.06, 0.80), # command tower steps up
+            (0.22, 0.06, 0.82),                      # tower + undercarriage
+            (0.24, 0.10, 0.95),                      # hex transition, keel begins
+            (0.34, 0.10, 1.00),                      # hanging keel pod (deepest)
+            (0.41, 0.01, 0.86),                      # cargo box top, spine below
+            (0.71, 0.01, 0.86),
+            (0.74, 0.01, 0.67),                      # box only, spine ends
+            (0.97, 0.01, 0.67),
+            (1.00, 0.05, 0.65),                      # bow bevel
         ],
         "bridge_at": "stern",
     },

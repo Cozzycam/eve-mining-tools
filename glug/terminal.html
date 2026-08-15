@@ -31,13 +31,9 @@ h1 small { display:block; font-size:10px; color:var(--dim); font-weight:400; let
           background:#0a0c10; object-fit:cover; display:none; }
 #nameplate b { font-size:15px; letter-spacing:.08em; color:var(--glug); }
 #nameplate div div { font-size:11px; color:var(--dim); }
-#decknav { position:absolute; right:12px; top:50%; transform:translateY(-70%);
-           display:flex; flex-direction:column; align-items:center; gap:4px; }
-#decknav button { padding:2px 10px; font-size:11px; background:#1c2129;
-                  color:var(--ink); border:1px solid var(--edge); }
-#decknav button:hover { background:#262c37; }
-#deck-label { font:9.5px Consolas,monospace; color:var(--glug); letter-spacing:.08em;
-              background:#0009; padding:2px 6px; border-radius:4px; white-space:pre; }
+#zoomhint { position:absolute; right:12px; top:38px; font:9px Consolas,monospace;
+            color:#454c58; letter-spacing:.1em; background:#0009; padding:3px 8px;
+            border-radius:4px; pointer-events:none; }
 #crew tr { cursor:pointer; }
 #dockbadge { position:absolute; right:14px; top:12px; font-size:10px; letter-spacing:.14em;
              padding:3px 9px; border-radius:4px; background:#0009; border:1px solid var(--edge);
@@ -100,8 +96,7 @@ footer { margin-top:14px; color:#454c58; font-size:10.5px; letter-spacing:.06em;
   <div id="dockbadge">…</div>
   <div id="nameplate"><img id="np-img" alt="">
     <div><b id="np-name">…</b><div id="np-sub">…</div></div></div>
-  <div id="decknav"><button id="deck-up">▲</button>
-    <div id="deck-label">…</div><button id="deck-down">▼</button></div>
+  <div id="zoomhint">DRAG TO PAN · WHEEL TO ZOOM</div>
 </div>
 
 <div class="grid">
@@ -280,8 +275,7 @@ const cv = $("diorama"), ctx = cv.getContext("2d");
 const dpr = window.devicePixelRatio || 1;
 const PPM = 20;                     // px per metre — a 1.8 m crew sprite is 36 px
 const DECKS = [{y:36,h:130},{y:178,h:130}];
-const HULL_TOP = 24, HULL_BOT = 316, RULER_Y = 338;
-let W = 0, H = 360, off = 0, offInit = false;
+let W = 0, H = 360, offInit = false;
 function resize(){ W = cv.clientWidth; cv.width = W*dpr; cv.height = H*dpr;
   ctx.setTransform(dpr,0,0,dpr,0,0);
   const m = $("minimap"); m.width = m.clientWidth*dpr; m.height = 48*dpr; }
@@ -290,19 +284,26 @@ window.addEventListener("resize", resize);
 const stars = Array.from({length:90}, () => ({x:Math.random(), y:Math.random(),
   r:Math.random()*1.3+0.3, tw:Math.random()*6}));
 
-let agents = [], layoutKey = "", deckIdx = 0;
+let agents = [], layoutKey = "";
 const worldW = () => (S ? S.interior.length_m*PPM : 0);
+const worldH = () => (S ? S.interior.height_m*PPM : 0);
 const nDecks = () => (S ? S.interior.n_decks : 2);
-// world room rect in px for a room on a VISIBLE row (0=upper, 1=lower)
-function roomPx(r, row){ const d = DECKS[row];
-  return {x:r.x*PPM, y:d.y, w:r.w*PPM, h:d.h, kind:r.kind, label:r.label}; }
-function clampOff(){
-  if (worldW() <= W){ off = (worldW()-W)/2; return; }
-  off = Math.max(0, Math.min(off, worldW()-W));
+const DECK_PX = () => (S ? S.interior.deck_pitch*PPM : 120);   // 6 m → 120 px
+const deckY = d => d*DECK_PX();
+// world rect (base px, 20 px/m) of a room on its real deck
+function roomPx(r){ const dp = DECK_PX();
+  return {x:r.x*PPM, y:deckY(r.deck)+0.12*dp, w:r.w*PPM, h:0.8*dp,
+          kind:r.kind, label:r.label}; }
+
+// ── 2D camera: cam.x/cam.y = world point at canvas centre, cam.k = zoom ──
+const cam = {x:0, y:0, k:0.1};
+function kMin(){ return Math.max(0.015,
+  Math.min((W-60)/(worldW()||1), (H-60)/(worldH()||1))); }
+function clampCam(){
+  cam.k = Math.max(kMin(), Math.min(cam.k, 1.6));
+  cam.x = Math.max(0, Math.min(cam.x, worldW()));
+  cam.y = Math.max(0, Math.min(cam.y, worldH()));
 }
-function setDeck(d){ deckIdx = Math.max(0, Math.min(d, nDecks()-2)); }
-$("deck-up").onclick = () => setDeck(deckIdx-1);
-$("deck-down").onclick = () => setDeck(deckIdx+1);
 
 function syncAgents(){
   const it = S.interior,
@@ -310,7 +311,6 @@ function syncAgents(){
   if (key === layoutKey) return;
   layoutKey = key;
   agents = [];
-  setDeck(deckIdx);
   const named = S.crew.slice(0, 24);
   // contractors across every deck of the whole hull
   const anon = Math.min(300, Math.round(it.length_m/18 * Math.max(1, it.n_decks/6)));
@@ -327,10 +327,9 @@ function syncAgents(){
                         DEPT_DARK[c.dept]||"#555", false));
   for (let i=0;i<anon;i++) mk(null, "#3d434e", "#2c313b", true);
   if (!offInit){
-    // open on the bridge deck, scrolled to the bridge
-    const br = it.rooms.find(r => r.kind === "bridge");
-    if (br){ setDeck(br.deck); off = br.x*PPM - W/2; } else off = worldW();
-    clampOff(); offInit = true;
+    // open zoomed out on the whole ship — the shape IS the first impression
+    cam.x = worldW()/2; cam.y = worldH()/2; cam.k = kMin();
+    clampCam(); offInit = true;
   }
 }
 
@@ -340,7 +339,6 @@ function stepAgents(dt){
   const active = new Set();
   for (const o of (S.orders||[])) (WORK_ROOMS[o.kind]||[]).forEach(k=>active.add(k));
   for (const a of agents){
-    if (a.deck < deckIdx-1 || a.deck > deckIdx+2) continue;  // step near-view only
     if (a.tx == null){
       a.dwell -= dt;
       if (a.dwell <= 0){
@@ -362,18 +360,30 @@ function stepAgents(dt){
   }
 }
 
-// ── Pan: drag, wheel, minimap ────────────────────────────────
-let dragX = null;
-cv.addEventListener("pointerdown", e => { dragX = e.clientX; cv.setPointerCapture(e.pointerId); });
+// ── Camera input: drag pans, wheel zooms toward cursor, minimap scrubs ──
+let drag = null;
+cv.addEventListener("pointerdown", e => {
+  drag = {x:e.clientX, y:e.clientY}; cv.setPointerCapture(e.pointerId); });
 cv.addEventListener("pointermove", e => {
-  if (dragX != null){ off -= (e.clientX - dragX); dragX = e.clientX; clampOff(); } });
-cv.addEventListener("pointerup", () => dragX = null);
-cv.addEventListener("wheel", e => { e.preventDefault();
-  off += (e.deltaY + e.deltaX); clampOff(); }, {passive:false});
+  if (drag){ cam.x -= (e.clientX-drag.x)/cam.k; cam.y -= (e.clientY-drag.y)/cam.k;
+    drag = {x:e.clientX, y:e.clientY}; clampCam(); } });
+cv.addEventListener("pointerup", () => drag = null);
+cv.addEventListener("wheel", e => {
+  e.preventDefault();
+  const rect = cv.getBoundingClientRect();
+  const mx = e.clientX-rect.left, my = e.clientY-rect.top;
+  const wx = cam.x + (mx - W/2)/cam.k, wy = cam.y + (my - H/2)/cam.k;
+  cam.k *= Math.pow(1.0015, -e.deltaY);
+  cam.k = Math.max(kMin(), Math.min(cam.k, 1.6));
+  cam.x = wx - (mx - W/2)/cam.k; cam.y = wy - (my - H/2)/cam.k;
+  clampCam();
+}, {passive:false});
 const mm = $("minimap");
 function mmJump(e){ const r = mm.getBoundingClientRect();
-  off = ((e.clientX - r.left) / r.width) * worldW() - W/2; clampOff();
-  setDeck(Math.round(((e.clientY - r.top) / r.height) * nDecks()) - 1); }
+  cam.x = ((e.clientX-r.left)/r.width) * worldW();
+  cam.y = ((e.clientY-r.top)/r.height) * worldH();
+  if (cam.k <= kMin()*1.05) cam.k = 0.5;   // scrub from overview = zoom in
+  clampCam(); }
 mm.addEventListener("pointerdown", e => { mmJump(e); mm.setPointerCapture(e.pointerId); mm._d = 1; });
 mm.addEventListener("pointermove", e => { if (mm._d) mmJump(e); });
 mm.addEventListener("pointerup", () => mm._d = 0);
@@ -407,6 +417,14 @@ const SPR_PAL = {O:"#080a0f", G:"#ffd23e", K:"#20242e", k:"#ffd23e",
                  C:"#39415a", W:"#9fd6ff"};
 
 function drawAgent(a, t, floor){
+  if (cam.k < 0.35){          // LOD: screen-constant dot when zoomed out
+    ctx.save();
+    ctx.globalAlpha = a.anon ? 0.45 : 1;
+    ctx.fillStyle = a.anon ? "#4a5262" : a.color;
+    ctx.beginPath(); ctx.arc(a.x, floor-18, Math.min(2.8/cam.k, 26), 0, 7); ctx.fill();
+    ctx.restore();
+    return;
+  }
   const walking = a.tx != null;
   const legs = !walking ? LEGS_IDLE
     : (Math.floor(t*8+a.phase)%2 ? LEGS_W1 : LEGS_W2);
@@ -416,8 +434,8 @@ function drawAgent(a, t, floor){
   ctx.save();
   ctx.globalAlpha = a.anon ? 0.5 : 1;
   spr(gr, pal, a.x-4*PXS, floor-gr.length*PXS, a.dir<0);
-  if (!a.anon && a.name){
-    ctx.font = "9px Segoe UI"; ctx.textAlign = "center";
+  if (!a.anon && a.name && cam.k >= 0.45){
+    ctx.font = `${9/Math.min(cam.k,1)}px Segoe UI`; ctx.textAlign = "center";
     ctx.fillStyle = "#9aa3b1"; ctx.fillText(a.name, a.x, floor-gr.length*PXS-4);
   }
   ctx.restore();
@@ -541,94 +559,136 @@ function draw(t){
   for (const s of stars){   // parallax starfield
     ctx.globalAlpha = 0.35 + 0.45*Math.abs(Math.sin(t*0.7+s.tw));
     ctx.fillStyle = "#cdd6e4";
-    const sx = ((s.x - off*0.00012) % 1 + 1) % 1;
+    const sx = ((s.x - cam.x*0.00006) % 1 + 1) % 1;
     ctx.beginPath(); ctx.arc(sx*W, s.y*H, s.r, 0, 7); ctx.fill();
   }
   ctx.globalAlpha = 1;
   if (!S) return;
   const it = S.interior, WW = worldW(), docked = S.ceo.docked;
 
-  ctx.save(); ctx.translate(-Math.round(off), 0);
+  const k = cam.k;
+  ctx.save();
+  ctx.setTransform(dpr*k, 0, 0, dpr*k,
+    dpr*(W/2 - cam.x*k), dpr*(H/2 - cam.y*k));
+  // visible world rect for culling
+  const vx0 = cam.x - W/(2*k) - 60, vx1 = cam.x + W/(2*k) + 60;
+  const vy0 = cam.y - H/(2*k) - 60, vy1 = cam.y + H/(2*k) + 60;
+  const WH = worldH(), dp = DECK_PX();
+
+  // outer hull silhouette from the traced profile
+  ctx.fillStyle = "#0d1016";
+  ctx.beginPath();
+  it.columns.forEach(([x, top], i) => {
+    const px = x*WW, py = top*WH;
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  });
+  [...it.columns].reverse().forEach(([x,, bot]) => ctx.lineTo(x*WW, bot*WH));
+  ctx.closePath(); ctx.fill();
+
   const active = new Set();
-  for (const o of (S.orders||[])) (WORK_ROOMS[o.kind]||[]).forEach(k=>active.add(k));
+  for (const o of (S.orders||[])) (WORK_ROOMS[o.kind]||[]).forEach(kk=>active.add(kk));
   ctx.textBaseline = "alphabetic";
 
-  for (let row = 0; row < 2; row++){
-    const d = deckIdx + row, band = DECKS[row];
+  for (let d = 0; d < it.n_decks; d++){
+    const y = deckY(d);
+    if (y > vy1 || y+dp < vy0) continue;
     const spans = (it.decks[d] && it.decks[d].spans) || [];
-    for (const [x0m, x1m] of spans){   // hull band segments for this deck
+    for (const [x0m, x1m] of spans){
       const x0 = x0m*PPM, x1 = x1m*PPM;
-      if (x1 < off - 80 || x0 > off + W + 80) continue;
+      if (x1 < vx0 || x0 > vx1) continue;
       ctx.fillStyle = "#101319";
-      ctx.beginPath(); ctx.roundRect(x0-14, band.y-9, x1-x0+28, band.h+18, 12); ctx.fill();
-      ctx.strokeStyle = "#39404e"; ctx.lineWidth = 3; ctx.stroke();
-      if (!docked && x0m < 5){   // engine glow off the sternmost segments
-        const p = 0.6+Math.sin(t*9)*0.25;
-        const grad = ctx.createLinearGradient(x0-52, 0, x0-12, 0);
+      ctx.beginPath(); ctx.roundRect(x0, y+3, x1-x0, dp-6, 8); ctx.fill();
+      ctx.strokeStyle = "#232a36"; ctx.lineWidth = Math.min(2/k, 8);
+      ctx.stroke();
+      if (!docked && x0m < 5){   // stern engine glow, every deck that reaches aft
+        const p = 0.6+Math.sin(t*9+d)*0.25;
+        const grad = ctx.createLinearGradient(x0-46, 0, x0-8, 0);
         grad.addColorStop(0, "rgba(106,176,243,0)");
-        grad.addColorStop(1, `rgba(106,176,243,${p*0.55})`);
-        ctx.fillStyle = grad; ctx.fillRect(x0-52, band.y+30, 40, band.h-60);
+        grad.addColorStop(1, `rgba(106,176,243,${p*0.5})`);
+        ctx.fillStyle = grad; ctx.fillRect(x0-46, y+dp*0.25, 38, dp*0.5);
       }
     }
-    ctx.font = "9px Consolas,monospace"; ctx.textAlign = "left";
-    ctx.fillStyle = "#39404e";
-    ctx.fillText(`DECK ${String(d+1).padStart(2,"0")}`, off+6, band.y-14);
-
-    for (const r0 of it.rooms){
-      if (r0.deck !== d) continue;
-      const r = roomPx(r0, row);
-      if (r.x + r.w < off - 60 || r.x > off + W + 60) continue;
-      ctx.fillStyle = "#151a22";
-      ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.fill();
-      const hot = active.has(r.kind);
-      ctx.strokeStyle = hot ? `rgba(255,210,62,${0.45+Math.sin(t*4)*0.25})` : "#232936";
-      ctx.lineWidth = hot ? 2 : 1.5;
-      ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.stroke();
-      ctx.strokeStyle = "#2a303c"; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(r.x+2, r.y+r.h-2); ctx.lineTo(r.x+r.w-2, r.y+r.h-2); ctx.stroke();
-      (PROPS[r.kind]||prop_console_room)(r, t);
-      ctx.font = "9.5px Segoe UI"; ctx.textAlign = "left";
-      ctx.fillStyle = hot ? "#c8a832" : "#525a68";
-      ctx.fillText(r.label.toUpperCase(), r.x+5, r.y+11);
-      if (hot){
-        for (let i=0;i<2;i++){
-          const my = (t*14+i*9) % (r.h-18);
-          ctx.fillStyle = "rgba(255,210,62,0.5)";
-          ctx.beginPath(); ctx.arc(r.x+r.w-8, r.y+r.h-6-my, 1.5, 0, 7); ctx.fill();
-        }
-      }
-      if (r.kind === "training_pod" && S.ceo.training){
-        ctx.font = "8.5px Segoe UI"; ctx.textAlign = "center";
-        ctx.fillStyle = "#4a90c2";
-        ctx.fillText(trainingText().split("— ")[1]||"", r.x+r.w/2, r.y+r.h+10);
-      }
-    }
-    for (const a of agents){
-      if (a.deck !== d) continue;
-      if (a.x < off - 40 || a.x > off + W + 40) continue;
-      drawAgent(a, t, band.y + band.h - 2);
+    if (k >= 0.3 && spans.length){
+      ctx.font = `${9/k}px Consolas,monospace`; ctx.textAlign = "left";
+      ctx.fillStyle = "#39404e";
+      ctx.fillText(`DECK ${String(d+1).padStart(2,"0")}`,
+        Math.max(spans[0][0]*PPM, vx0+60)+6/k, y + 14/Math.max(k,0.5));
     }
   }
+
+  for (const r0 of it.rooms){
+    const r = roomPx(r0);
+    if (r.x+r.w < vx0 || r.x > vx1 || r.y > vy1 || r.y+r.h < vy0) continue;
+    const hot = active.has(r.kind);
+    ctx.fillStyle = "#151a22";
+    ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.fill();
+    ctx.strokeStyle = hot ? `rgba(255,210,62,${0.45+Math.sin(t*4)*0.25})` : "#232936";
+    ctx.lineWidth = hot ? Math.min(2/k, 10) : 1.5;
+    ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.stroke();
+    if (k < 0.22) continue;                       // LOD: blocks only
+    ctx.strokeStyle = "#2a303c"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(r.x+2, r.y+r.h-2); ctx.lineTo(r.x+r.w-2, r.y+r.h-2); ctx.stroke();
+    (PROPS[r.kind]||prop_console_room)(r, t);
+    if (k >= 0.4){
+      ctx.font = `${9.5/Math.min(k,1)}px Segoe UI`; ctx.textAlign = "left";
+      ctx.fillStyle = hot ? "#c8a832" : "#525a68";
+      ctx.fillText(r.label.toUpperCase(), r.x+5, r.y+13/Math.min(k,1));
+    }
+    if (hot){
+      for (let i=0;i<2;i++){
+        const my = (t*14+i*9) % (r.h-18);
+        ctx.fillStyle = "rgba(255,210,62,0.5)";
+        ctx.beginPath(); ctx.arc(r.x+r.w-8, r.y+r.h-6-my, 1.5, 0, 7); ctx.fill();
+      }
+    }
+    if (r.kind === "training_pod" && S.ceo.training && k >= 0.4){
+      ctx.font = `${8.5/Math.min(k,1)}px Segoe UI`; ctx.textAlign = "center";
+      ctx.fillStyle = "#4a90c2";
+      ctx.fillText(trainingText().split("— ")[1]||"", r.x+r.w/2, r.y+r.h-6);
+    }
+  }
+
+  for (const a of agents){
+    if (a.x < vx0 || a.x > vx1) continue;
+    const fy = deckY(a.deck) + 0.92*dp;
+    if (fy > vy1+40 || fy < vy0-40) continue;
+    drawAgent(a, t, fy);
+  }
+
+  // hull outline on top for a crisp silhouette edge
+  ctx.strokeStyle = "#39404e"; ctx.lineWidth = Math.min(3/k, 14);
+  ctx.beginPath();
+  it.columns.forEach(([x, top], i) => {
+    const px = x*WW, py = top*WH;
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  });
+  [...it.columns].reverse().forEach(([x,, bot]) => ctx.lineTo(x*WW, bot*WH));
+  ctx.closePath(); ctx.stroke();
+
   ctx.restore();
+  ctx.setTransform(dpr,0,0,dpr,0,0);
   drawRuler();
-  $("deck-label").textContent =
-    `DECKS ${String(deckIdx+1).padStart(2,"0")}–${String(deckIdx+2).padStart(2,"0")}\n  OF ${it.n_decks}`;
 }
 
 function drawRuler(){
-  ctx.fillStyle = "#0a0c10"; ctx.fillRect(0, HULL_BOT+8, W, H-HULL_BOT-8);
+  const ry = H - 16;
+  ctx.fillStyle = "rgba(10,12,16,.85)"; ctx.fillRect(0, ry-8, W, 24);
   ctx.font = "9px Consolas,monospace";
-  const m0 = Math.floor(off/PPM/10)*10;
-  for (let m = m0; m*PPM < off+W; m += 10){
-    const x = m*PPM - off, major = m % 50 === 0;
-    ctx.strokeStyle = major ? "#39404e" : "#20242c"; ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(x, RULER_Y-6); ctx.lineTo(x, RULER_Y+(major?4:0)); ctx.stroke();
-    if (major && m >= 0){ ctx.fillStyle = "#525a68"; ctx.textAlign = "left";
-      ctx.fillText(fmt(m)+" m", x+3, RULER_Y+7); }
+  const mppx = 1/(PPM*cam.k);                       // metres per screen px
+  const step = [5,10,25,50,100,250,500][
+    [5,10,25,50,100,250,500].findIndex(s => s/mppx >= 70)] || 500;
+  const leftM = (cam.x - W/(2*cam.k))/PPM;
+  for (let m = Math.ceil(leftM/step)*step; (m-leftM)*PPM*cam.k < W; m += step){
+    if (m < 0 || m > S.interior.length_m) continue;
+    const x = (m-leftM)*PPM*cam.k;
+    ctx.strokeStyle = "#39404e"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, ry-4); ctx.lineTo(x, ry+2); ctx.stroke();
+    ctx.fillStyle = "#525a68"; ctx.textAlign = "left";
+    ctx.fillText(fmt(m)+" m", x+3, ry+3);
   }
   ctx.fillStyle = "#6b7482"; ctx.textAlign = "right";
-  ctx.fillText(`VIEWING ${Math.round(Math.min(W, worldW())/PPM)} m OF ${fmt(S.interior.length_m)} m · CREW AT TRUE SCALE (1.8 m)`,
-    W-8, RULER_Y+7);
+  ctx.fillText(`VIEW ${fmt(Math.round(W*mppx))} m ACROSS · SHIP ${fmt(S.interior.length_m)}×${fmt(S.interior.height_m)} m · CREW TRUE SCALE (1.8 m)`,
+    W-8, ry+3);
   ctx.textAlign = "left";
 }
 
@@ -663,18 +723,18 @@ function drawMinimap(){
     g.fillStyle = a.color;
     g.fillRect(x0 + a.x*sc - 1, y0 + (a.deck/nd)*yh - 1, 2.5, 3);
   }
-  // viewport: x range and current deck band
+  // viewport: the camera's visible world rect
+  const vw = W/cam.k, vh = H/cam.k;
   g.strokeStyle = "#ffd23e"; g.lineWidth = 1.5;
-  g.strokeRect(x0 + off*sc, y0 + (deckIdx/nd)*yh - 1,
-               Math.max(8, W*sc), Math.max(4, (2/nd)*yh) + 2);
+  g.strokeRect(x0 + (cam.x - vw/2)*sc, y0 + ((cam.y - vh/2)/worldH())*yh,
+               Math.max(8, vw*sc), Math.max(6, (vh/worldH())*yh));
 }
 function prop_console_room(r,t){ prop_console(r.x+r.w/2, r.y+r.h-4, t); }
 
 function locateCrew(i){
   const a = agents[i];
   if (!a || a.anon) return;
-  setDeck(a.deck > 0 && a.deck === nDecks()-1 ? a.deck-1 : a.deck);
-  off = a.x - W/2; clampOff();
+  cam.x = a.x; cam.y = deckY(a.deck) + DECK_PX()/2; cam.k = 0.85; clampCam();
   toast(`${a.name} located — Deck ${String(a.deck+1).padStart(2,"0")}.`);
 }
 function updateDeckBadges(){
