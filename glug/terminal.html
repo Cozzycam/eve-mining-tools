@@ -293,7 +293,9 @@ const deckY = d => d*DECK_PX();
 // world rect (base px, 20 px/m) of a room on its real deck
 function roomPx(r){ const dp = DECK_PX();
   return {x:r.x*PPM, y:deckY(r.deck)+0.12*dp, w:r.w*PPM, h:0.8*dp,
-          kind:r.kind, label:r.label}; }
+          kind:r.kind, label:r.label, cat:r.cat}; }
+// zone tint (Campbell's colours: red cargo, green admin, purple engineering)
+const CAT_FILL = {cargo:"#1c1517", admin:"#141b16", engineering:"#181421"};
 
 // ── 2D camera: cam.x/cam.y = world point at canvas centre, cam.k = zoom ──
 const cam = {x:0, y:0, k:0.1};
@@ -626,7 +628,7 @@ function draw(t){
     const r = roomPx(r0);
     if (r.x+r.w < vx0 || r.x > vx1 || r.y > vy1 || r.y+r.h < vy0) continue;
     const hot = active.has(r.kind);
-    ctx.fillStyle = "#151a22";
+    ctx.fillStyle = CAT_FILL[r0.cat] || "#151a22";
     ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 4); ctx.fill();
     ctx.strokeStyle = hot ? `rgba(255,210,62,${0.45+Math.sin(t*4)*0.25})` : "#232936";
     ctx.lineWidth = hot ? Math.min(2/k, 10) : 1.5;

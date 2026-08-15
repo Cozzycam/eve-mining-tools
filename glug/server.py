@@ -102,8 +102,50 @@ SHIP_PROFILES = {
             (1.00, 0.05, 0.65),                      # bow bevel
         ],
         "bridge_at": "stern",
+        # Campbell's zone annotation (2026-08-15): red=cargo, green=admin,
+        # purple=functional/engineering. Stern block + keel are engineering.
+        "zones": [
+            (0.00, 0.13, 0.0, 1.0, "engineering"),   # engines / stern block
+            (0.13, 0.32, 0.0, 1.0, "admin"),         # command tower (green)
+            (0.32, 1.00, 0.0, 0.67, "cargo"),        # the big box (red)
+            (0.32, 0.70, 0.67, 1.0, "engineering"),  # keel machinery (purple)
+        ],
+    },
+    33697: {   # Prospect — traced from Campbell's annotated side shot (2026-08-15)
+        "length_m": 105, "height_m": 28,
+        "columns": [
+            (0.00, 0.15, 0.75),                     # stern lip / exhaust
+            (0.05, 0.00, 0.95), (0.38, 0.00, 0.95), # bulky main hull
+            (0.42, 0.10, 0.80),                     # taper to neck
+            (0.45, 0.15, 0.55), (0.55, 0.30, 0.75), # slim cockpit neck
+            (0.60, 0.35, 0.95), (0.95, 0.35, 0.95), # harvester boom modules
+            (1.00, 0.45, 0.80),                     # tail taper
+        ],
+        "bridge_at": "stern",
+        "zones": [
+            (0.00, 0.05, 0.0, 1.0, "engineering"),  # engines
+            (0.05, 0.42, 0.0, 1.0, "cargo"),        # main hull = ore hold (red)
+            (0.42, 0.55, 0.0, 1.0, "admin"),        # cockpit neck (green)
+            (0.55, 1.00, 0.0, 1.0, "engineering"),  # harvester boom (purple)
+        ],
     },
 }
+
+ZONE_POOLS = {
+    "cargo": {"hauler": ["cargo", "cargo", "crane_bay"],
+              "miner": ["ore_hold", "cargo", "crane_bay"],
+              "generic": ["cargo", "magazine"]},
+    "admin": ["manifest", "mess", "bunks", "office"],
+}
+ZONE_SIZES = {"cargo": (60, 110), "admin": (18, 45), "engineering": (40, 70),
+              None: (35, 65)}
+
+
+def zone_at(zones, xf, yf):
+    for (x0, x1, t0, b0, cat) in zones or []:
+        if x0 <= xf <= x1 and t0 <= yf <= b0:
+            return cat
+    return None
 
 
 def hull_length(type_id, group_name, tier):
@@ -126,6 +168,10 @@ def fallback_profile(length, archetype):
             (0.90, 0.00, 1.00), (1.00, 0.18, 0.82),
         ],
         "bridge_at": "bow",
+        "zones": [
+            (0.00, 0.12, 0.0, 1.0, "engineering"),
+            (0.85, 1.00, 0.0, 1.0, "admin"),
+        ],
     }
 
 
@@ -202,23 +248,30 @@ def build_interior(ship_type_id, training):
             continue
         frac = d / max(1, n_decks - 1)
         rngd = _r.Random(ship_type_id * 1000 + d)
-        eng = frac > 0.82
+        yf = (d + 0.5) / n_decks
         for (x0, x1) in spans:
             x, i = x0 + 2, rngd.randrange(4)
             while x < x1 - 12:
-                w = min(rngd.uniform(35, 65), x1 - x - 2)
-                if not bridge_done and (
-                        (prof["bridge_at"] == "stern" and x0 < L * 0.3) or
-                        (prof["bridge_at"] == "bow" and x1 > L * 0.7)):
+                cat = zone_at(prof.get("zones"), x / L, yf)
+                lo, hi = ZONE_SIZES.get(cat, ZONE_SIZES[None])
+                w = min(rngd.uniform(lo, hi), x1 - x - 2)
+                if not bridge_done and cat == "admin":
                     kind, bridge_done = "bridge", True
-                elif bridge_done and not pod_done:
+                elif bridge_done and not pod_done and cat == "admin":
                     kind, pod_done = "training_pod", True
                     w = min(w, 30)
-                elif eng:
+                elif cat == "cargo":
+                    pool = ZONE_POOLS["cargo"][archetype]
+                    kind = pool[i % len(pool)]
+                elif cat == "admin":
+                    kind = ZONE_POOLS["admin"][i % 4]
+                elif cat == "engineering":
+                    kind = "engineering"
+                elif frac > 0.82:
                     kind = "engineering"
                 else:
                     kind = role_pool[i % len(role_pool)] if i % 3 else support[i % 2]
-                rooms.append({"kind": kind,
+                rooms.append({"kind": kind, "cat": cat or "",
                               "label": ROOM_LABELS.get(kind, kind.title()),
                               "deck": d, "x": round(x, 1), "w": round(w, 1)})
                 x += w + 2.5
@@ -239,7 +292,8 @@ ROOM_LABELS = {
     "engineering": "Engineering", "training_pod": "Executive Pod",
     "intake": "Raw Intake", "processing": "Processing Line",
     "ore_hold": "Ore Hold", "crystal_bay": "Crystal Bay",
-    "cargo": "Cargo Bay", "crane_bay": "Crane Bay", "manifest": "Manifest Office",
+    "cargo": "Cargo Cell", "crane_bay": "Crane Bay", "manifest": "Manifest Office",
+    "office": "Offices",
     "magazine": "Magazine", "fire_control": "Fire Control", "armory": "Armory",
 }
 
