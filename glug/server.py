@@ -43,13 +43,22 @@ def size_tier(mass):
     return 5
 
 
-# est. souls aboard by archetype/tier — lore-flavoured, not canon
-COMPLEMENT = {
-    "miner":   {1: 5, 2: 30, 3: 140, 4: 900, 5: 6000},
-    "hauler":  {1: 6, 2: 40, 3: 180, 4: 1200, 5: 8000},
-    "generic": {1: 4, 2: 35, 3: 200, 4: 1500, 5: 12000},
-    "hq":      {1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+# Souls aboard — grounded in the lore Crew Statistics table (capsuleer-
+# minimum column): pod-flown hulls run skeleton crews. By mass tier:
+# t1≈frigate, t2≈destroyer/cruiser, t3≈battlecruiser, t4≈battleship/
+# freighter, t5≈capital. Archetype scales it (haulers are mostly cargo).
+CREW_BY_TIER = {1: 3, 2: 25, 3: 90, 4: 250, 5: 1500}
+EVAC_BY_TIER = {1: 30, 2: 400, 3: 600, 4: 7000, 5: 25000}  # max capacity, lore
+CREW_ARCH_MULT = {"miner": 1.0, "hauler": 0.75, "generic": 1.2, "hq": 0}
+SHIP_CREW = {
+    12731: 70,   # Bustard — Campbell-calibrated vs the lore table
 }
+
+
+def complement(type_id, archetype, tier):
+    if type_id in SHIP_CREW:
+        return SHIP_CREW[type_id]
+    return round(CREW_BY_TIER[tier] * CREW_ARCH_MULT[archetype])
 
 ROLE_ROOMS = {
     "miner":   ["intake", "processing", "ore_hold", "crystal_bay"],
@@ -216,7 +225,8 @@ def build_interior(ship_type_id, training):
                 i += 1
 
     return {"archetype": archetype, "tier": tier,
-            "complement": COMPLEMENT[archetype][tier], "length_m": L,
+            "complement": complement(ship_type_id, archetype, tier),
+            "evac_rating": EVAC_BY_TIER[tier], "length_m": L,
             "height_m": prof["height_m"], "n_decks": n_decks,
             "deck_pitch": DECK_PITCH, "decks": decks,
             "columns": prof["columns"],

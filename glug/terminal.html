@@ -167,8 +167,8 @@ function renderPanels(){
     $("np-name").textContent = (c.ship_name||"UNREGISTERED VESSEL").toUpperCase();
     const mass = it.mass ? fmt(it.mass/1000) + " t" : "";
     $("np-sub").textContent = `${c.ship_type||"?"}-class ${it.ship_class}` +
-      ` · ≈${fmt(it.length_m)}×${fmt(it.height_m)} m · ${it.n_decks} decks` +
-      ` · est. complement ${fmt(it.complement)} souls · ${mass}`;
+      ` · ≈${fmt(it.length_m)}×${fmt(it.height_m)} m · ${it.n_decks} decks · ${mass}` +
+      ` · complement ${fmt(it.complement)} souls (rated ${fmt(it.evac_rating)})`;
     if (it.type_id){
       const src = `https://images.evetech.net/types/${it.type_id}/render?size=64`;
       if (img.src !== src) img.src = src;
@@ -312,8 +312,8 @@ function syncAgents(){
   layoutKey = key;
   agents = [];
   const named = S.crew.slice(0, 24);
-  // contractors across every deck of the whole hull
-  const anon = Math.min(300, Math.round(it.length_m/18 * Math.max(1, it.n_decks/6)));
+  // contractors = the rest of the real complement (skeleton crew, lore-scaled)
+  const anon = Math.min(140, Math.max(0, it.complement - named.length));
   const deckRooms = d => it.rooms.filter(r => r.deck === d);
   const decksWithRooms = [...new Set(it.rooms.map(r => r.deck))];
   const mk = (name, color, dark, isAnon) => {
