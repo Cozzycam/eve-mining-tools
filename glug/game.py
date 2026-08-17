@@ -66,6 +66,15 @@ PRODUCTS = {
     "banana":    {"wing": "consumer", "name": "Glug Banana Milk", "cost": 600,
                   "req": ("income_units", 100), "be": 6,
                   "blurb": "Now with detectable banana."},
+    "chocolate": {"wing": "consumer", "name": "Glug Chocolate", "cost": 900,
+                  "req": ("income_units", 300), "be": 9,
+                  "blurb": "Real cocoa flavouring. Legally distinct from cocoa."},
+    "strawberry":{"wing": "consumer", "name": "Glug Strawberry", "cost": 1200,
+                  "req": ("ore_m3", 2000), "be": 12,
+                  "blurb": "Pink. Undeniably, relentlessly pink."},
+    "vanilla":   {"wing": "consumer", "name": "Glug Vanilla", "cost": 1800,
+                  "req": ("pi_events", 5), "be": 18,
+                  "blurb": "The people's default."},
     "sparkling": {"wing": "consumer", "name": "Glug Sparkling", "cost": 1500,
                   "req": ("ore_m3", 5000), "be": 15,
                   "blurb": "Carbonated with genuine asteroid minerals."},
@@ -75,6 +84,18 @@ PRODUCTS = {
     "zero":      {"wing": "consumer", "name": "Glug Zero", "cost": 6000,
                   "req": ("launches", 2), "be": 60,
                   "blurb": "Everything you love about Glug. Nothing else."},
+    "lite":      {"wing": "consumer", "name": "Glug Lite", "cost": 2400,
+                  "req": ("income_units", 1000), "be": 24,
+                  "blurb": "40% fewer nutrients. Same great loyalty."},
+    "awake":     {"wing": "consumer", "name": "Glug AWAKE", "cost": 5000,
+                  "req": ("income_units", 3000), "be": 50,
+                  "blurb": "Sleep is a legacy feature."},
+    "nog":       {"wing": "consumer", "name": "Glug Nog (Seasonal)", "cost": 4000,
+                  "req": ("launches", 3), "be": 40,
+                  "blurb": "Available all year. Mandatory in Q4."},
+    "reserve":   {"wing": "consumer", "name": "Glug Reserve — Aged 12 Minutes",
+                  "cost": 10000, "req": ("ore_m3", 50000), "be": 100,
+                  "blurb": "For the discerning executive palate."},
     "spray":     {"wing": "defense", "name": "Glug Pepper Spray (Family Size)", "cost": 800,
                   "req": None, "be": 8,
                   "blurb": "Self-defense for the whole household."},
@@ -87,6 +108,21 @@ PRODUCTS = {
     "orbital":   {"wing": "defense", "name": "Glug Party Popper (Orbital)", "cost": 15000,
                   "req": ("launches", 4), "be": 150,
                   "blurb": "For very special occasions."},
+    "foam":      {"wing": "defense", "name": "Glug Riot Foam", "cost": 1200,
+                  "req": ("bounty_isk", 1_000_000), "be": 12,
+                  "blurb": "Crowd control that smells like vanilla."},
+    "rations":   {"wing": "defense", "name": "Glug Combat Rations", "cost": 3500,
+                  "req": ("pi_events", 20), "be": 35,
+                  "blurb": "All nine meals are milk."},
+    "lube":      {"wing": "defense", "name": "GlugSlick Turret Lubricant", "cost": 5000,
+                  "req": ("ore_m3", 35000), "be": 50,
+                  "blurb": "Frictionless. Like our HR process."},
+    "designator":{"wing": "defense", "name": "GlugPoint Laser Designator", "cost": 12000,
+                  "req": ("bounty_isk", 10_000_000), "be": 120,
+                  "blurb": "Point at problems."},
+    "doctrine":  {"wing": "defense", "name": "Glug Fleet Doctrine (Consulting)",
+                  "cost": 25000, "req": ("launches", 6), "be": 250,
+                  "blurb": "We tell your fleet what to feel."},
 }
 
 # Brand Equity perk shop. One-time purchases; each multiplies one sim knob.
@@ -110,6 +146,53 @@ PERKS = {
     "billboard": {"name": "Orbital Billboard Campaign", "cost": 100,
                   "target": "earnings", "mult": 1.1,
                   "blurb": "Visible from three planets. Tasteful."},
+    "anthem":    {"name": "Corporate Anthem (Mandatory)", "cost": 15,
+                  "target": "busywork", "mult": 1.25,
+                  "blurb": "Eight minutes long. No verse skippable."},
+    "eotm":      {"name": "Employee of the Month Program", "cost": 60,
+                  "target": "crew_rate", "mult": 1.1,
+                  "blurb": "There is one plaque. It is contested."},
+    "legal":     {"name": "Glug Legal Retainer", "cost": 80,
+                  "target": "hire_cost", "mult": 0.85,
+                  "blurb": "Contracts reviewed. Loopholes installed."},
+    "synergy2":  {"name": "Synergy II: Beyond Synergy", "cost": 150,
+                  "target": "franchise", "mult": 1.5,
+                  "blurb": "The seminar has a sequel."},
+    "lobbying":  {"name": "CONCORD Lobbying Fund", "cost": 250,
+                  "target": "earnings", "mult": 1.1,
+                  "blurb": "Regulation is a conversation."},
+    "vertical":  {"name": "Vertical Integration", "cost": 400,
+                  "target": "earnings", "mult": 1.15,
+                  "blurb": "We now own the cows. All cows."},
+}
+
+# Ship facilities — one-time SCRIP purchases. Same multiplier system as
+# perks; `room` names the room kind they visibly appear in on the diorama.
+FACILITIES = {
+    "posters":   {"name": "Motivational Poster Set", "cost": 300,
+                  "target": "busywork", "mult": 1.1, "room": "bunks",
+                  "blurb": "HANG IN THERE. That is an order."},
+    "coffee":    {"name": "Espresso Machine", "cost": 800,
+                  "target": "research", "mult": 1.1, "room": "lab",
+                  "blurb": "Turns sleep into science."},
+    "arcade":    {"name": "Arcade Cabinet", "cost": 1500,
+                  "target": "busywork", "mult": 1.15, "room": "mess",
+                  "blurb": "Top score: GLG. All three slots."},
+    "desks":     {"name": "Ergonomic Standing Desks", "cost": 3000,
+                  "target": "crew_rate", "mult": 1.05, "room": "office",
+                  "blurb": "Sitting is theft."},
+    "gym":       {"name": "Crew Gymnasium", "cost": 6000,
+                  "target": "crew_rate", "mult": 1.05, "room": "bunks",
+                  "blurb": "Wellness is measured quarterly."},
+    "holotable": {"name": "Conference Holotable", "cost": 12000,
+                  "target": "earnings", "mult": 1.05, "room": "bridge",
+                  "blurb": "The pie charts are three-dimensional now."},
+    "fountain":  {"name": "Lobby Milk Fountain", "cost": 25000,
+                  "target": "earnings", "mult": 1.05, "room": "lobby",
+                  "blurb": "Flows with Original Formula. Do not swim."},
+    "jacuzzi":   {"name": "Executive Jacuzzi", "cost": 60000,
+                  "target": "earnings", "mult": 1.1, "room": "office",
+                  "blurb": "Strategy happens here."},
 }
 
 FIRST = ["Aile", "Bex", "Cato", "Dree", "Emek", "Fenn", "Gozi", "Hale", "Ilya",
@@ -187,11 +270,12 @@ def launch_count(db):
 
 
 def perk_factor(db, target, owned=None):
-    """Product of owned-perk multipliers for one sim knob."""
-    owned = get_state(db, "perks", []) if owned is None else owned
+    """Product of owned perk + facility multipliers for one sim knob."""
+    if owned is None:
+        owned = get_state(db, "perks", []) + get_state(db, "facilities", [])
     f = 1.0
     for k in owned:
-        p = PERKS.get(k)
+        p = PERKS.get(k) or FACILITIES.get(k)
         if p and p["target"] == target:
             f *= p["mult"]
     return f
@@ -348,7 +432,7 @@ def advance(db, now):
         set_state(db, "last_sim_ts", now)
         db.commit()
         return
-    perks = get_state(db, "perks", [])
+    perks = get_state(db, "perks", []) + get_state(db, "facilities", [])
     crew = db.execute("SELECT id, level FROM crew").fetchall()
     n_dept = dict(db.execute(
         "SELECT department, COUNT(*) FROM crew GROUP BY department"))
@@ -491,6 +575,27 @@ def buy_perk(db, key, now):
                (now, 0, f"PERK ACQUIRED: {p['name']} (-{p['cost']} Brand Equity)"))
     db.commit()
     return p
+
+
+def buy_facility(db, key, now):
+    """Spend scrip on a one-time ship facility."""
+    p = FACILITIES.get(key)
+    owned = get_state(db, "facilities", [])
+    if not p or key in owned:
+        return None
+    if not spend(db, p["cost"], f"FACILITY: {p['name']}", now):
+        return None
+    set_state(db, "facilities", owned + [key])
+    db.commit()
+    return p
+
+
+def facility_state(db):
+    owned = get_state(db, "facilities", [])
+    return [{"key": k, "name": p["name"], "cost": p["cost"], "blurb": p["blurb"],
+             "target": p["target"], "mult": p["mult"], "room": p["room"],
+             "owned": k in owned}
+            for k, p in FACILITIES.items()]
 
 
 def perk_state(db):
@@ -716,6 +821,14 @@ def selftest():
     advance(db, t0 + 3600 * 15)
     got = get_state(db, "scrip") - pre
     assert abs(got - 1.02 * (24.0 + 2.2)) < 0.01, got
+
+    # ── Facilities (scrip sink) ──
+    set_state(db, "scrip", 1000.0)
+    assert buy_facility(db, "jacuzzi", t0) is None, "unaffordable facility sold"
+    assert buy_facility(db, "posters", t0)["cost"] == 300
+    assert abs(get_state(db, "scrip") - 700.0) < 0.01
+    assert buy_facility(db, "posters", t0) is None, "facility sold twice"
+    assert abs(perk_factor(db, "busywork") - 1.1) < 1e-9  # facility counts
     print("selftest OK")
 
 

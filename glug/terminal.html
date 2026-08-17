@@ -130,8 +130,8 @@ footer { margin-top:14px; color:#454c58; font-size:10.5px; letter-spacing:.06em;
     <canvas id="frmap"></canvas><table id="franchises"></table></div>
   <div class="panel" style="grid-column:1/-1"><h2>Product Development
     <span id="pd-sub"></span></h2><div class="wings" id="products"></div></div>
-  <div class="panel" style="grid-column:1/-1"><h2>Brand Equity Perk Shop
-    <span id="pk-sub"></span></h2><div class="wings" id="perks"></div></div>
+  <div class="panel" style="grid-column:1/-1"><h2>Glug Company Store
+    <span id="pk-sub"></span></h2><div class="wings" id="store"></div></div>
   <div class="panel" style="grid-column:1/-1"><h2>Scrip Ledger</h2><table id="ledger"></table></div>
 </div>
 <footer>GLUG&trade; IS A FAMILY COMPANY &middot; THIS TERMINAL IS MONITORED FOR YOUR CONVENIENCE</footer>
@@ -212,24 +212,33 @@ function renderPanels(){
 const PERK_TEXT = { crew_rate:"crew work rate", research:"research speed",
   hire_cost:"promotion cost", busywork:"idle busywork income",
   franchise:"franchise income", earnings:"all earnings" };
-function renderPerks(){
-  const owned = S.perks.filter(p=>p.owned).length;
-  $("pk-sub").textContent = `${owned} / ${S.perks.length} acquired`;
-  $("perks").innerHTML = S.perks.map(p => {
-    const pct = Math.round(Math.abs(p.mult-1)*100);
-    const fx = `${p.mult>=1?"+":"−"}${pct}% ${PERK_TEXT[p.target]||p.target}`;
-    if (p.owned)
-      return `<div class="prod launched"><div class="row1"><b>${p.name}</b>
-        <span class="badge-launched">ACQUIRED</span></div>
-        <div class="blurb">${p.blurb}</div>
-        <div class="reqline">${fx}</div></div>`;
-    return `<div class="prod"><div class="row1"><b>${p.name}</b></div>
+function storeCard(p, action, wallet, unit){
+  const pct = Math.round(Math.abs(p.mult-1)*100);
+  const fx = `${p.mult>=1?"+":"−"}${pct}% ${PERK_TEXT[p.target]||p.target}` +
+    (p.room ? ` · installs in ${p.room.replace("_"," ")}` : "");
+  if (p.owned)
+    return `<div class="prod launched"><div class="row1"><b>${p.name}</b>
+      <span class="badge-launched">${p.room?"INSTALLED":"ACQUIRED"}</span></div>
       <div class="blurb">${p.blurb}</div>
-      <div class="foot"><span class="dim">${fx}</span>
-        <button class="mini" ${S.brand_equity<p.cost?"disabled":""}
-          onclick='act({action:"perk",key:"${p.key}"})'>Acquire (${p.cost} BE)</button>
-      </div></div>`;
-  }).join("");
+      <div class="reqline">${fx}</div></div>`;
+  return `<div class="prod"><div class="row1"><b>${p.name}</b></div>
+    <div class="blurb">${p.blurb}</div>
+    <div class="foot"><span class="dim">${fx}</span>
+      <button class="mini" ${wallet<p.cost?"disabled":""}
+        onclick='act({action:"${action}",key:"${p.key}"})'>${p.owned?"":"Buy"} ${fmt(p.cost)} ${unit}</button>
+    </div></div>`;
+}
+function renderPerks(){
+  const owned = S.perks.filter(p=>p.owned).length +
+                S.facilities.filter(f=>f.owned).length;
+  $("pk-sub").textContent =
+    `${owned} / ${S.perks.length + S.facilities.length} acquired`;
+  $("store").innerHTML =
+    `<div class="wing"><h3>Ship Facilities · scrip</h3>` +
+    S.facilities.map(f => storeCard(f, "facility", S.scrip, "GS")).join("") +
+    `</div><div class="wing"><h3>Corporate Initiatives · Brand Equity</h3>` +
+    S.perks.map(p => storeCard(p, "perk", S.brand_equity, "BE")).join("") +
+    `</div>`;
 }
 
 const REQ_TEXT = { ore_m3:"m³ of raw material processed",
@@ -457,7 +466,48 @@ const SPR_CRATE = ["OOOOOOOOOO","OCCCCCCCCO","OCGGCCGGCO","OCCCCCCCCO","OOOOOOOO
 const SPR_CONSOLE = ["..OOOOOO..","..OWWWWO..","..OWwWWO..","..OOOOOO..",
                      ".OOCCCCOO.","OCCCCCCCCO","OOOOOOOOOO"];
 const SPR_PAL = {O:"#080a0f", G:"#ffd23e", K:"#20242e", k:"#ffd23e",
-                 C:"#39415a", W:"#9fd6ff"};
+                 C:"#39415a", W:"#9fd6ff", M:"#eef2f7"};
+// facility mini-sprites (Company Store purchases, drawn in their room kind)
+const SPR_POSTER   = ["OOOOOO","OGGGGO","OGKGKO","OGGGGO","OGKKGO","OOOOOO"];
+const SPR_ESPRESSO = ["OOOOOO","OCCCCO","OCWWCO","OCCCCO","OKGKKO","OOOOOO"];
+const SPR_ARCADE   = ["OOOOOO","OKWWKO","OKWWKO","OKKKKO","OKGGKO","OKKKKO","OOOOOO"];
+const SPR_DESK     = ["OOOOOOOO","OCCCCCCO","..C..C..","..C..C.."];
+const SPR_GYM      = ["OK....KO","OKCCCCKO","OK....KO"];
+const SPR_FOUNTAIN = ["..MM..",".MMMM.","OOOOOO","OCCCCO","OOOOOO"];
+const SPR_JACUZZI  = ["OMMMMMO","OCCCCCO",".C...C."];
+const FACIL_SPR = { posters:{spr:SPR_POSTER, wall:1}, coffee:{spr:SPR_ESPRESSO},
+  arcade:{spr:SPR_ARCADE}, desks:{spr:SPR_DESK}, gym:{spr:SPR_GYM},
+  fountain:{spr:SPR_FOUNTAIN}, jacuzzi:{spr:SPR_JACUZZI},
+  holotable:{fn:(r,t)=>{ const cx=r.x+r.w*0.32, y=r.y+r.h-12;
+    ctx.strokeStyle="#3a4150"; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(cx-10,y); ctx.lineTo(cx+10,y);
+    ctx.moveTo(cx-7,y); ctx.lineTo(cx-7,y+8); ctx.moveTo(cx+7,y); ctx.lineTo(cx+7,y+8); ctx.stroke();
+    ctx.fillStyle=`rgba(106,176,243,${0.35+Math.sin(t*2.5)*0.2})`;
+    ctx.beginPath(); ctx.moveTo(cx-8,y-2); ctx.lineTo(cx,y-16); ctx.lineTo(cx+8,y-2);
+    ctx.closePath(); ctx.fill(); }} };
+function drawFacilities(r, t){
+  for (const f of S.facilities){
+    if (!f.owned || f.room !== r.kind) continue;
+    const d = FACIL_SPR[f.key]; if (!d) continue;
+    if (d.fn){ d.fn(r, t); continue; }
+    const w = d.spr[0].length*PXS, h = d.spr.length*PXS;
+    spr(d.spr, SPR_PAL, r.x+r.w-w-8, d.wall ? r.y+8 : r.y+r.h-2-h);
+  }
+}
+// launched products hang as little ad posters in mess halls and lobbies
+function drawAds(r){
+  const launched = S.products.filter(p=>p.launched);
+  const n = Math.min(launched.length, Math.floor((r.w-20)/13));
+  for (let i=0;i<n;i++){
+    const p = launched[i], x = r.x+r.w-10-(n-i)*13, y = r.y+6;
+    const col = p.wing==="consumer" ? "#ffd23e" : "#e5484d";
+    ctx.fillStyle = col; ctx.fillRect(x, y, 9, 12);
+    ctx.fillStyle = "#10131a"; ctx.fillRect(x+1, y+1, 7, 10);
+    ctx.fillStyle = col;
+    ctx.fillRect(x+2, y+4, 1.6, 1.6); ctx.fillRect(x+5.4, y+4, 1.6, 1.6);
+    ctx.fillRect(x+3, y+8, 3, 1.4);
+  }
+}
 
 function drawAgent(a, t, floor){
   if (cam.k < 0.35){          // LOD: screen-constant dot when zoomed out
@@ -607,6 +657,20 @@ function draw(t){
   }
   ctx.globalAlpha = 1;
   if (!S) return;
+  // Orbital Billboard Campaign perk: a distant hoarding in the starfield
+  if (S.perks.some(p=>p.key==="billboard"&&p.owned)){
+    const bx = W-186, by = 22, bw = 150, bh = 58;
+    ctx.fillStyle = "#0d1016"; ctx.strokeStyle = "#b8921c"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 5); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = "#ffd23e"; ctx.font = "bold 19px Segoe UI"; ctx.textAlign = "center";
+    ctx.fillText("☺ GLUG", bx+bw/2, by+27);
+    ctx.fillStyle = "#6b7482"; ctx.font = "7.5px Segoe UI";
+    ctx.fillText("NOURISHING WORKERS · DEFENDING MARGINS", bx+bw/2, by+44);
+    ctx.strokeStyle = "#39415a"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(bx+bw/2, by+bh); ctx.lineTo(bx+bw/2, by+bh+14); ctx.stroke();
+    ctx.fillStyle = `rgba(229,72,77,${0.4+Math.sin(t*3)*0.35})`;
+    ctx.beginPath(); ctx.arc(bx+bw-6, by-4, 2.5, 0, 7); ctx.fill();
+  }
   const it = S.interior, WW = worldW(), docked = S.ceo.docked;
 
   const k = cam.k;
@@ -672,6 +736,8 @@ function draw(t){
     ctx.strokeStyle = "#2a303c"; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(r.x+2, r.y+r.h-2); ctx.lineTo(r.x+r.w-2, r.y+r.h-2); ctx.stroke();
     (PROPS[r.kind]||prop_console_room)(r, t);
+    drawFacilities(r, t);
+    if (r.kind==="mess" || r.kind==="lobby") drawAds(r);
     if (k >= 0.4){
       ctx.font = `${9.5/Math.min(k,1)}px Segoe UI`; ctx.textAlign = "left";
       ctx.fillStyle = hot ? "#c8a832" : "#525a68";

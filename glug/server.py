@@ -402,6 +402,7 @@ def build_state(ship_override=None):
         "franchises": franchise_list(db),
         "brand_equity": game.get_state(db, "brand_equity", 0),
         "perks": game.perk_state(db),
+        "facilities": game.facility_state(db),
         "earn_mult": game.earn_mult(db),
         "franchise_rate": game.FRANCHISE_RATE,
         "counters": game.get_state(db, "counters", {}),
@@ -458,6 +459,10 @@ def do_action(payload):
         result = game.buy_perk(db, payload.get("key"), now)
         msg = (f"☺ {result['name']} acquired. Glug invests in Glug."
                if result else "Insufficient Brand Equity.")
+    elif action == "facility":
+        result = game.buy_facility(db, payload.get("key"), now)
+        msg = (f"🔧 {result['name']} installed aboard. Facilities thanks you "
+               f"for your patience." if result else "Insufficient scrip.")
     else:
         result, msg = None, "Unknown action."
     db.close()
