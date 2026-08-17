@@ -448,6 +448,12 @@ def do_action(payload):
         msg = (f"🎉 {result['name']} LAUNCHED. +{result['be']} Brand Equity. "
                f"Marketing is weeping with joy." if result
                else "Launch conditions not met.")
+    elif action == "assign":
+        result = game.assign_crew(db, int(payload.get("id", 0)),
+                                  payload.get("dept"), now)
+        msg = (f"{result[0]} transferred to {result[1]}. Internal Transfer "
+               f"Paperwork filed ({game.ASSIGN_COST:,.0f} GS)." if result
+               else "Transfer denied by HR.")
     elif action == "perk":
         result = game.buy_perk(db, payload.get("key"), now)
         msg = (f"☺ {result['name']} acquired. Glug invests in Glug."

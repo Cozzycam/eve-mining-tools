@@ -50,6 +50,12 @@ FRANCHISE_RATE = 2.0          # scrip/hour per open franchise
 LAUNCH_MULT = 0.02            # permanent earnings multiplier per launched product
 
 DEPARTMENTS = ["Logistics", "Catering", "Safety & Compliance", "Marketing", "R&D"]
+DEPT_BONUS = 0.10         # each staffer adds +10% to their dept's stream
+ASSIGN_COST = 25.0        # Internal Transfer Paperwork fee
+# Which department boosts scrip from which work-order kind. Catering boosts
+# busywork, Marketing boosts franchises, R&D boosts research (see advance).
+KIND_DEPT = {"ore": "Logistics", "colony": "Logistics",
+             "income": "Safety & Compliance"}
 
 # Product catalogue. req: (activity counter, threshold) unlocked by REAL play.
 # be = Brand Equity minted at launch.
@@ -344,6 +350,9 @@ def advance(db, now):
         return
     perks = get_state(db, "perks", [])
     crew = db.execute("SELECT id, level FROM crew").fetchall()
+    n_dept = dict(db.execute(
+        "SELECT department, COUNT(*) FROM crew GROUP BY department"))
+    dept_mult = lambda dept: 1.0 + DEPT_BONUS * n_dept.get(dept, 0)
     capacity = (sum(crew_rate(lvl) for _, lvl in crew) * hours
                 * perk_factor(db, "crew_rate", perks))
     total_capacity = capacity
@@ -357,7 +366,8 @@ def advance(db, now):
         chunk = min(capacity, units - done)
         capacity -= chunk
         done += chunk
-        earn(db, chunk * SCRIP_PER_UNIT.get(kind, 1.0),
+        earn(db, chunk * SCRIP_PER_UNIT.get(kind, 1.0)
+             * dept_mult(KIND_DEPT.get(kind)),
              f"work:{kind}", now)
         db.execute(
             "UPDATE work_orders SET done=?, completed_ts=? WHERE id=?",
@@ -368,14 +378,14 @@ def advance(db, now):
     if crew and total_capacity > 0 and capacity > 0:
         idle_hours = hours * (capacity / total_capacity)
         earn(db, BUSYWORK_RATE * len(crew) * idle_hours
-             * perk_factor(db, "busywork", perks),
+             * perk_factor(db, "busywork", perks) * dept_mult("Catering"),
              "busywork: internal Glug contracts", now)
 
     # Franchise network trickle
     n_fr = db.execute("SELECT COUNT(*) FROM franchises").fetchone()[0]
     if n_fr:
         earn(db, FRANCHISE_RATE * n_fr * hours
-             * perk_factor(db, "franchise", perks),
+             * perk_factor(db, "franchise", perks) * dept_mult("Marketing"),
              f"franchise network ({n_fr} locations)", now)
 
     # R&D: research points into the active project
@@ -505,6 +515,19 @@ def product_state(db):
     return out
 
 
+def assign_crew(db, crew_id, dept, now):
+    """Move a crew member to another department (Internal Transfer fee)."""
+    row = db.execute("SELECT name, department FROM crew WHERE id=?",
+                     (crew_id,)).fetchone()
+    if not row or dept not in DEPARTMENTS or row[1] == dept:
+        return None
+    if not spend(db, ASSIGN_COST, f"transfer:{row[0]} → {dept}", now):
+        return None
+    db.execute("UPDATE crew SET department=? WHERE id=?", (dept, crew_id))
+    db.commit()
+    return row[0], dept
+
+
 def train_cost(level):
     return TRAIN_BASE * TRAIN_GROWTH ** (level - 1)
 
@@ -602,20 +625,21 @@ def selftest():
     assert db.execute("SELECT COUNT(*) FROM work_orders").fetchone()[0] == 2
 
     # 1 hour: 2 crew L1 = 120 units capacity → income order (5u) done,
-    # ore order 115u done. Scrip: 5*0.8 + 115*1.0 = 119
+    # ore order 115u done. Crew #1 is Logistics (round-robin), so ore pays
+    # ×1.1: 5*0.8 + 115*1.0*1.1 = 130.5
     advance(db, t0 + 3600)
     scrip = get_state(db, "scrip")
-    assert abs(scrip - (FOUNDING_SCRIP + 119.0)) < 0.01, f"scrip {scrip}"
+    assert abs(scrip - (FOUNDING_SCRIP + 130.5)) < 0.01, f"scrip {scrip}"
     done = db.execute("SELECT COUNT(*) FROM work_orders "
                       "WHERE completed_ts IS NOT NULL").fetchone()[0]
     assert done == 1, "income order should be complete"
 
     # Drain the rest (needs 885 more units ≈ 7.375h), then 1h pure idle:
-    # busywork = 8 * 2 crew * 1h = 16
+    # busywork = 8 * 2 crew * 1h * 1.1 (crew #2 is Catering) = 17.6
     advance(db, t0 + 3600 * 10)
     pre_idle = get_state(db, "scrip")
     advance(db, t0 + 3600 * 11)
-    assert abs(get_state(db, "scrip") - pre_idle - 16.0) < 0.01, "busywork wrong"
+    assert abs(get_state(db, "scrip") - pre_idle - 17.6) < 0.01, "busywork wrong"
 
     # Hiring: cost 100 * 1.15^2 = 132.25, deducted
     pre = get_state(db, "scrip")
@@ -650,7 +674,8 @@ def selftest():
     rp = db.execute("SELECT research FROM products WHERE key='original'").fetchone()[0]
     assert abs(rp - 2 * (72 * 0.5 + 120 * 0.05)) < 0.01, rp
     got = get_state(db, "scrip") - pre
-    assert abs(got - 2 * (8.0 * 3 + 2.0 * 1)) < 0.01, got  # busywork + 1 franchise
+    # busywork ×1.1 (1 Catering) + 1 franchise: 2 * (8*3*1.1 + 2)
+    assert abs(got - 2 * (8.0 * 3 * 1.1 + 2.0)) < 0.01, got
 
     assert launch_product(db, "original", t0) is None, "unfinished launch allowed"
     db.execute("UPDATE products SET research=? WHERE key='original'", (200,))
@@ -666,15 +691,31 @@ def selftest():
     assert buy_perk(db, "smiles", t0) is None, "perk sold twice"
     assert perk_factor(db, "busywork") == 1.5
     assert perk_factor(db, "crew_rate") == 1.0
-    # busywork now 1.5×: clear queue, 1h idle with 3 crew = 8*3*1.5 = 36
+    # busywork now perk 1.5× and Catering 1.1×: clear queue, 1h idle,
+    # 3 crew = 8*3*1.5*1.1 = 39.6, + franchise 2, all × earn_mult 1.02
     db.execute("UPDATE work_orders SET done=units, completed_ts=1 "
                "WHERE completed_ts IS NULL")
     pre = get_state(db, "scrip")
     advance(db, t0 + 3600 * 14)
     got = get_state(db, "scrip") - pre
-    assert abs(got - 1.02 * (36.0 + 2.0)) < 0.01, got  # busywork*perk + franchise
+    assert abs(got - 1.02 * (39.6 + 2.0)) < 0.01, got
     set_state(db, "perks", ["onboarding"])
     assert abs(hire_cost(db) - HIRE_BASE * HIRE_GROWTH ** 3 * 0.8) < 0.01
+    set_state(db, "perks", [])
+
+    # ── Department reassignment ──
+    assert assign_crew(db, 2, "Catering", t0) is None, "same-dept transfer"
+    assert assign_crew(db, 99, "Marketing", t0) is None, "ghost crew"
+    pre = get_state(db, "scrip")
+    name, dept = assign_crew(db, 2, "Marketing", t0)
+    assert dept == "Marketing"
+    assert abs(get_state(db, "scrip") - (pre - ASSIGN_COST)) < 0.01
+    # Catering gone, Marketing gained: idle hour = busywork 8*3 + franchise
+    # 2*1.1, × earn_mult 1.02
+    pre = get_state(db, "scrip")
+    advance(db, t0 + 3600 * 15)
+    got = get_state(db, "scrip") - pre
+    assert abs(got - 1.02 * (24.0 + 2.2)) < 0.01, got
     print("selftest OK")
 
 

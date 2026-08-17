@@ -59,6 +59,9 @@ button.mini { padding:2px 9px; font-size:11.5px; font-weight:600; }
 button:disabled { opacity:.35; cursor:default; }
 .tag { font-size:9.5px; padding:1px 6px; border-radius:3px; background:var(--edge);
        color:var(--dim); text-transform:uppercase; letter-spacing:.08em; }
+select.dept-sel { font-size:9.5px; padding:1px 3px; border-radius:3px;
+       background:var(--edge); color:var(--dim); border:0;
+       text-transform:uppercase; letter-spacing:.08em; cursor:pointer; }
 .dept-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
 .wings { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; }
 .wing h3 { font-size:10.5px; letter-spacing:.14em; color:var(--dim); margin:2px 0 7px;
@@ -118,7 +121,10 @@ footer { margin-top:14px; color:#454c58; font-size:10.5px; letter-spacing:.06em;
     <div class="kv"><span>Corporate treasury</span><b id="ceo-wallet">…</b></div>
     <div class="kv"><span>Executive development</span><b id="ceo-train">…</b></div>
   </div>
-  <div class="panel"><h2>Crew Roster</h2><table id="crew"></table></div>
+  <div class="panel"><h2>Crew Roster</h2><table id="crew"></table>
+    <div class="reqline" style="margin-top:8px">Dept bonus +10%/staffer —
+      Logistics: intake &amp; colony scrip · S&amp;C: paperwork scrip ·
+      Catering: busywork · Marketing: franchises · R&amp;D: research</div></div>
   <div class="panel"><h2>Work Order Queue</h2><table id="queue"></table></div>
   <div class="panel"><h2>Franchise Network <span id="fr-sub"></span></h2>
     <canvas id="frmap"></canvas><table id="franchises"></table></div>
@@ -181,7 +187,11 @@ function renderPanels(){
     `<tr onclick="locateCrew(${i})" title="Click to locate on ship">
      <td><span class="dept-dot" style="background:${DEPT_COLOR[m.dept]||"#888"}"></span>
      <b>${m.name}</b> <span class="tag" id="crew-deck-${i}"></span><br>
-     <span class="tag">${m.dept}</span></td>
+     <select class="dept-sel" title="Transfer department (25 GS)"
+       onclick="event.stopPropagation()"
+       onchange='act({action:"assign",id:${m.id},dept:this.value})'>
+       ${Object.keys(DEPT_COLOR).map(d=>`<option ${d===m.dept?"selected":""}>${d}</option>`).join("")}
+     </select></td>
      <td>L${m.level}</td><td class="dim">${fmt(m.rate)} u/hr</td>
      <td style="text-align:right"><button class="mini" ${S.scrip<m.train_cost?"disabled":""}
        onclick='event.stopPropagation();act({action:"train",id:${m.id}})'>Train ${fmt(m.train_cost)}</button></td></tr>`).join("");
