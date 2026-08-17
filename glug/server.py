@@ -133,9 +133,9 @@ SHIP_PROFILES = {
     77114: {   # Metamorphosis — re-traced from Campbell's side shot (2026-08-15 v2)
         # Lance goes off LEFT (x=0); tall upper fin + separate lower pod on
         # the right, approximated continuous where they meet the body.
-        # Length still a guess — send the in-game Long axis to calibrate;
+        # Long axis 155 m (Campbell, in-game, 2026-08-17);
         # height follows the image aspect (~0.8 × length).
-        "length_m": 150, "height_m": 120,
+        "length_m": 155, "height_m": 124,
         "columns": [
             (0.00, 0.36, 0.44),                     # lance tip (off left)
             (0.30, 0.33, 0.47), (0.38, 0.32, 0.49), # lance thickens to root
@@ -401,6 +401,7 @@ def build_state(ship_override=None):
         "products": game.product_state(db),
         "franchises": franchise_list(db),
         "brand_equity": game.get_state(db, "brand_equity", 0),
+        "perks": game.perk_state(db),
         "earn_mult": game.earn_mult(db),
         "franchise_rate": game.FRANCHISE_RATE,
         "counters": game.get_state(db, "counters", {}),
@@ -447,6 +448,10 @@ def do_action(payload):
         msg = (f"🎉 {result['name']} LAUNCHED. +{result['be']} Brand Equity. "
                f"Marketing is weeping with joy." if result
                else "Launch conditions not met.")
+    elif action == "perk":
+        result = game.buy_perk(db, payload.get("key"), now)
+        msg = (f"☺ {result['name']} acquired. Glug invests in Glug."
+               if result else "Insufficient Brand Equity.")
     else:
         result, msg = None, "Unknown action."
     db.close()

@@ -83,6 +83,29 @@ PRODUCTS = {
                   "blurb": "For very special occasions."},
 }
 
+# Brand Equity perk shop. One-time purchases; each multiplies one sim knob.
+# target: crew_rate | research | hire_cost | busywork | franchise | earnings.
+PERKS = {
+    "smiles":    {"name": "Mandatory Smile Initiative", "cost": 2,
+                  "target": "busywork", "mult": 1.5,
+                  "blurb": "Idle crew now smile at 150% intensity. Morale is not optional."},
+    "espresso":  {"name": "R&D Espresso Entitlement", "cost": 5,
+                  "target": "research", "mult": 1.25,
+                  "blurb": "One (1) complimentary espresso per breakthrough."},
+    "synergy":   {"name": "Franchise Synergy Seminar", "cost": 10,
+                  "target": "franchise", "mult": 2.0,
+                  "blurb": "Attendance mandatory. Synergy doubled."},
+    "onboarding":{"name": "Streamlined Onboarding", "cost": 20,
+                  "target": "hire_cost", "mult": 0.8,
+                  "blurb": "The 400-page handbook is now a QR code."},
+    "overtime":  {"name": "Voluntary Overtime Program", "cost": 40,
+                  "target": "crew_rate", "mult": 1.15,
+                  "blurb": "Participation is voluntary and universal."},
+    "billboard": {"name": "Orbital Billboard Campaign", "cost": 100,
+                  "target": "earnings", "mult": 1.1,
+                  "blurb": "Visible from three planets. Tasteful."},
+}
+
 FIRST = ["Aile", "Bex", "Cato", "Dree", "Emek", "Fenn", "Gozi", "Hale", "Ilya",
          "Jax", "Kess", "Lomi", "Moro", "Nyra", "Osun", "Pell", "Quon", "Rask",
          "Suvi", "Tovak"]
@@ -157,9 +180,20 @@ def launch_count(db):
                       "WHERE launched_ts IS NOT NULL").fetchone()[0]
 
 
+def perk_factor(db, target, owned=None):
+    """Product of owned-perk multipliers for one sim knob."""
+    owned = get_state(db, "perks", []) if owned is None else owned
+    f = 1.0
+    for k in owned:
+        p = PERKS.get(k)
+        if p and p["target"] == target:
+            f *= p["mult"]
+    return f
+
+
 def earn_mult(db):
-    """Permanent company-wide earnings multiplier from launched products."""
-    return 1.0 + LAUNCH_MULT * launch_count(db)
+    """Permanent company-wide earnings multiplier (launches + perks)."""
+    return (1.0 + LAUNCH_MULT * launch_count(db)) * perk_factor(db, "earnings")
 
 
 def earn(db, amount, reason, now):
@@ -308,8 +342,10 @@ def advance(db, now):
         set_state(db, "last_sim_ts", now)
         db.commit()
         return
+    perks = get_state(db, "perks", [])
     crew = db.execute("SELECT id, level FROM crew").fetchall()
-    capacity = sum(crew_rate(lvl) for _, lvl in crew) * hours
+    capacity = (sum(crew_rate(lvl) for _, lvl in crew) * hours
+                * perk_factor(db, "crew_rate", perks))
     total_capacity = capacity
 
     orders = db.execute(
@@ -331,13 +367,15 @@ def advance(db, now):
     # window, not per-order timing; fine until orders get sub-hour granularity
     if crew and total_capacity > 0 and capacity > 0:
         idle_hours = hours * (capacity / total_capacity)
-        earn(db, BUSYWORK_RATE * len(crew) * idle_hours,
+        earn(db, BUSYWORK_RATE * len(crew) * idle_hours
+             * perk_factor(db, "busywork", perks),
              "busywork: internal Glug contracts", now)
 
     # Franchise network trickle
     n_fr = db.execute("SELECT COUNT(*) FROM franchises").fetchone()[0]
     if n_fr:
-        earn(db, FRANCHISE_RATE * n_fr * hours,
+        earn(db, FRANCHISE_RATE * n_fr * hours
+             * perk_factor(db, "franchise", perks),
              f"franchise network ({n_fr} locations)", now)
 
     # R&D: research points into the active project
@@ -347,8 +385,9 @@ def advance(db, now):
             "SELECT id, level FROM crew WHERE department='R&D'").fetchall())
         other_rate = sum(crew_rate(lvl) for _, lvl in db.execute(
             "SELECT id, level FROM crew WHERE department!='R&D'").fetchall())
-        points = (rd_rate * RESEARCH_RD_FACTOR +
-                  other_rate * RESEARCH_OTHER_FACTOR) * hours
+        points = ((rd_rate * RESEARCH_RD_FACTOR +
+                   other_rate * RESEARCH_OTHER_FACTOR) * hours
+                  * perk_factor(db, "research", perks))
         db.execute("UPDATE products SET research=MIN(research+?, ?) "
                    "WHERE key=? AND launched_ts IS NULL",
                    (points, PRODUCTS[active]["cost"], active))
@@ -371,7 +410,7 @@ def sim(db, now=None):
 
 def hire_cost(db):
     n = db.execute("SELECT COUNT(*) FROM crew").fetchone()[0]
-    return HIRE_BASE * HIRE_GROWTH ** n
+    return HIRE_BASE * HIRE_GROWTH ** n * perk_factor(db, "hire_cost")
 
 
 def hire_crew(db, now, free=False, rng=random, dept=None):
@@ -427,6 +466,28 @@ def launch_product(db, key, now):
                (now, 0, f"PRODUCT LAUNCH: {p['name']} (+{p['be']} Brand Equity)"))
     db.commit()
     return p
+
+
+def buy_perk(db, key, now):
+    """Spend Brand Equity on a one-time perk."""
+    p = PERKS.get(key)
+    owned = get_state(db, "perks", [])
+    be = get_state(db, "brand_equity", 0)
+    if not p or key in owned or be < p["cost"]:
+        return None
+    set_state(db, "brand_equity", be - p["cost"])
+    set_state(db, "perks", owned + [key])
+    db.execute("INSERT INTO scrip_ledger(ts, amount, reason) VALUES(?,?,?)",
+               (now, 0, f"PERK ACQUIRED: {p['name']} (-{p['cost']} Brand Equity)"))
+    db.commit()
+    return p
+
+
+def perk_state(db):
+    owned = get_state(db, "perks", [])
+    return [{"key": k, "name": p["name"], "cost": p["cost"], "blurb": p["blurb"],
+             "target": p["target"], "mult": p["mult"], "owned": k in owned}
+            for k, p in PERKS.items()]
 
 
 def product_state(db):
@@ -597,6 +658,23 @@ def selftest():
     assert launch_product(db, "original", t0) is None, "double launch"
     assert get_state(db, "brand_equity") == 2
     assert abs(earn_mult(db) - 1.02) < 1e-9
+
+    # ── Perk shop ──
+    assert buy_perk(db, "espresso", t0) is None, "unaffordable perk sold"
+    assert buy_perk(db, "smiles", t0)["cost"] == 2
+    assert get_state(db, "brand_equity") == 0
+    assert buy_perk(db, "smiles", t0) is None, "perk sold twice"
+    assert perk_factor(db, "busywork") == 1.5
+    assert perk_factor(db, "crew_rate") == 1.0
+    # busywork now 1.5×: clear queue, 1h idle with 3 crew = 8*3*1.5 = 36
+    db.execute("UPDATE work_orders SET done=units, completed_ts=1 "
+               "WHERE completed_ts IS NULL")
+    pre = get_state(db, "scrip")
+    advance(db, t0 + 3600 * 14)
+    got = get_state(db, "scrip") - pre
+    assert abs(got - 1.02 * (36.0 + 2.0)) < 0.01, got  # busywork*perk + franchise
+    set_state(db, "perks", ["onboarding"])
+    assert abs(hire_cost(db) - HIRE_BASE * HIRE_GROWTH ** 3 * 0.8) < 0.01
     print("selftest OK")
 
 
